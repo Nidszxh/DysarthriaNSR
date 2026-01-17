@@ -37,18 +37,24 @@ This is a research project combining:
    - Label padding value: -100 (ignored by CTC loss)
    - Computes attention mask manually (1 where signal exists, 0 for padding)
 
-5. **Neural Component** (TBD):
-   - SSL encoder (wav2vec 2.0 base, facebook/wav2vec2-base-960h) processes audio → CTC phoneme predictions
-   - Self-supervised learning reduces need for large labeled datasets
+5. **Neural Component** ([model.py](model.py)):
+   - HuBERT encoder (facebook/hubert-base-ls960) extracts 768-dim self-supervised representations
+   - Projection layer reduces to `hidden_dim` (512), followed by phoneme classifier
+   - CTC loss aligns variable-length audio to phoneme sequences
+   - Supports selective layer freezing for VRAM optimization (freeze first 6 encoder layers by default)
 
-6. **Symbolic Constraint Layer** (TBD):
-   - Rules for common dysarthric substitutions (e.g., /p/ → /b/, /t/ → /d/)
-   - Articulatory similarity constraints guide neural predictions
-   - Leverage `articulatory_classes` column for fine-grained error analysis
+6. **Symbolic Constraint Layer** ([model.py](model.py)):
+   - `SymbolicConstraintMatrix`: Encodes articulatory similarity via distance between phoneme features
+   - `ConstraintAggregation`: Applies learned weighted matrix to neural logits: `logits_constrained = α * logits_neural + (1-α) * C @ logits_neural`
+   - Dysarthria-aware weighting: Higher dysarthric severity → stronger constraint influence
+   - Covers stops, fricatives, nasals, liquids, glides, vowels, diphthongs with phonetic properties (manner, place, voicing)
 
-7. **Explainability Module** (TBD):
-   - Phoneme-level error attribution with articulatory class breakdown
-   - Rule activation tracking for clinical interpretability
+7. **Training Pipeline** ([train.py](train.py)):
+   - Multi-task learning: CTC loss (phoneme) + focal loss (dysarthria classification) + KL constraint loss
+   - MLflow tracking with safe parameter flattening for nested configs
+   - EarlyStopping, ModelCheckpoint, LearningRateMonitor callbacks
+   - Gradient accumulation (batch_size=2, accumulation_steps=12) for RTX 4060 8GB VRAM constraint
+   - Learning rate: 5e-5, cosine scheduler with warmup, label smoothing 0.1
 
 ## Critical Developer Workflows
 
@@ -102,11 +108,33 @@ loader = DataLoader(
 # - speakers: [batch_size] - Speaker IDs for analysis
 ```
 
+### 4. Start Training
+```bash
+python train.py --config config.yaml  # Uses MLflow for experiment tracking
+# Or with overrides:
+python train.py --config config.yaml --trainer.max_epochs 10 --training.batch_size 4
+```
+- Checkpoints saved to `./checkpoints/` (triggered by validation metrics)
+- MLflow runs logged to `mlruns/` with safe parameter flattening
+- Early stopping after 5 validation epochs without improvement
+
+### 5. Evaluate Trained Model
+```python
+from train import TrainedModel
+from evaluate import compute_per, compute_wer, visualize_confusion_matrix
+
+# Load checkpoint and compute metrics per speaker, articulatory class, dysarthria status
+model = TrainedModel.load_from_checkpoint("checkpoints/best_model.ckpt")
+per_scores, confusion_mats = model.evaluate(test_loader)
+visualize_confusion_matrix(confusion_mats, save_path="results/")
+```
+
 ### Environment Requirements
 - Python 3.8+
 - Core: `datasets`, `pandas`, `tqdm`, `librosa`, `g2p_en`, `nltk`
-- ML: `torch`, `transformers`, `torchaudio`
-- Evaluation: `jiwer` (for WER/PER metrics)
+- ML: `torch>=2.0.0`, `transformers>=4.30.0`, `torchaudio`
+- Training: `pytorch-lightning>=2.0.0`, `mlflow>=2.5.0`
+- Evaluation: `jiwer>=3.0.0`, `editdistance>=0.6.0`
 
 ## Project-Specific Conventions
 
@@ -128,7 +156,30 @@ loader = DataLoader(
   - **Glides**: W, Y
   - **Vowels & Diphthongs**: Separate classes for vowel analysis
 
-### CTC Training Specifics (Critical)
+### Symbolic Constraint Matrix & Articulatory Features
+- **Matrix construction**: Built in `SymbolicConstraintMatrix` using euclidean distance between articulatory feature vectors
+  - Features: `manner` (stop, fricative, nasal, etc.), `place` (bilabial, alveolar, etc.), `voice` (voiced/voiceless)
+  - Distance-based: Similar phonemes (e.g., /p/ and /b/, stops with same place) → lower cost
+- **Application**: In `ConstraintAggregation`, weighted combination of neural logits and symbolic guidance:
+  ```
+  logits_constrained = α * logits_neural + (1-α) * (C @ logits_neural)
+  α = severity-aware interpolation weight (0 for severe dysarthria → rely more on rules)
+  ```
+- **Clinical insight**: Dysarthric substitutions often preserve articulatory place/manner (e.g., velars → alveolars, not fricatives)
+  - Use this in error analysis: Higher confusion between articulatorily-similar phonemes is clinically expected
+
+### Training Configuration & Multi-Task Learning
+- **Config file**: [config.py](config.py) with dataclasses for ModelConfig, TrainingConfig, SymbolicConfig
+- **Loss weighting**: 
+  - CTC loss (phoneme alignment): 1.0
+  - Focal loss (dysarthria classification): 0.1 (handles class imbalance)
+  - KL constraint loss (symbolic guidance): 0.05
+- **VRAM optimization**: 
+  - Batch size 2, gradient accumulation 12 steps = effective batch 24
+  - Freeze HuBERT encoder layers 0-5 (reduce parameters, VRAM)
+  - Layer dropout 0.05 for regularization
+- **Learning rate schedule**: Cosine annealing with 500-step warmup
+- **Checkpoint strategy**: Save best model (early stopping metric: validation PER)
 - **Vocabulary architecture**:
   ```python
   <BLANK> = 0      # CTC alignment state (not a phoneme)
@@ -160,13 +211,21 @@ loader = DataLoader(
 - `./data/`: HuggingFace cache and manifest CSV
 - `./data/torgo_neuro_symbolic_manifest.csv`: Generated manifest (16K+ samples with metadata)
 
+## What's Implemented
+
+- ✅ Data pipeline: TORGO dataset download, neuro-symbolic manifest with articulatory metadata
+- ✅ Neural dataset & dataloader: HuBERT feature extraction, CTC-compatible batching
+- ✅ NeuroSymbolicASR model: HuBERT encoder + phoneme classifier + symbolic constraint layer
+- ✅ Training infrastructure: PyTorch Lightning with multi-task learning, MLflow logging, callbacks
+- ✅ Evaluation metrics: PER (phoneme error rate), WER, phoneme alignment, confusion matrices
+
 ## Next Steps: What's NOT Built Yet
 
-- **Training script**: PyTorch Lightning or HuggingFace Trainer with CTC loss, learning rate scheduling, checkpoint management
-- **Symbolic constraint layer**: Rule-based post-processing to enforce dysarthric substitution patterns
-- **Evaluation metrics**: WER, PER, confidence-based filtering, per-speaker and per-articulatory-class analysis
-- **Explainability dashboard**: Phoneme confusion matrices, rule activation heatmaps, per-speaker error patterns
-- **Model checkpoints**: Pretrained baselines and fine-tuned models for clinical deployment
+- **Explainability dashboard**: Interactive visualization of phoneme confusion matrices, rule activations, per-speaker error patterns
+- **Model checkpoints**: Pretrained baseline & fine-tuned models for TORGO dysarthric/control cohorts
+- **Symbolic rule discovery**: Auto-extract dysarthric substitution rules from confusion matrices (e.g., /p/ → /b/ frequency thresholds)
+- **Clinical interface**: ONNX export, streaming inference, real-time feedback for speech therapy
+- **Ablation studies**: Quantify contribution of neural vs. symbolic components via systematic evaluation
 
 ## Common Pitfalls & Solutions
 
