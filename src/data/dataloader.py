@@ -1,6 +1,15 @@
 import os
 from pathlib import Path
 from typing import Any, Dict, List
+from dataclasses import dataclass
+try:
+    from src.utils.config import get_default_config
+except ImportError:
+    import sys
+    _ROOT = Path(__file__).resolve().parents[2]
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from src.utils.config import get_default_config
 
 import pandas as pd
 import torch
@@ -8,6 +17,18 @@ import torchaudio
 import torchaudio.functional as taF
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoFeatureExtractor, AutoProcessor
+
+
+@dataclass(frozen=True)
+class DataPaths:
+    """Path configuration matching download.py structure."""
+    root: Path = Path(__file__).resolve().parents[2]
+    data_dir: Path = None
+    processed_dir: Path = None
+    
+    def __post_init__(self):
+        object.__setattr__(self, "data_dir", self.root / "data")
+        object.__setattr__(self, "processed_dir", self.data_dir / "processed")
 
 
 class TorgoNeuroSymbolicDataset(Dataset):
@@ -65,7 +86,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
         # Build vocabularies for phonemes and articulatory classes.
         # Extract unique phonemes from manifest
         phonemes_list = sorted(set(
-            phoneme
+            self._normalize_phoneme(phoneme)
             for phonemes_str in self.df['phonemes'].fillna("")
             for phoneme in phonemes_str.split()
         ))
@@ -105,6 +126,14 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.id_to_art = {idx: art for art, idx in self.art_to_id.items()}
         self.art_pad_id = 0
         self.art_unk_id = 1
+
+    @staticmethod
+    def _normalize_phoneme(phn: str) -> str:
+        """
+        Normalize ARPABET phoneme by stripping stress markers (0/1/2).
+        Example: 'AH0' -> 'AH', 'IY1' -> 'IY'.
+        """
+        return str(phn).rstrip('012')
     
     def _load_audio(self, audio_path: str) -> torch.Tensor:
         """
@@ -149,7 +178,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
             
         Returns: List of phoneme IDs
         """
-        phoneme_list = phonemes_str.split()
+        phoneme_list = [self._normalize_phoneme(phn) for phn in phonemes_str.split()]
         return [self.phn_to_id.get(phn, self.unk_id) for phn in phoneme_list]
 
     def _encode_articulatory_classes(self, art_str: str) -> List[int]:
@@ -190,12 +219,15 @@ class TorgoNeuroSymbolicDataset(Dataset):
         art_str = str(row.get('articulatory_classes', ""))
         art_ids = self._encode_articulatory_classes(art_str)
 
-        # Align lengths defensively to avoid mismatch errors
-        if not art_ids:
-            art_ids = [self.art_pad_id] * len(phoneme_ids)
-        seq_len = min(len(phoneme_ids), len(art_ids))
-        phoneme_ids = phoneme_ids[:seq_len]
-        art_ids = art_ids[:seq_len]
+        # Verify 1:1 alignment (by design from manifest generation)
+        if len(phoneme_ids) != len(art_ids):
+            raise ValueError(
+                f"Data quality error in sample {idx} (speaker: {row['speaker']}): "
+                f"phoneme sequence length ({len(phoneme_ids)}) != "
+                f"articulatory class length ({len(art_ids)}). "
+                f"This indicates misalignment during manifest generation or G2P encoding. "
+                f"Phonemes: {phonemes_str[:80]}... | Articulatory: {art_str[:80]}..."
+            )
         
         return {
             "input_values": audio_features,
@@ -268,6 +300,7 @@ class NeuroSymbolicCollator:
         # Aggregate metadata
         status = torch.stack([item["metadata"]["is_dysarthric"] for item in batch])
         speakers = [item["metadata"]["speaker"] for item in batch]
+        transcripts = [item["metadata"]["transcript"] for item in batch]
         
         return {
             "input_values": input_padded,
@@ -275,7 +308,8 @@ class NeuroSymbolicCollator:
             "labels": labels_padded,
             "articulatory_labels": art_padded,
             "status": status,
-            "speakers": speakers
+            "speakers": speakers,
+            "transcripts": transcripts
         }
 
 
@@ -313,13 +347,23 @@ def create_dataloaders( manifest_path: str, processor_id: str = "facebook/hubert
 
 
 def main() -> None:
-    manifest_path = "./data/torgo_neuro_symbolic_manifest.csv"
-    
-    # Create dataloader
+    config = get_default_config()
+
+    manifest_path = config.data.manifest_path
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Manifest not found at {manifest_path}. "
+            "Run 'python src/data/manifest.py' to generate it."
+        )
+
+    # Create dataloader using config values
     loader = create_dataloaders(
         manifest_path=manifest_path,
-        batch_size=4,
-        num_workers=4  # Use 0 for debugging
+        processor_id=config.model.hubert_model_id,
+        batch_size=config.training.batch_size,
+        num_workers=config.training.num_workers,
+        sampling_rate=config.data.sampling_rate
     )
     
     # Test batch loading
