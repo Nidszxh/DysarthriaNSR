@@ -24,9 +24,10 @@ This is a research project combining:
    - **Robustness enhancements**: Articulatory feature mapping (stops, fricatives, nasals, etc.) and signal quality assessment
    - Manifest enables reliable speaker-prefixed sample matching for HF dataset
 
-3. **Neural Dataset & Dataloader** ([dataloader.py](dataloader.py)):
+3. **Neural Dataset & Dataloader** ([src/data/dataloader.py](src/data/dataloader.py)):
    - `TorgoNeuroSymbolicDataset`: Streams audio from HF dataset matched by `speaker_filename` key
-   - Wav2Vec2 feature extraction (16kHz, zero-mean-unit-variance normalized)
+   - HuBERT feature extraction (16kHz, zero-mean-unit-variance normalized)
+   - **Audio truncation**: Long utterances capped at `max_audio_length` (default 8 seconds) to reduce GPU memory
    - Peak normalization to handle TORGO's variable breath support
    - Returns: audio features, phoneme IDs, and articulatory metadata
    - **CTC-ready**: Vocabulary includes `<BLANK>` (ID 0), `<PAD>` (ID 1), `<UNK>` (ID 2), then phonemes (ID 3+)
@@ -37,16 +38,17 @@ This is a research project combining:
    - Label padding value: -100 (ignored by CTC loss)
    - Computes attention mask manually (1 where signal exists, 0 for padding)
 
-5. **Neural Component** ([model.py](model.py)):
+5. **Neural Component** ([src/models/model.py](src/models/model.py)):
    - HuBERT encoder (facebook/hubert-base-ls960) extracts 768-dim self-supervised representations
+   - **Gradient checkpointing**: Enabled to reduce activation memory during backprop (~40% reduction, ~20% slower)
    - Projection layer reduces to `hidden_dim` (512), followed by phoneme classifier
    - CTC loss aligns variable-length audio to phoneme sequences
-   - Supports selective layer freezing for VRAM optimization (freeze first 6 encoder layers by default)
+   - Supports selective layer freezing for VRAM optimization (freeze first 8 encoder layers by default)
 
-6. **Symbolic Constraint Layer** ([model.py](model.py)):
+6. **Symbolic Constraint Layer** ([src/models/model.py](src/models/model.py)):
    - `SymbolicConstraintMatrix`: Encodes articulatory similarity via distance between phoneme features
-   - `ConstraintAggregation`: Applies learned weighted matrix to neural logits: `logits_constrained = α * logits_neural + (1-α) * C @ logits_neural`
-   - Dysarthria-aware weighting: Higher dysarthric severity → stronger constraint influence
+   - `ConstraintAggregation`: Applies learnable weighted blend to neural logits: `logits_constrained = β * logits_neural + (1-β) * (C @ logits_neural)`
+   - Dysarthria-aware weighting: Higher dysarthric severity → stronger constraint influence (adaptive β)
    - Covers stops, fricatives, nasals, liquids, glides, vowels, diphthongs with phonetic properties (manner, place, voicing)
 
 7. **Training Pipeline** ([train.py](train.py)):
@@ -54,8 +56,9 @@ This is a research project combining:
    - Adaptive neuro-symbolic weighting via `beta`: Neural logits blended with symbolic constraints based on speaker severity
    - MLflow tracking with safe parameter flattening for nested configs
    - EarlyStopping, ModelCheckpoint, LearningRateMonitor callbacks
-   - Gradient accumulation (batch_size=2, accumulation_steps=12) for RTX 4060 8GB VRAM constraint
-   - Learning rate: 5e-5, cosine scheduler with warmup, label smoothing 0.1
+   - **Memory optimizations**: batch_size=1, gradient_accumulation=8, gradient_checkpointing=True, max_audio_length=8s, fp16 mixed precision
+   - Learning rate: 5e-5, OneCycleLR scheduler with 10% warmup, label smoothing 0.1
+   - CUDA memory fragmentation mitigation: `PYTORCH_ALLOC_CONF=expandable_segments:True`
 
 ## Critical Developer Workflows
 
@@ -69,7 +72,7 @@ python download.py  # Downloads TORGO dataset to ./data/
 
 ### 2. Generate Neuro-Symbolic Manifest
 ```bash
-python manifest.py --data-dir ./data --out ./data/torgo_neuro_symbolic_manifest.csv
+python src/data/manifest.py --data-dir ./data --out ./data/processed/torgo_neuro_symbolic_manifest.csv
 ```
 - **Requires**: `pip install g2p_en pandas tqdm librosa datasets nltk`
 - Automatically downloads NLTK tagger if needed
@@ -81,28 +84,27 @@ python manifest.py --data-dir ./data --out ./data/torgo_neuro_symbolic_manifest.
 
 ### 3. Initialize DataLoader for Training
 ```python
-from dataloader import TorgoNeuroSymbolicDataset, NeuroSymbolicCollator
+from src.data.dataloader import TorgoNeuroSymbolicDataset, NeuroSymbolicCollator
 from torch.utils.data import DataLoader
 
 dataset = TorgoNeuroSymbolicDataset(
-    manifest_path="./data/torgo_neuro_symbolic_manifest.csv",
-    processor_id="facebook/wav2vec2-base-960h",
+    manifest_path="./data/processed/torgo_neuro_symbolic_manifest.csv",
+    processor_id="facebook/hubert-base-ls960",
     sampling_rate=16000,
-    use_hf_dataset=True,
-    hf_cache_dir="./data"
+    max_audio_length=8.0  # Truncate long utterances to 8 seconds
 )
 
 collator = NeuroSymbolicCollator(dataset.processor)
 
 loader = DataLoader(
     dataset,
-    batch_size=4,
+    batch_size=1,  # Small batch for 8GB VRAM
     shuffle=True,
     collate_fn=collator
 )
 
 # Each batch returns:
-# - input_values: [batch_size, max_time] - Wav2Vec2 features
+# - input_values: [batch_size, max_time] - HuBERT features
 # - attention_mask: [batch_size, max_time] - 1 where valid, 0 for padding
 # - labels: [batch_size, max_phonemes] - Phoneme IDs (-100 for padding, ignored by CTC loss)
 # - status: [batch_size] - Dysarthric (1) vs Control (0)
@@ -111,15 +113,29 @@ loader = DataLoader(
 
 ### 4. Start Training
 ```bash
-python train.py  # Uses default config from src/utils/config.py
+# Run with default config
+python train.py
+
+# Or with custom run name
+python train.py --run-name my_experiment_v1
 ```
 - **Config system**: Uses Python dataclasses (`ModelConfig`, `TrainingConfig`, `SymbolicConfig`) in `src/utils/config.py`
-- **Checkpoints saved to**: `./checkpoints/` (triggered by validation metrics, keeps top 3 models)
+- **Checkpoints saved to**: `./checkpoints/{run_name}/` (triggered by validation metrics, keeps top 3 models)
+- **Results saved to**: `./results/{run_name}/` (evaluation artifacts, confusion matrices, rule hit-rates)
 - **MLflow runs logged to**: `mlruns/` with safe parameter flattening (handles nested dict keys)
 - **Early stopping**: After 10 validation steps without improvement (metric: `val/per`)
 - **Monitoring**: `train/loss`, `train/loss_ctc`, `train/loss_ce`, `train/avg_beta` tracked in MLflow
 
-### 5. Evaluate Trained Model
+### 5. View Results
+```bash
+# Inspect evaluation metrics
+cat ./results/{run_name}/evaluation_results.json | python -m json.tool
+
+# View visualizations
+ls -la ./results/{run_name}/*.png
+```
+
+### 6. Evaluate Trained Model
 ```python
 from train import DysarthriaASRLightning
 from evaluate import compute_per, compute_wer, evaluate_model

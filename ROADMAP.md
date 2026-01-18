@@ -1,6 +1,12 @@
 # Implementation Status & Detailed System Architecture
 
-**Current Status**: Core system (data pipeline, model, training) is **implemented** ✅. This document details the low-level architecture, design decisions, and implementation patterns.
+**Current Status**: Core system (data pipeline, model, training) is **fully implemented and tested** ✅. System handles dysarthric speech recognition with neuro-symbolic constraints and produces evaluation artifacts (confusion matrices, per-speaker metrics, rule activations). This document details the low-level architecture, design decisions, and implementation patterns.
+
+**Recent optimizations** (Jan 2025):
+- ✅ Memory reduction: Audio truncation (8s), batch_size=1, gradient checkpointing, fp16 mixed precision
+- ✅ CUDA memory fragmentation mitigation via `PYTORCH_ALLOC_CONF=expandable_segments:True`
+- ✅ Result persistence: Automatic checkpoint and evaluation artifact saving to `./results/{run_name}/`
+- ✅ Progress logging: Reduced verbosity (print every 100 batches vs. every 10)
 
 ---
 
@@ -610,13 +616,13 @@ training_config = {
     'optimizer': 'AdamW',
     'learning_rate': 5e-5,
     'weight_decay': 0.01,
-    'lr_scheduler': 'cosine_with_warmup',
-    'warmup_steps': 500,
+    'lr_scheduler': 'OneCycleLR',
+    'warmup_ratio': 0.1,  # 10% of total steps
     
-    # Training dynamics
-    'batch_size': 8,  # Small due to memory constraints
-    'gradient_accumulation': 4,  # Effective batch size = 32
-    'max_epochs': 50,
+    # Training dynamics (VRAM-optimized for RTX 4060 8GB)
+    'batch_size': 1,  # Further reduced from 2
+    'gradient_accumulation': 8,  # Effective batch size = 8
+    'max_epochs': 5,  # For experimentation; increase for convergence
     'early_stopping_patience': 10,
     
     # Regularization
@@ -624,13 +630,23 @@ training_config = {
     'layer_dropout': 0.05,  # Drop entire transformer layers
     'label_smoothing': 0.1,
     
-    # Loss weights (dynamic adjustment)
-    'lambda_ctc': cosine_schedule(start=0.7, end=0.5),
-    'lambda_ce': 0.3,
-    'lambda_focal': 0.2,
-    'lambda_symbolic': cosine_schedule(start=0.1, end=0.3),
+    # Loss weights (fixed, not dynamic)
+    'lambda_ctc': 0.7,  # Primary: phoneme alignment
+    'lambda_ce': 0.3,   # Auxiliary: frame-level classification
+    
+    # Precision & Memory
+    'precision': '16-mixed',  # Mixed precision for GPU efficiency
+    'gradient_checkpointing': True,  # Trade compute for memory
+    'max_audio_length': 8.0,  # Truncate audio to 8 seconds
 }
 ```
+
+**Memory Optimizations in Detail**:
+- **Gradient Checkpointing** ([src/models/model.py](src/models/model.py#L325)): Recompute activations during backward pass instead of storing them. Reduces memory by ~40% at cost of ~20% slower training.
+- **Audio Truncation** ([src/data/dataloader.py](src/data/dataloader.py#L168)): Limit input length to 8 seconds (~128k samples at 16kHz). Prevents pathological long-sequence memory spikes.
+- **Frozen Encoder Layers**: Freeze first 8 of 12 HuBERT layers ([src/models/model.py](src/models/model.py#L352)). Low-level acoustic features don't need fine-tuning for dysarthria.
+- **Mixed Precision (fp16)**: Use 16-bit floats for activations/weights, 32-bit for loss computation. PyTorch Lightning handles this automatically.
+- **CUDA Fragmentation Mitigation** ([train.py](train.py#L551)): Set `PYTORCH_ALLOC_CONF=expandable_segments:True` to allow dynamic memory pool resizing.
 
 ### 7.3 Training Loop
 

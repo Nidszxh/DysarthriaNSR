@@ -19,28 +19,32 @@ python download.py  # Downloads TORGO to ./data/
 
 ### 2. Generate Manifest
 ```bash
-python manifest.py --data-dir ./data --out ./data/torgo_neuro_symbolic_manifest.csv
+python src/data/manifest.py --data-dir ./data --out ./data/processed/torgo_neuro_symbolic_manifest.csv
 ```
 
 ### 3. Train Model
 ```bash
-python train.py --config config.yaml
+# Run with default config
+python train.py
+
+# Or with custom run name
+python train.py --run-name experiment_v1
 ```
 
-### 4. Evaluate
-```python
-from evaluate import compute_per, compute_wer
-# Load checkpoints/best_model.ckpt and evaluate on test set
-```
+### 4. Results
+After training completes, results are automatically saved to:
+- **Checkpoints**: `./checkpoints/{run_name}/` — best 3 models + last checkpoint
+- **Evaluation**: `./results/{run_name}/` — visualizations, metrics, confusion matrices
+- **MLflow logs**: `./mlruns/` — hyperparameters and training curves
 
 ## Key Features
 
-- ✅ **HuBERT Encoder**: 768-dim self-supervised representations with selective layer freezing
-- ✅ **Symbolic Constraint Layer**: Articulatory feature-based phoneme similarity matrix
-- ✅ **Multi-Task Learning**: CTC loss (phoneme) + Focal loss (dysarthria classification) + KL constraint loss
-- ✅ **VRAM Optimized**: Gradient accumulation (batch_size=2, accumulation_steps=12) for RTX 4060 8GB
-- ✅ **MLflow Integration**: Experiment tracking with safe parameter flattening
-- ✅ **Evaluation Metrics**: PER, WER, phoneme confusion matrices, per-speaker error analysis
+- **HuBERT Encoder**: 768-dim self-supervised representations with selective layer freezing + gradient checkpointing
+- **Symbolic Constraint Layer**: Articulatory feature-based phoneme similarity matrix with adaptive dysarthria weighting
+- **Multi-Task Learning**: CTC loss (phoneme alignment) + CE loss (frame-level auxiliary)
+- **VRAM Optimized**: Audio truncation (8s max), batch_size=1, gradient_accumulation=8, fp16 mixed precision
+- **MLflow Integration**: Experiment tracking with safe parameter flattening
+- **Evaluation Metrics**: PER, WER, phoneme confusion matrices, per-speaker analysis, rule activation counts
 
 ## Project Structure
 
@@ -85,21 +89,28 @@ Constrained Logits (dysarthria-aware weighting)
 
 ## Configuration & Training
 
-**Key Hyperparameters** (see [config.py](config.py)):
-- Learning rate: 5e-5 (cosine annealing + 500-step warmup)
-- Batch size: 2 (effective: 24 with gradient accumulation)
-- Max epochs: 2 (experimentally configured)
+**Key Hyperparameters** (see [src/utils/config.py](src/utils/config.py)):
+- Learning rate: 5e-5 (OneCycleLR with 10% warmup)
+- Batch size: 1 (effective: 8 with gradient accumulation)
+- Max epochs: 5
+- Max audio length: 8 seconds (truncated for memory)
 - Dropout: 0.1 (classifier), 0.05 (layer)
 - Label smoothing: 0.1
+- Precision: fp16-mixed for GPU memory efficiency
+
+**Memory Optimizations**:
+- **Gradient Checkpointing**: Enabled on HuBERT encoder (trades compute for memory)
+- **Audio Truncation**: Long utterances capped at 8 seconds
+- **Frozen Encoder Layers**: First 8 of 12 HuBERT layers frozen (reduces parameters)
+- **Fragmentation Mitigation**: `PYTORCH_ALLOC_CONF=expandable_segments:True`
 
 **Loss Weighting**:
-- CTC loss (phoneme): 1.0
-- Focal loss (dysarthria): 0.1
-- KL constraint loss: 0.05
+- CTC loss (phoneme alignment): 0.7
+- CE loss (frame-level auxiliary): 0.3
 
 **Callbacks**:
-- EarlyStopping (patience=5, metric=val_per)
-- ModelCheckpoint (save best)
+- EarlyStopping (patience=10, metric=val/per)
+- ModelCheckpoint (save top 3 models)
 - LearningRateMonitor
 
 ## Dataset: TORGO
@@ -129,20 +140,9 @@ This project prioritizes:
 
 ## What's Implemented
 
-- ✅ Data pipeline (TORGO download + neuro-symbolic manifest)
-- ✅ Neural dataset & dataloader (HuBERT feature extraction, CTC batching)
-- ✅ NeuroSymbolicASR model (HuBERT + phoneme classifier + symbolic constraints)
-- ✅ Training infrastructure (PyTorch Lightning, multi-task learning, MLflow)
-- ✅ Evaluation (PER, WER, confusion matrices, per-speaker analysis)
-
-## Future Work
-
-- Explainability dashboard (phoneme confusion heatmaps, rule activations)
-- Pretrained model checkpoints (dysarthric/control baselines)
-- Symbolic rule discovery (auto-extract substitution patterns)
-- Clinical interface (ONNX export, streaming inference)
-- Ablation studies (neural vs. symbolic component contribution)
-
-## License
-
-See LICENSE file.
+- Data pipeline (TORGO download + neuro-symbolic manifest with articulatory features)
+- Neural dataset & dataloader (HuBERT feature extraction, CTC-compatible batching, audio truncation)
+- NeuroSymbolicASR model (HuBERT encoder + phoneme classifier + symbolic constraint layer)
+- Training infrastructure (PyTorch Lightning, multi-task CTC+CE loss, MLflow logging)
+- Evaluation pipeline (PER, WER, confusion matrices, per-speaker analysis, rule hit-rates)
+- Result persistence (checkpoints to disk, evaluation artifacts with visualizations)
