@@ -36,6 +36,11 @@ def get_project_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def strip_stress(phonemes: List[str]) -> List[str]:
+    """Remove ARPABET stress digits for stress-agnostic scoring."""
+    return [str(ph).rstrip('012') for ph in phonemes]
+
+
 def compute_per(prediction: List[str], reference: List[str]) -> float:
     """
     Compute Phoneme Error Rate (PER) using edit distance.
@@ -50,11 +55,14 @@ def compute_per(prediction: List[str], reference: List[str]) -> float:
     Returns:
         PER score (0.0 to 1.0+, can exceed 1.0 for many insertions)
     """
-    if len(reference) == 0:
-        return 1.0 if len(prediction) > 0 else 0.0
+    prediction_clean = strip_stress(prediction)
+    reference_clean = strip_stress(reference)
+
+    if len(reference_clean) == 0:
+        return 1.0 if len(prediction_clean) > 0 else 0.0
     
-    distance = editdistance.eval(prediction, reference)
-    per = distance / len(reference)
+    distance = editdistance.eval(prediction_clean, reference_clean)
+    per = distance / len(reference_clean)
     return per
 
 
@@ -191,7 +199,9 @@ def analyze_phoneme_errors(
     insertion_phonemes = []
     
     for pred, ref in zip(predictions, references):
-        alignment = phoneme_alignment(pred, ref)
+        pred_clean = strip_stress(pred)
+        ref_clean = strip_stress(ref)
+        alignment = phoneme_alignment(pred_clean, ref_clean)
         
         for op, pred_ph, ref_ph in alignment:
             if op == 'correct':

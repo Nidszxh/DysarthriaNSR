@@ -436,6 +436,16 @@ class NeuroSymbolicASR(nn.Module):
                 for param in self.hubert.encoder.layers[layer_idx].parameters():
                     param.requires_grad = True
 
+    def _unfreeze_all_hubert(self) -> None:
+        """Helper to unfreeze the full HuBERT stack before reapplying freezes."""
+        for param in self.hubert.parameters():
+            param.requires_grad = True
+
+    def unfreeze_after_warmup(self) -> None:
+        """Unfreeze encoder after warmup while keeping configured frozen layers."""
+        self._unfreeze_all_hubert()
+        self._configure_frozen_layers()
+
 
 def main() -> None:
     import sys
