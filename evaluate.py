@@ -685,7 +685,7 @@ def evaluate_model(
                 beta_val = np.clip(base_beta + 0.1 * sev_norm, 0.0, 0.8)
                 all_beta_values.append(float(beta_val))
             
-            if (batch_idx + 1) % 10 == 0:
+            if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
     
     # Compute overall metrics
@@ -943,7 +943,6 @@ def plot_beta_vs_per(
 
 
 def main() -> None:
-    """Test evaluation functions."""
     # Test PER computation
     pred = ['P', 'B', 'T', 'AH', 'L']
     ref = ['B', 'AH', 'T', 'AH', 'L']

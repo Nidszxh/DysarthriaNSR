@@ -116,7 +116,7 @@ class TorgoManager:
         arrow_dest.mkdir(parents=True, exist_ok=True)
         arrow_files = list(hf_cache.rglob("*.arrow"))
         
-        logger.info(f" Organizing {len(arrow_files)} arrow files...")
+        logger.info(f"Organizing {len(arrow_files)} arrow files...")
         for arrow_file in arrow_files:
             dest = arrow_dest / arrow_file.name
             if not dest.exists():
@@ -131,12 +131,12 @@ def main():
     try:
         # 1. Load dataset
         dataset = manager.download_and_load()
-        logger.info(f" Splits found: {list(dataset.keys())}")
+        logger.info(f"Splits found: {list(dataset.keys())}")
         
         # 2. Inspection
         sample = dataset["train"][0]
         text_snippet = sample['transcription'][:50]
-        logger.info(f" Sample Transcription: {text_snippet}...")
+        logger.info(f"Sample Transcription: {text_snippet}...")
         
         # 3. File Management
         manager.organize_arrows()

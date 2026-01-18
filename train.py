@@ -26,6 +26,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from utils.config import Config, get_default_config, get_project_root
 from data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+import os
 from models.model import NeuroSymbolicASR
 
 # Import evaluate functions from root level
@@ -543,6 +544,9 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     Returns:
         Tuple of (trained_model, trainer)
     """
+    # Mitigate memory fragmentation for long audio sequences
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
     if config is None:
         config = get_default_config()
     
@@ -572,7 +576,8 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     dataset = TorgoNeuroSymbolicDataset(
         manifest_path=str(config.data.manifest_path),
         processor_id=config.model.hubert_model_id,
-        sampling_rate=config.data.sampling_rate
+        sampling_rate=config.data.sampling_rate,
+        max_audio_length=config.data.max_audio_length
     )
     
     # Create dataloaders

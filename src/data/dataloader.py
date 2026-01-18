@@ -41,7 +41,8 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self, 
         manifest_path: str, 
         processor_id: str = "facebook/hubert-base-ls960", 
-        sampling_rate: int = 16000
+        sampling_rate: int = 16000,
+        max_audio_length: float = None
     ):
         """ Initialize TORGO dataset.
         # Args:
@@ -57,8 +58,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.df = self.df[self.df["phonemes"].fillna("").str.strip() != ""].reset_index(drop=True)
         dropped = initial_count - len(self.df)
         if dropped:
-            print(f"⚠️ Removed {dropped} samples with empty phoneme sequences")
+            print(f"Removed {dropped} samples with empty phoneme sequences")
         self.sampling_rate = sampling_rate
+        self.max_audio_samples = (
+            int(max_audio_length * sampling_rate) if max_audio_length else None
+        )
         
         # Load feature processor
         self.processor = self._load_processor(processor_id)
@@ -66,20 +70,20 @@ class TorgoNeuroSymbolicDataset(Dataset):
         # Build phoneme vocabulary
         self._build_vocabularies()
         
-        print(f"📊 Dataset initialized: {len(self.df)} samples")
-        print(f"🔤 Vocabulary size: {len(self.phn_to_id)} phonemes")
+        print(f"Dataset initialized: {len(self.df)} samples")
+        print(f"Vocabulary size: {len(self.phn_to_id)} phonemes")
     
     def _load_processor(self, processor_id: str):
         # Load feature processor from HuggingFace.
         if "hubert" in processor_id.lower():
-            print(f"🔥 Loading HuBERT feature extractor...")
+            print(f"Loading HuBERT feature extractor...")
             return AutoFeatureExtractor.from_pretrained(processor_id)
         
         # Try AutoProcessor first, fall back to feature extractor
         try:
             return AutoProcessor.from_pretrained(processor_id)
         except Exception as e:
-            print(f"⚠️  AutoProcessor failed, using feature extractor: {e}")
+            print(f"AutoProcessor failed, using feature extractor: {e}")
             return AutoFeatureExtractor.from_pretrained(processor_id)
     
     def _build_vocabularies(self) -> None:
@@ -161,6 +165,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
         # Resample if necessary using functional API to avoid recreating kernels
         if sample_rate != self.sampling_rate:
             waveform = taF.resample(waveform, sample_rate, self.sampling_rate)
+
+        # Truncate long waveforms to reduce GPU memory footprint
+        if self.max_audio_samples is not None:
+            if waveform.shape[-1] > self.max_audio_samples:
+                waveform = waveform[..., : self.max_audio_samples]
         
         # Normalize using peak normalization
         waveform = waveform.squeeze(0)
@@ -314,7 +323,7 @@ class NeuroSymbolicCollator:
 
 
 def create_dataloaders( manifest_path: str, processor_id: str = "facebook/hubert-base-ls960",
-    batch_size: int = 4, num_workers: int = 4, sampling_rate: int = 16000) -> DataLoader:
+    batch_size: int = 4, num_workers: int = 4, sampling_rate: int = 16000, max_audio_length: float = None) -> DataLoader:
     """
     Create DataLoader for TORGO dataset.
     
@@ -331,7 +340,8 @@ def create_dataloaders( manifest_path: str, processor_id: str = "facebook/hubert
     dataset = TorgoNeuroSymbolicDataset(
         manifest_path=manifest_path,
         processor_id=processor_id,
-        sampling_rate=sampling_rate
+        sampling_rate=sampling_rate,
+        max_audio_length=max_audio_length
     )
     
     collator = NeuroSymbolicCollator(dataset.processor)
@@ -368,7 +378,7 @@ def main() -> None:
     
     # Test batch loading
     for batch in loader:
-        print("\n✅ Batch loaded successfully")
+        print("\nBatch loaded successfully")
         print(f"Input shape (neural): {batch['input_values'].shape}")
         print(f"Labels shape (symbolic): {batch['labels'].shape}")
         print(f"Attention mask shape: {batch['attention_mask'].shape}")

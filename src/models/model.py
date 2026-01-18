@@ -315,6 +315,13 @@ class NeuroSymbolicASR(nn.Module):
         # HuBERT Encoder
         print(f"🧠 Loading HuBERT: {model_config.hubert_model_id}")
         self.hubert = HubertModel.from_pretrained(model_config.hubert_model_id)
+        # Enable gradient checkpointing to reduce activation memory
+        try:
+            self.hubert.gradient_checkpointing_enable()
+        except Exception:
+            # Fallback for older transformers versions
+            if hasattr(self.hubert, "config"):
+                setattr(self.hubert.config, "gradient_checkpointing", True)
         
         # Configure frozen layers
         self._configure_frozen_layers()

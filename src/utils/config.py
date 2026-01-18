@@ -21,7 +21,7 @@ class ModelConfig:
     # HuBERT Encoder
     hubert_model_id: str = "facebook/hubert-base-ls960"
     freeze_feature_extractor: bool = True
-    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 6)))
+    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 8)))
     
     # Phoneme Classifier
     hidden_dim: int = 512
@@ -49,9 +49,9 @@ class TrainingConfig:
     warmup_ratio: float = 0.1
     
     # Training Dynamics (VRAM-optimized)
-    batch_size: int = 2  # Small batch for 8GB VRAM
-    gradient_accumulation_steps: int = 12  # Effective batch size = 24
-    max_epochs: int = 2  # For experimentation
+    batch_size: int = 2  # Further reduced for 8GB VRAM
+    gradient_accumulation_steps: int = 8  # Effective batch size = 16
+    max_epochs: int = 5  # For experimentation
     val_check_interval: float = 0.25  # Validate 4 times per epoch
     
     # Regularization
@@ -97,7 +97,7 @@ class DataConfig:
     
     # Audio Processing
     sampling_rate: int = 16000
-    max_audio_length: float = 10.0  # seconds
+    max_audio_length: float = 8.0  # seconds (truncate to reduce memory)
 
 
 @dataclass
