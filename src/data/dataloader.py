@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 from dataclasses import dataclass
+import numpy as np
 try:
     from src.utils.config import get_default_config
 except ImportError:
@@ -52,7 +53,8 @@ class TorgoNeuroSymbolicDataset(Dataset):
         """
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(f"Manifest not found at {manifest_path}")
-            
+        
+        self.manifest_path = manifest_path
         self.df = pd.read_csv(manifest_path)
         initial_count = len(self.df)
         self.df = self.df[self.df["phonemes"].fillna("").str.strip() != ""].reset_index(drop=True)
@@ -69,6 +71,9 @@ class TorgoNeuroSymbolicDataset(Dataset):
         
         # Build phoneme vocabulary
         self._build_vocabularies()
+        
+        # Pre-calculate inverse-frequency phoneme weights for loss balancing
+        self.phoneme_weights = self._calculate_phoneme_weights()
         
         print(f"Dataset initialized: {len(self.df)} samples")
         print(f"Vocabulary size: {len(self.phn_to_id)} phonemes")
@@ -130,6 +135,44 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.id_to_art = {idx: art for art, idx in self.art_to_id.items()}
         self.art_pad_id = 0
         self.art_unk_id = 1
+
+    def _calculate_phoneme_weights(self) -> torch.Tensor:
+        """
+        Calculate inverse-frequency weights per phoneme to mitigate class imbalance.
+        Returns a tensor aligned to `self.phn_to_id` indices.
+        """
+        # Collect all normalized phonemes from manifest
+        all_phonemes: List[str] = []
+        for row in self.df['phonemes'].fillna(""):
+            all_phonemes.extend([self._normalize_phoneme(p) for p in str(row).split()])
+
+        # Frequency counts using pandas for robustness
+        counts = pd.Series(all_phonemes).value_counts()
+
+        # Initialize weights to ones
+        weights = torch.ones(len(self.phn_to_id), dtype=torch.float32)
+        median_freq = float(counts.median()) if not counts.empty else 1.0
+
+        # Assign inverse-frequency weights (with sqrt damping)
+        for phn, phn_id in self.phn_to_id.items():
+            if phn in counts:
+                freq = float(counts[phn])
+                # Avoid division by zero; sqrt to damp extremes
+                weights[phn_id] = np.sqrt(median_freq / max(freq, 1.0))
+            else:
+                weights[phn_id] = 1.0
+
+        # Optional: adjust BLANK to discourage over-insertion (slightly lower than others)
+        if '<BLANK>' in self.phn_to_id:
+            weights[self.phn_to_id['<BLANK>']] *= 0.8
+
+        # Clamp for numerical stability
+        weights = torch.clamp(weights, min=0.5, max=5.0)
+        return weights
+
+    def get_loss_weights(self) -> torch.Tensor:
+        """Return precomputed phoneme weights for use in CrossEntropyLoss."""
+        return self.phoneme_weights
 
     @staticmethod
     def _normalize_phoneme(phn: str) -> str:

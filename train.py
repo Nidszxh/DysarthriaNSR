@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import MLFlowLogger
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 # Add src directory to path for imports
 project_root = Path(__file__).resolve().parent
@@ -86,7 +86,8 @@ class DysarthriaASRLightning(pl.LightningModule):
         model: NeuroSymbolicASR,
         config: Config,
         phn_to_id: Dict[str, int],
-        id_to_phn: Dict[int, str]
+        id_to_phn: Dict[int, str],
+        class_weights: Optional[torch.Tensor] = None
     ):
         """
         Initialize Lightning module.
@@ -102,12 +103,17 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.config = config
         self.phn_to_id = phn_to_id
         self.id_to_phn = id_to_phn
+        self.class_weights = class_weights
         
         # Save hyperparameters (exclude complex objects)
         self.save_hyperparameters(ignore=['model', 'config', 'phn_to_id', 'id_to_phn'])
         
         # Initialize loss functions
         self._init_loss_functions()
+        
+        # Freeze HuBERT encoder for warmup epochs to stabilize the head
+        self.model.freeze_encoder()
+        self.encoder_unfrozen = False
         
         # Metrics tracking
         self.validation_step_outputs = []
@@ -120,7 +126,24 @@ class DysarthriaASRLightning(pl.LightningModule):
             zero_infinity=True
         )
         
+        num_classes = len(self.phn_to_id)
+        # Use dataset-provided inverse-frequency weights if available
+        if self.class_weights is not None:
+            ce_weights = self.class_weights.clone().detach().float()
+            # Ensure correct length
+            if ce_weights.numel() != num_classes:
+                ce_weights = torch.ones(num_classes, dtype=torch.float32)
+        else:
+            ce_weights = torch.ones(num_classes, dtype=torch.float32)
+
+        # Optional emphasis for special tokens if present
+        if '<BLANK>' in self.phn_to_id:
+            ce_weights[self.phn_to_id['<BLANK>']] = float(ce_weights[self.phn_to_id['<BLANK>']]) * 1.5
+        if '<PAD>' in self.phn_to_id:
+            ce_weights[self.phn_to_id['<PAD>']] = float(ce_weights[self.phn_to_id['<PAD>']]) * 1.5
+
         self.ce_loss = nn.CrossEntropyLoss(
+            weight=ce_weights,
             ignore_index=-100,
             label_smoothing=self.config.training.label_smoothing
         )
@@ -128,6 +151,14 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Register loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
         self.register_buffer('lambda_ce', torch.tensor(self.config.training.lambda_ce))
+
+    def on_fit_start(self) -> None:
+        """Ensure loss weights reside on the correct device once available."""
+        if hasattr(self, 'ce_loss') and hasattr(self.ce_loss, 'weight') and self.ce_loss.weight is not None:
+            try:
+                self.ce_loss.weight = self.ce_loss.weight.to(self.device)
+            except Exception:
+                pass
     
     def forward(self, batch: Dict) -> Dict:
         """
@@ -268,6 +299,12 @@ class DysarthriaASRLightning(pl.LightningModule):
         
         labels = batch['labels']
         label_lengths = (labels != -100).sum(dim=1)
+
+        # Guard against label sequences longer than available frames to avoid CTC inf
+        if (label_lengths > input_lengths).any():
+            # Align lengths conservatively to avoid invalid CTC; log once per hit
+            input_lengths = torch.maximum(input_lengths, label_lengths)
+            self.log('train/ctc_length_adjust', (label_lengths > input_lengths).float().mean(), on_step=True, prog_bar=False)
         
         # Compute losses
         losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
@@ -281,6 +318,14 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
         
         return losses['loss']
+
+    def on_train_epoch_start(self) -> None:
+        """Gradually unfreeze HuBERT after warmup epochs."""
+        if (not self.encoder_unfrozen and
+                self.current_epoch >= self.config.training.encoder_warmup_epochs):
+            self.model.unfreeze_after_warmup()
+            self.encoder_unfrozen = True
+            print(f"🧊 Unfroze HuBERT encoder at epoch {self.current_epoch}")
     
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
         """
@@ -501,12 +546,19 @@ def create_dataloaders(
     
     # Create collator
     collator = NeuroSymbolicCollator(dataset.processor)
+
+    # Weighted sampling to balance dysarthric vs control speakers
+    train_df = dataset.df.iloc[train_idx]
+    status_counts = train_df['status'].value_counts().to_dict()
+    train_weights = [1.0 / status_counts[dataset.df.iloc[i]['status']] for i in train_idx]
+    sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
-        shuffle=True,
+        shuffle=False,
+        sampler=sampler,
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
@@ -546,6 +598,7 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     """
     # Mitigate memory fragmentation for long audio sequences
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    torch.set_float32_matmul_precision('high')
 
     if config is None:
         config = get_default_config()
@@ -597,7 +650,8 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         model=model,
         config=config,
         phn_to_id=dataset.phn_to_id,
-        id_to_phn=dataset.id_to_phn
+        id_to_phn=dataset.id_to_phn,
+        class_weights=dataset.get_loss_weights()
     )
     
     # Setup callbacks

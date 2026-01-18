@@ -29,7 +29,7 @@ class ModelConfig:
     classifier_dropout: float = 0.1
     
     # Symbolic Constraint Layer
-    constraint_weight_init: float = 0.3
+    constraint_weight_init: float = 0.5
     constraint_learnable: bool = True
     use_articulatory_distance: bool = True
 
@@ -51,7 +51,8 @@ class TrainingConfig:
     # Training Dynamics (VRAM-optimized)
     batch_size: int = 2  # Further reduced for 8GB VRAM
     gradient_accumulation_steps: int = 8  # Effective batch size = 16
-    max_epochs: int = 5  # For experimentation
+    max_epochs: int = 30  # Extended for proper convergence with HuBERT fine-tuning
+    encoder_warmup_epochs: int = 3  # Keep HuBERT frozen before unfreezing
     val_check_interval: float = 0.25  # Validate 4 times per epoch
     
     # Regularization
