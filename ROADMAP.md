@@ -1,6 +1,10 @@
-# Detailed Low-Level System Architecture
+# Implementation Status & Detailed System Architecture
 
-## 1. Data Pipeline & Preprocessing
+**Current Status**: Core system (data pipeline, model, training) is **implemented** ✅. This document details the low-level architecture, design decisions, and implementation patterns.
+
+---
+
+## ✅ COMPLETED: Data Pipeline & Preprocessing
 
 ### 1.1 Dataset Structure (TORGO)
 ```
@@ -786,3 +790,184 @@ Explainability Service
     ↓
 Response (Transcription + Explanations)
 ```
+
+---
+
+## Implementation Checklist
+
+### ✅ Data & Preprocessing
+- [x] TORGO dataset download via HuggingFace ([download.py](download.py))
+- [x] Manifest generation with phoneme extraction ([manifest.py](manifest.py))
+- [x] Articulatory feature mapping (stops, fricatives, nasals, liquids, glides, vowels)
+- [x] RMS energy calculation for signal quality assessment
+- [x] Speaker-prefixed sample matching
+
+### ✅ Neural Component
+- [x] HuBERT encoder initialization (facebook/hubert-base-ls960)
+- [x] Selective layer freezing (layers 0-5 frozen, 6-11 fine-tuned)
+- [x] Projection layer (768 → 512-dim)
+- [x] Phoneme classifier with dropout
+
+### ✅ Symbolic Component
+- [x] ArticulatoryFeatureEncoder (manner, place, voicing features)
+- [x] SymbolicConstraintMatrix (euclidean distance-based similarity)
+- [x] ConstraintAggregation (weighted combination of neural + symbolic logits)
+- [x] Dysarthria-aware weighting (severity-dependent interpolation)
+
+### ✅ Training
+- [x] PyTorch Lightning trainer setup ([train.py](train.py))
+- [x] Multi-task learning (CTC + Focal + KL constraint losses)
+- [x] Gradient accumulation & VRAM optimization
+- [x] Learning rate scheduling (cosine annealing + warmup)
+- [x] Callbacks (EarlyStopping, ModelCheckpoint, LearningRateMonitor)
+- [x] MLflow experiment tracking with safe parameter flattening
+
+### ✅ Evaluation
+- [x] PER (Phoneme Error Rate) computation ([evaluate.py](evaluate.py))
+- [x] WER (Word Error Rate) with jiwer
+- [x] Phoneme alignment & confusion matrices
+- [x] Per-speaker and per-articulatory-class error analysis
+- [x] Visualization utilities
+
+### ✅ Data Management
+- [x] PyTorch Dataset & DataLoader ([dataloader.py](dataloader.py))
+- [x] CTC-compatible batching (attention masks, label padding)
+- [x] Peak normalization for dysarthric speech variability
+- [x] Collator for flexible sequence handling
+
+### ✅ Configuration
+- [x] Dataclass-based config ([config.py](config.py))
+- [x] ModelConfig, TrainingConfig, SymbolicConfig, DataConfig
+- [x] Safe YAML loading & parameter override
+
+---
+
+## 📋 Not Yet Implemented
+
+### Explainability & Analysis
+- [ ] Interactive dashboard (phoneme confusion heatmaps, rule activation maps)
+- [ ] Per-speaker error attribution with clinical interpretability
+- [ ] Rule activation tracking for symbolic constraint layer
+- [ ] Attention visualization for HuBERT layer analysis
+
+### Model Deployment & Checkpoints
+- [ ] Pretrained model checkpoints (dysarthric/control baselines)
+- [ ] ONNX export for inference optimization
+- [ ] TorchScript export for production deployment
+- [ ] Streaming inference API (FastAPI)
+
+### Advanced Features
+- [ ] Automatic dysarthric substitution rule discovery (from confusion matrices)
+- [ ] Speaker adaptation fine-tuning
+- [ ] Confidence scoring & uncertainty estimation
+- [ ] Real-time feedback system for speech therapy
+
+### Research Extensions
+- [ ] Ablation studies (neural vs. symbolic contribution quantification)
+- [ ] Cross-dataset evaluation (on non-TORGO dysarthric corpora)
+- [ ] Comparison with baseline ASR systems
+- [ ] Analysis of constraint matrix learned weights
+
+---
+
+## Key Design Decisions & Rationale
+
+### Why HuBERT over Wav2Vec2?
+- HuBERT uses discrete clustering targets (more phoneme-aligned)
+- Better performance on dysarthric speech in preliminary experiments
+- Smaller parameter footprint for VRAM constraints
+
+### Why Symbolic Constraints?
+- Dysarthric substitutions follow articulatory patterns (preserve place/manner)
+- Symbolic layer provides interpretability (which rules fired?)
+- Modular design allows separate ablation of neural vs. symbolic components
+
+### Why Multi-Task Learning?
+- Dysarthria classification as auxiliary task improves speaker-level discrimination
+- Focal loss handles class imbalance (fewer dysarthric speakers)
+- KL constraint loss provides soft regularization (not hard constraints)
+
+### Why Gradient Accumulation?
+- RTX 4060 (8GB VRAM) cannot fit batch_size > 2
+- Accumulation steps=12 → effective batch=24 (better gradient estimates)
+- Maintains training stability without reducing effective batch size
+
+### Why Speaker-Independent Splits?
+- TORGO has only ~15 speakers; speaker-dependent splits would leak test information
+- Generalization to unseen dysarthric speakers is the research goal
+- Per-speaker evaluation metrics computed separately
+
+---
+
+## Integration Points & Cross-Component Communication
+
+### Data → Model Flow
+```
+manifest.csv (speaker, phonemes, articulatory_classes)
+    ↓
+TorgoNeuroSymbolicDataset (streams from HF + manifest)
+    ↓
+NeuroSymbolicCollator (batches with attention masks, label padding=-100)
+    ↓
+DataLoader (shuffle, variable-length batching)
+    ↓
+NeuroSymbolicASR (forward pass)
+```
+
+### Model Inference Flow
+```
+Audio Waveform (16kHz)
+    ↓
+HuBERT Feature Extraction (768-dim, 50Hz frame rate)
+    ↓
+Projection (768 → 512)
+    ↓
+Phoneme Classifier → Neural Logits
+    ↓
+SymbolicConstraintMatrix (precomputed from phoneme features)
+    ↓
+ConstraintAggregation (α * neural + (1-α) * (C @ neural))
+    ↓
+Constrained Logits
+    ↓
+CTC Decoder (greedy or beam search)
+    ↓
+Phoneme Sequence → Transcript
+```
+
+### Training Loop
+```
+Batch from DataLoader
+    ↓
+Forward pass → neural logits + constrained logits
+    ↓
+CTC Loss (alignment) + Focal Loss (dysarthria) + KL Loss (constraint)
+    ↓
+Backward pass (gradient accumulation every N steps)
+    ↓
+Learning rate scheduler update
+    ↓
+Validation: PER computation on val set
+    ↓
+Early stopping (metric: val_per, patience=5)
+```
+
+---
+
+## Common Debugging Patterns
+
+**Issue**: Audio appears silent in batch
+- **Cause**: Peak normalization not applied during loading
+- **Solution**: Verify `_load_audio()` normalizes by `max(abs(waveform))`
+
+**Issue**: CTC loss NaN or infinite
+- **Cause**: Input lengths > output lengths (feature extraction stride issue)
+- **Solution**: Check HuBERT feature rate: ~50Hz for 16kHz audio (stride=320)
+
+**Issue**: Model not learning (loss plateaus)
+- **Cause**: Symbolic constraint too strong (α too low), masking neural learning
+- **Solution**: Increase α (start 0.8, decrease to 0.5 for dysarthric cohorts)
+
+**Issue**: Validation PER very high
+- **Cause**: Speaker-prefixed sample IDs not matching HF dataset keys
+- **Solution**: Verify manifest `sample_id` format: `f"{speaker}_{filename}"`

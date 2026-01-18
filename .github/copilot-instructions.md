@@ -50,7 +50,8 @@ This is a research project combining:
    - Covers stops, fricatives, nasals, liquids, glides, vowels, diphthongs with phonetic properties (manner, place, voicing)
 
 7. **Training Pipeline** ([train.py](train.py)):
-   - Multi-task learning: CTC loss (phoneme) + focal loss (dysarthria classification) + KL constraint loss
+   - Multi-task learning: CTC loss (primary phoneme alignment) + CE loss (frame-level auxiliary)
+   - Adaptive neuro-symbolic weighting via `beta`: Neural logits blended with symbolic constraints based on speaker severity
    - MLflow tracking with safe parameter flattening for nested configs
    - EarlyStopping, ModelCheckpoint, LearningRateMonitor callbacks
    - Gradient accumulation (batch_size=2, accumulation_steps=12) for RTX 4060 8GB VRAM constraint
@@ -110,24 +111,35 @@ loader = DataLoader(
 
 ### 4. Start Training
 ```bash
-python train.py --config config.yaml  # Uses MLflow for experiment tracking
-# Or with overrides:
-python train.py --config config.yaml --trainer.max_epochs 10 --training.batch_size 4
+python train.py  # Uses default config from src/utils/config.py
 ```
-- Checkpoints saved to `./checkpoints/` (triggered by validation metrics)
-- MLflow runs logged to `mlruns/` with safe parameter flattening
-- Early stopping after 5 validation epochs without improvement
+- **Config system**: Uses Python dataclasses (`ModelConfig`, `TrainingConfig`, `SymbolicConfig`) in `src/utils/config.py`
+- **Checkpoints saved to**: `./checkpoints/` (triggered by validation metrics, keeps top 3 models)
+- **MLflow runs logged to**: `mlruns/` with safe parameter flattening (handles nested dict keys)
+- **Early stopping**: After 10 validation steps without improvement (metric: `val/per`)
+- **Monitoring**: `train/loss`, `train/loss_ctc`, `train/loss_ce`, `train/avg_beta` tracked in MLflow
 
 ### 5. Evaluate Trained Model
 ```python
-from train import TrainedModel
-from evaluate import compute_per, compute_wer, visualize_confusion_matrix
+from train import DysarthriaASRLightning
+from evaluate import compute_per, compute_wer, evaluate_model
 
-# Load checkpoint and compute metrics per speaker, articulatory class, dysarthria status
-model = TrainedModel.load_from_checkpoint("checkpoints/best_model.ckpt")
-per_scores, confusion_mats = model.evaluate(test_loader)
-visualize_confusion_matrix(confusion_mats, save_path="results/")
+# Load checkpoint (PyTorch Lightning automatically handles state_dict)
+model = DysarthriaASRLightning.load_from_checkpoint("checkpoints/epoch=X-step=Y.ckpt")
+
+# Run comprehensive evaluation with visualizations
+evaluate_model(
+    model=model.model,  # Extract the underlying NeuroSymbolicASR from Lightning wrapper
+    dataloader=test_loader,
+    device="cuda",
+    phn_to_id=dataset.phn_to_id,
+    id_to_phn=dataset.id_to_phn,
+    results_dir="results/"
+)
 ```
+- Metrics computed per speaker, per articulatory class, per dysarthria status
+- Outputs confusion matrices, error analysis, phoneme alignment visualizations
+- Clinical diagnostic plots saved to `results/figures/`
 
 ### Environment Requirements
 - Python 3.8+
@@ -169,17 +181,17 @@ visualize_confusion_matrix(confusion_mats, save_path="results/")
   - Use this in error analysis: Higher confusion between articulatorily-similar phonemes is clinically expected
 
 ### Training Configuration & Multi-Task Learning
-- **Config file**: [config.py](config.py) with dataclasses for ModelConfig, TrainingConfig, SymbolicConfig
+- **Config file**: [src/utils/config.py](src/utils/config.py) with dataclasses for `ModelConfig`, `TrainingConfig`, `SymbolicConfig`
 - **Loss weighting**: 
-  - CTC loss (phoneme alignment): 1.0
-  - Focal loss (dysarthria classification): 0.1 (handles class imbalance)
-  - KL constraint loss (symbolic guidance): 0.05
+  - CTC loss (phoneme alignment): `lambda_ctc=0.7`
+  - CE loss (frame-level auxiliary): `lambda_ce=0.3`
+  - **Combined loss**: `loss = lambda_ctc * loss_ctc + lambda_ce * loss_ce`
 - **VRAM optimization**: 
   - Batch size 2, gradient accumulation 12 steps = effective batch 24
   - Freeze HuBERT encoder layers 0-5 (reduce parameters, VRAM)
   - Layer dropout 0.05 for regularization
 - **Learning rate schedule**: Cosine annealing with 500-step warmup
-- **Checkpoint strategy**: Save best model (early stopping metric: validation PER)
+- **Checkpoint strategy**: Save best 3 models (early stopping metric: validation PER)
 - **Vocabulary architecture**:
   ```python
   <BLANK> = 0      # CTC alignment state (not a phoneme)
@@ -187,9 +199,11 @@ visualize_confusion_matrix(confusion_mats, save_path="results/")
   <UNK> = 2        # Unknown/OOV phonemes
   Phonemes = 3+    # Actual target labels
   ```
-- **Loss computation**: Use `torch.nn.CTCLoss` with reduction on frames (not samples)
-- **Label padding**: Use `-100` for CTC-compatible loss functions to ignore padding
-- **Input length**: Computed from attention_mask; output length from label sequence length
+- **Loss computation**: 
+  - CTC loss: `torch.nn.CTCLoss` on constrained logits (handles variable-length alignment)
+  - CE loss: Frame-level cross-entropy on predictions
+  - Label padding value `-100` (automatically ignored by both loss functions)
+  - Input lengths from attention_mask; output lengths from label sequences
 
 ### TORGO-Specific Handling
 - **Peak normalization**: Dysarthric speakers have variable breath support; normalize waveform by peak amplitude
@@ -202,14 +216,89 @@ visualize_confusion_matrix(confusion_mats, save_path="results/")
 - Type hints for function signatures (`Path`, `pd.DataFrame`, `torch.Tensor`)
 - Descriptive variable names aligned with research concepts (`is_dysarthric`, `phonemes`, `articulatory_classes`, `rms_energy`)
 
+## Hidden Implementation Patterns (Critical for Modifications)
+
+### 1. Forward Pass & Neural-Symbolic Integration
+
+In [train.py](train.py), the `forward()` method passes **batch status as speaker severity proxy** to activate adaptive beta:
+```python
+def forward(self, batch: Dict) -> Dict:
+    # 'status' = 0 (control) or 1 (dysarthric) → scale to 0-5 severity range
+    severity = batch['status'].float() * 5.0
+    return self.model(
+        input_values=batch['input_values'],
+        attention_mask=batch['attention_mask'],
+        speaker_severity=severity  # Triggers ConstraintAggregation weighting
+    )
+```
+**Why**: Beta interpolation weight is severity-aware; dysarthric speakers (status=1) get stronger symbolic constraint influence.
+
+### 2. MLflow Parameter Flattening
+
+The `flatten_config_for_mlflow()` function converts nested dataclass configs to flat dicts before logging:
+- **Problem**: MLflow rejects tuple keys and nested dicts
+- **Solution**: Recursively flatten with "/" separators; skip complex nested structures
+- **Impact**: Without this, MLflow logging crashes on `config.symbolic.__dict__` if it contains tuples (e.g., weights)
+
+### 3. Attention Mask vs Label Padding
+
+Both require **different sentinel values**:
+- **attention_mask**: Binary mask (1 for valid, 0 for padding) — used by HuBERT encoder
+- **labels**: Phoneme IDs, with **-100 for padding** — automatically ignored by both CTC and CE loss functions
+```python
+# In compute_loss():
+label_lengths = (labels != -100).sum(dim=1)  # Counts actual phoneme tokens
+input_lengths = torch.full(..., logits.size(1), ...)  # Assumes full sequence valid
+```
+**Gotcha**: If labels don't use -100, CTC loss treats padding as "<PAD>" token (ID 1) → wrong alignment.
+
+### 4. Phoneme Vocabulary Building
+
+In [dataloader.py](dataloader.py), vocabulary is built **once** at dataset initialization:
+```python
+self.phn_to_id = {
+    '<BLANK>': 0,  # CTC blank (never a true label)
+    '<PAD>': 1,    # Padding in batches
+    '<UNK>': 2,    # Unknown phonemes
+}
+# Phonemes start at ID 3
+```
+**Critical**: The model's output logits shape is `[batch, time, num_phonemes]` where `num_phonemes = len(phn_to_id)`. If manifest has unobserved phonemes, they're mapped to `<UNK>` (ID 2).
+
+### 5. Symbolic Constraint Matrix Weight Initialization
+
+In [model.py](model.py), `ConstraintAggregation` uses learnable blending weight `alpha`:
+```python
+# logits_constrained = alpha * logits_neural + (1 - alpha) * (constraint_matrix @ logits_neural)
+self.alpha = nn.Parameter(torch.tensor(constraint_weight_init))  # e.g., 0.3
+```
+- **Initialization**: `constraint_weight_init` from config (default 0.3 = favor neural)
+- **Learning**: Alpha is updated during training; monitor via `train/avg_beta` in MLflow
+- **Interpretation**: Alpha ≈ 0 → rely on symbolic rules; Alpha ≈ 1 → pure neural
+
+### 6. HuBERT Encoder Layer Freezing
+
+For VRAM optimization, [model.py](model.py) freezes early layers by default:
+```python
+freeze_encoder_layers = [0, 1, 2, 3, 4, 5]  # Freeze first 6 layers (of 12)
+for layer_idx in freeze_encoder_layers:
+    for param in encoder.layers[layer_idx].parameters():
+        param.requires_grad = False
+```
+**Why**: Lower layers learn generic acoustic features; dysarthria-specific refinement happens in unfrozen layers.
+
 ## Key Files & Directories
 
 - [Overview.md](Overview.md): Detailed system architecture and research motivation
 - [download.py](download.py): Dataset download with safe path extraction
 - [manifest.py](manifest.py): Neuro-symbolic manifest generation with articulatory and robustness features
 - [dataloader.py](dataloader.py): PyTorch dataset and dataloader for CTC training with HF streaming
+- [train.py](train.py): PyTorch Lightning training orchestrator with multi-task learning
+- [model.py](model.py): NeuroSymbolicASR core model (HuBERT + phoneme classifier + symbolic constraints)
+- [evaluate.py](evaluate.py): Comprehensive evaluation with PER, WER, confusion matrices, clinical visualizations
 - `./data/`: HuggingFace cache and manifest CSV
 - `./data/torgo_neuro_symbolic_manifest.csv`: Generated manifest (16K+ samples with metadata)
+- `src/utils/config.py`: Configuration dataclasses (ModelConfig, TrainingConfig, SymbolicConfig)
 
 ## What's Implemented
 
