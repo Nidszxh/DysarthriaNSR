@@ -1,12 +1,25 @@
 # Implementation Status & Detailed System Architecture
 
-**Current Status**: Core system (data pipeline, model, training) is **fully implemented and tested** ✅. System handles dysarthric speech recognition with neuro-symbolic constraints and produces evaluation artifacts (confusion matrices, per-speaker metrics, rule activations). This document details the low-level architecture, design decisions, and implementation patterns.
+**Current Status**: Core system (data pipeline, model, training) is **fully implemented and tested** ✅. System handles dysarthric speech recognition with neuro-symbolic constraints and produces evaluation artifacts (confusion matrices, per-speaker metrics, rule activations).
 
-**Recent optimizations** (Jan 2025):
-- ✅ Memory reduction: Audio truncation (8s), batch_size=1, gradient checkpointing, fp16 mixed precision
+**Baseline Performance (baseline_v1 - Jan 2026)**:
+- **Test PER**: 0.567 ± 0.365 on 3,553 samples (3 TORGO speakers)
+- **Dysarthric PER**: 0.541 | **Control PER**: 0.575
+- **Model**: 94.8M params (416K trainable), HuBERT encoder with symbolic constraint layer
+- **Dataset**: 16,552 samples (13.68 hours), 15 speakers total
+- **Training**: 10 speakers train, 2 val, 3 test | Best epoch: 17/50
+
+**Recent optimizations** (Jan 2026):
+- ✅ Inverse-frequency CE class weights + weighted sampler for class balance
+- ✅ Symbolic constraint weight increased to β=0.5 for stronger early guidance
+- ✅ CTC length guard to prevent inf losses on short utterances
+- ✅ Memory reduction: batch_size=2, gradient_accumulation=8, max_epochs=50
 - ✅ CUDA memory fragmentation mitigation via `PYTORCH_ALLOC_CONF=expandable_segments:True`
-- ✅ Result persistence: Automatic checkpoint and evaluation artifact saving to `./results/{run_name}/`
-- ✅ Progress logging: Reduced verbosity (print every 100 batches vs. every 10)
+- ✅ Result persistence: Automatic checkpoint and evaluation artifact saving
+
+**Known Issues**:
+- ⚠️ High insertion rate (21,290 insertions vs. 376 deletions) - model over-predicting phonemes
+- ⚠️ Counter-intuitive dysarthric vs. control PER - needs stratified analysis by utterance length
 
 ---
 
@@ -124,24 +137,13 @@ Contextualized Representations [batch, frames, 768]
 
 ### 2.3 Fine-Tuning Strategy
 
-**Two-Stage Fine-Tuning:**
-
-**Stage 1: Feature Adaptation (Epochs 1-10)**
-- Freeze: Layers 0-6
-- Train: Layers 7-12 + projection head
-- Loss: CTC loss on phoneme targets
-- Learning Rate: 1e-5
-
-**Stage 2: Full Fine-Tuning (Epochs 11-30)**
-- Freeze: Layers 0-3 (preserve basic acoustics)
-- Train: Layers 4-12 + all task-specific heads
-- Loss: Combined CTC + Cross-Entropy
-- Learning Rate: 5e-6 with cosine decay
-
-**LoRA Integration (Optional):**
-- Add low-rank adapters to attention layers
-- Rank: 16-32 for parameter efficiency
-- Train only adapter weights (~1% of total parameters)
+**Key Hyperparameters** (see [src/utils/config.py](src/utils/config.py)):
+- Learning rate: 5e-5 (OneCycleLR with 10% warmup, cosine annealing)
+- Batch size: 2 (effective: 16 with gradient_accumulation=8)
+- Max epochs: 50 (early stopping patience=10, monitor=val/per)
+- Symbolic constraint: β=0.5 (initial), learnable, severity-adaptive
+- Loss weights: λ_ctc=0.7, λ_ce=0.3
+- Freeze encoder layers: 0-7 initially, unfreeze after 3 warmup epochs
 
 ---
 

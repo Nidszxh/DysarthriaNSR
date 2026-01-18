@@ -40,11 +40,34 @@ After training completes, results are automatically saved to:
 ## Key Features
 
 - **HuBERT Encoder**: 768-dim self-supervised representations with selective layer freezing + gradient checkpointing
-- **Symbolic Constraint Layer**: Articulatory feature-based phoneme similarity matrix with adaptive dysarthria weighting
-- **Multi-Task Learning**: CTC loss (phoneme alignment) + CE loss (frame-level auxiliary)
-- **VRAM Optimized**: Audio truncation (8s max), batch_size=1, gradient_accumulation=8, fp16 mixed precision
+- **Symbolic Constraint Layer**: Articulatory feature-based phoneme similarity matrix (initial β=0.5) with adaptive dysarthria weighting
+- **Multi-Task Learning**: CTC loss (phoneme alignment) + CE loss (frame-level auxiliary) with inverse-frequency class weights
+- **Class Balancing**: Inverse-frequency CE weights + weighted sampler for dysarthric/control balance
+- **VRAM Optimized**: Audio truncation (8s max), batch_size=2, gradient_accumulation=8 (effective=16), fp16 mixed precision
 - **MLflow Integration**: Experiment tracking with safe parameter flattening
 - **Evaluation Metrics**: PER, WER, phoneme confusion matrices, per-speaker analysis, rule activation counts
+
+## Current Performance (baseline_v1)
+
+**Dataset**: 16,552 samples (13.68 hours) across 15 TORGO speakers  
+**Model**: 94.8M params (416K trainable, encoder frozen initially)  
+**Training**: 10 speakers train, 2 val, 3 test | Best epoch: 17/50
+
+**Test Set Results**:
+- **Overall PER**: 0.567 ± 0.365
+- **Dysarthric PER**: 0.541 (n=810 samples)
+- **Control PER**: 0.575 (n=2,743 samples)
+
+**Error Breakdown**:
+- Correct: 8,853
+- Substitutions: 2,833
+- Deletions: 376
+- Insertions: 21,290 ⚠️ (high - see notes below)
+
+**Key Observations**:
+- High insertion rate indicates model over-predicting phonemes vs. CTC blanks
+- Dysarthric speakers show slightly better PER than controls (counter-intuitive; may indicate dataset imbalance)
+- Symbolic constraint weight (β) converged to 0.5, suggesting balanced neural-symbolic fusion
 
 ## Project Structure
 
@@ -57,8 +80,6 @@ DysarthriaNSR/
 ├── config.py                # Configuration (ModelConfig, TrainingConfig, SymbolicConfig)
 ├── train.py                 # PyTorch Lightning training pipeline
 ├── evaluate.py              # Evaluation metrics & visualization
-├── .github/
-│   └── copilot-instructions.md  # AI agent guide
 ├── data/
 │   ├── torgo_neuro_symbolic_manifest.csv  # Generated manifest
 │   └── abnerh___torgo-database/           # HuggingFace cache
@@ -91,12 +112,13 @@ Constrained Logits (dysarthria-aware weighting)
 
 **Key Hyperparameters** (see [src/utils/config.py](src/utils/config.py)):
 - Learning rate: 5e-5 (OneCycleLR with 10% warmup)
-- Batch size: 1 (effective: 8 with gradient accumulation)
-- Max epochs: 5
+- Batch size: 2 (effective: 16 with gradient accumulation=8)
+- Max epochs: 50 (early stopping patience=10)
 - Max audio length: 8 seconds (truncated for memory)
 - Dropout: 0.1 (classifier), 0.05 (layer)
 - Label smoothing: 0.1
 - Precision: fp16-mixed for GPU memory efficiency
+- Symbolic constraint init: β=0.5 (learnable, adaptive by speaker severity)
 
 **Memory Optimizations**:
 - **Gradient Checkpointing**: Enabled on HuBERT encoder (trades compute for memory)
@@ -126,10 +148,6 @@ Constrained Logits (dysarthria-aware weighting)
 - Articulatory metadata (manner, place, voicing)
 - RMS energy for signal quality assessment
 
-## Development
-
-For detailed implementation patterns, cross-component communication, and troubleshooting, see [`.github/copilot-instructions.md`](.github/copilot-instructions.md).
-
 ## Research Context
 
 This project prioritizes:
@@ -141,8 +159,26 @@ This project prioritizes:
 ## What's Implemented
 
 - Data pipeline (TORGO download + neuro-symbolic manifest with articulatory features)
-- Neural dataset & dataloader (HuBERT feature extraction, CTC-compatible batching, audio truncation)
-- NeuroSymbolicASR model (HuBERT encoder + phoneme classifier + symbolic constraint layer)
-- Training infrastructure (PyTorch Lightning, multi-task CTC+CE loss, MLflow logging)
+- Neural dataset & dataloader (HuBERT feature extraction, CTC-compatible batching, audio truncation, inverse-frequency weights)
+- NeuroSymbolicASR model (HuBERT encoder + phoneme classifier + symbolic constraint layer with adaptive β)
+- Training infrastructure (PyTorch Lightning, multi-task CTC+CE loss, weighted sampler, MLflow logging)
 - Evaluation pipeline (PER, WER, confusion matrices, per-speaker analysis, rule hit-rates)
 - Result persistence (checkpoints to disk, evaluation artifacts with visualizations)
+- **Baseline model**: PER 0.567 on TORGO test set (3 speakers, 3,553 samples)
+
+## Known Issues & Future Work
+
+**Current Limitations**:
+- High insertion rate (21,290 insertions vs. 376 deletions) suggests model is over-generating phonemes
+  - **Potential fixes**: Increase CTC blank penalty, adjust CE loss `<BLANK>` weight further, or add insertion-specific regularization
+- Counter-intuitive dysarthric vs. control PER (0.541 vs. 0.575) may indicate:
+  - Dysarthric samples are shorter/simpler utterances on average
+  - Dataset imbalance or speaker-specific effects
+  - Need phoneme-length stratified analysis
+
+**Roadmap**:
+- [ ] Investigate insertion bias: analyze CTC blank probabilities, add explicit blank encouragement
+- [ ] Phoneme-length distribution logging and stratified PER analysis
+- [ ] Ablation studies: neural-only vs. symbolic-only vs. neuro-symbolic fusion
+- [ ] Extend to word-level decoding with language model integration
+- [ ] ONNX export for clinical deployment

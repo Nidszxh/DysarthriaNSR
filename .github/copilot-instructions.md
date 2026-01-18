@@ -29,6 +29,7 @@ This is a research project combining:
    - HuBERT feature extraction (16kHz, zero-mean-unit-variance normalized)
    - **Audio truncation**: Long utterances capped at `max_audio_length` (default 8 seconds) to reduce GPU memory
    - Peak normalization to handle TORGO's variable breath support
+  - **Class balancing**: Inverse-frequency phoneme weights computed from manifest for CE loss; weighted sampler balances dysarthric vs control
    - Returns: audio features, phoneme IDs, and articulatory metadata
    - **CTC-ready**: Vocabulary includes `<BLANK>` (ID 0), `<PAD>` (ID 1), `<UNK>` (ID 2), then phonemes (ID 3+)
 
@@ -49,14 +50,17 @@ This is a research project combining:
    - `SymbolicConstraintMatrix`: Encodes articulatory similarity via distance between phoneme features
    - `ConstraintAggregation`: Applies learnable weighted blend to neural logits: `logits_constrained = β * logits_neural + (1-β) * (C @ logits_neural)`
    - Dysarthria-aware weighting: Higher dysarthric severity → stronger constraint influence (adaptive β)
+  - **Current init**: `constraint_weight_init=0.5` for stronger early symbolic guidance
    - Covers stops, fricatives, nasals, liquids, glides, vowels, diphthongs with phonetic properties (manner, place, voicing)
 
 7. **Training Pipeline** ([train.py](train.py)):
    - Multi-task learning: CTC loss (primary phoneme alignment) + CE loss (frame-level auxiliary)
    - Adaptive neuro-symbolic weighting via `beta`: Neural logits blended with symbolic constraints based on speaker severity
+  - **Loss balancing**: `lambda_ctc=0.7`, `lambda_ce=0.3`; CE uses dataset inverse-frequency weights plus boosted BLANK/PAD
+  - **Length safety**: Guard to ensure input_lengths ≥ label_lengths before CTC to avoid inf losses on short clips
    - MLflow tracking with safe parameter flattening for nested configs
    - EarlyStopping, ModelCheckpoint, LearningRateMonitor callbacks
-   - **Memory optimizations**: batch_size=1, gradient_accumulation=8, gradient_checkpointing=True, max_audio_length=8s, fp16 mixed precision
+  - **Memory optimizations**: batch_size=2, gradient_accumulation=8 (effective 16), gradient_checkpointing=True, max_audio_length=8s, fp16 mixed precision
    - Learning rate: 5e-5, OneCycleLR scheduler with 10% warmup, label smoothing 0.1
    - CUDA memory fragmentation mitigation: `PYTORCH_ALLOC_CONF=expandable_segments:True`
 
@@ -203,8 +207,8 @@ evaluate_model(
   - CE loss (frame-level auxiliary): `lambda_ce=0.3`
   - **Combined loss**: `loss = lambda_ctc * loss_ctc + lambda_ce * loss_ce`
 - **VRAM optimization**: 
-  - Batch size 2, gradient accumulation 12 steps = effective batch 24
-  - Freeze HuBERT encoder layers 0-5 (reduce parameters, VRAM)
+  - Batch size 2, gradient accumulation 8 steps = effective batch 16
+  - Freeze HuBERT encoder layers 0-7 by default; unfreeze after warmup epochs
   - Layer dropout 0.05 for regularization
 - **Learning rate schedule**: Cosine annealing with 500-step warmup
 - **Checkpoint strategy**: Save best 3 models (early stopping metric: validation PER)
@@ -218,14 +222,16 @@ evaluate_model(
 - **Loss computation**: 
   - CTC loss: `torch.nn.CTCLoss` on constrained logits (handles variable-length alignment)
   - CE loss: Frame-level cross-entropy on predictions
+  - CE class weights: inverse-frequency from manifest; `<BLANK>`/`<PAD>` up-weighted
   - Label padding value `-100` (automatically ignored by both loss functions)
-  - Input lengths from attention_mask; output lengths from label sequences
+  - Input lengths from logits time dimension (stride), clamped to at least label lengths to avoid CTC inf
 
 ### TORGO-Specific Handling
 - **Peak normalization**: Dysarthric speakers have variable breath support; normalize waveform by peak amplitude
 - **Duration metadata**: Critical for understanding slow speech characteristics
 - **RMS energy**: Use for distinguishing signal quality issues from articulation errors
 - **Speaker-level splits**: Small dataset (~15 speakers); use speaker-independent train/test splits for valid evaluation
+ - **Weighted sampling**: Train split uses WeightedRandomSampler to balance dysarthric vs control
 
 ### Code Style
 - Use **emoji prefixes** in print statements: 📦 (loading), 🧠 (processing), ✅ (success), ⚠️ (warnings), 📥 (downloading)
@@ -319,15 +325,24 @@ for layer_idx in freeze_encoder_layers:
 ## What's Implemented
 
 - ✅ Data pipeline: TORGO dataset download, neuro-symbolic manifest with articulatory metadata
-- ✅ Neural dataset & dataloader: HuBERT feature extraction, CTC-compatible batching
-- ✅ NeuroSymbolicASR model: HuBERT encoder + phoneme classifier + symbolic constraint layer
-- ✅ Training infrastructure: PyTorch Lightning with multi-task learning, MLflow logging, callbacks
-- ✅ Evaluation metrics: PER (phoneme error rate), WER, phoneme alignment, confusion matrices
+- ✅ Neural dataset & dataloader: HuBERT feature extraction, CTC-compatible batching, inverse-frequency class weights
+- ✅ NeuroSymbolicASR model: HuBERT encoder + phoneme classifier + symbolic constraint layer (β=0.5 init)
+- ✅ Training infrastructure: PyTorch Lightning with multi-task learning, weighted sampler, MLflow logging, callbacks
+- ✅ Evaluation metrics: PER, WER, phoneme alignment, confusion matrices, per-speaker analysis
+- ✅ **Baseline model (baseline_v1)**: Test PER 0.567 on 3,553 samples (3 TORGO speakers)
+  - Dysarthric PER: 0.541 | Control PER: 0.575
+  - 94.8M params (416K trainable), trained on 10 speakers, best epoch 17/50
+  - **Known issue**: High insertion rate (21,290 insertions vs. 376 deletions)
 
 ## Next Steps: What's NOT Built Yet
 
+- **Insertion bias mitigation**: High insertion rate (21,290 insertions) needs investigation
+  - Analyze CTC blank probabilities and emission patterns
+  - Adjust CE loss `<BLANK>` weight dynamically during training
+  - Add insertion-specific regularization (e.g., penalize consecutive non-blank predictions)
+- **Phoneme-length stratification**: Analyze PER by utterance length to understand dysarthric vs. control performance gap
 - **Explainability dashboard**: Interactive visualization of phoneme confusion matrices, rule activations, per-speaker error patterns
-- **Model checkpoints**: Pretrained baseline & fine-tuned models for TORGO dysarthric/control cohorts
+- **Model checkpoints**: Publish pretrained baseline & fine-tuned models for TORGO dysarthric/control cohorts
 - **Symbolic rule discovery**: Auto-extract dysarthric substitution rules from confusion matrices (e.g., /p/ → /b/ frequency thresholds)
 - **Clinical interface**: ONNX export, streaming inference, real-time feedback for speech therapy
 - **Ablation studies**: Quantify contribution of neural vs. symbolic components via systematic evaluation
