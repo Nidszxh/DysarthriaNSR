@@ -5,6 +5,7 @@ Orchestrates model training using PyTorch Lightning with multi-task learning,
 symbolic constraints, and comprehensive evaluation metrics.
 """
 
+import sys
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,10 +20,16 @@ from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, Mode
 from pytorch_lightning.loggers import MLFlowLogger
 from torch.utils.data import DataLoader, Subset
 
-from config import Config, get_default_config
-from dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
-from evaluate import compute_per
-from model import NeuroSymbolicASR
+# Add src directory to path for imports
+project_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(project_root / "src"))
+
+from utils.config import Config, get_default_config, get_project_root
+from data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+from models.model import NeuroSymbolicASR
+
+# Import evaluate functions from root level
+from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
 
 warnings.filterwarnings('ignore')
 
@@ -70,62 +77,6 @@ def flatten_config_for_mlflow(config: Config) -> Dict:
     return safe_params
 
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for addressing class imbalance in phoneme distribution.
-    
-    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-    """
-    
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, ignore_index: int = -100):
-        """
-        Initialize Focal Loss.
-        
-        Args:
-            alpha: Weighting factor for balanced classes
-            gamma: Focusing parameter for hard examples
-            ignore_index: Index to ignore in loss computation
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.ignore_index = ignore_index
-    
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Compute focal loss.
-        
-        Args:
-            logits: Predictions [batch, time, num_classes]
-            targets: Ground truth [batch, time]
-            
-        Returns:
-            Scalar loss value
-        """
-        batch_size, time_steps, num_classes = logits.shape
-        
-        # Reshape for cross-entropy
-        logits_flat = logits.reshape(-1, num_classes)
-        targets_flat = targets.reshape(-1)
-        
-        # Compute cross-entropy
-        ce_loss = F.cross_entropy(
-            logits_flat, 
-            targets_flat, 
-            reduction='none',
-            ignore_index=self.ignore_index
-        )
-        
-        # Compute focal weight
-        p_t = torch.exp(-ce_loss)
-        focal_weight = (1 - p_t) ** self.gamma
-        
-        # Apply alpha weighting
-        focal_loss = self.alpha * focal_weight * ce_loss
-        
-        return focal_loss.mean()
-
-
 class DysarthriaASRLightning(pl.LightningModule):
     """PyTorch Lightning module for neuro-symbolic dysarthria ASR."""
     
@@ -161,7 +112,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.validation_step_outputs = []
     
     def _init_loss_functions(self) -> None:
-        """Initialize all loss functions."""
+        """Initialize loss functions (simplified to 2 losses)."""
         self.ctc_loss = nn.CTCLoss(
             blank=self.phn_to_id['<BLANK>'],
             reduction='mean',
@@ -173,17 +124,9 @@ class DysarthriaASRLightning(pl.LightningModule):
             label_smoothing=self.config.training.label_smoothing
         )
         
-        self.focal_loss = FocalLoss(
-            alpha=self.config.training.focal_alpha,
-            gamma=self.config.training.focal_gamma,
-            ignore_index=-100
-        )
-        
         # Register loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
         self.register_buffer('lambda_ce', torch.tensor(self.config.training.lambda_ce))
-        self.register_buffer('lambda_focal', torch.tensor(self.config.training.lambda_focal))
-        self.register_buffer('lambda_symbolic', torch.tensor(self.config.training.lambda_symbolic))
     
     def forward(self, batch: Dict) -> Dict:
         """
@@ -195,11 +138,13 @@ class DysarthriaASRLightning(pl.LightningModule):
         Returns:
             Model outputs
         """
+        # Use 'status' from the batch (0 for control, 1 for dysarthric)
+        # Scale to 0-5 severity range for adaptive beta computation
+        severity = batch['status'].float() * 5.0
         return self.model(
             input_values=batch['input_values'],
             attention_mask=batch['attention_mask'],
-            speaker_severity=batch.get('severity'),
-            return_activations=False
+            speaker_severity=severity
         )
     
     def compute_loss(
@@ -210,7 +155,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         label_lengths: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute multi-task loss.
+        Compute multi-task loss (simplified to CTC + CE).
         
         Args:
             outputs: Model outputs
@@ -221,35 +166,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         Returns:
             Dictionary with individual and total losses
         """
-        logits_neural = outputs['logits_neural']
         logits_constrained = outputs['logits_constrained']
         
-        # CTC Loss (alignment-free)
-        loss_ctc = self._compute_ctc_loss(logits_constrained, labels, input_lengths, label_lengths)
+        # 1. CTC Loss (primary alignment loss)
+        loss_ctc = self._compute_ctc_loss(
+            logits_constrained, labels, input_lengths, label_lengths
+        )
         
-        # Cross-Entropy Loss (frame-level supervision)
-        loss_ce = self._compute_ce_loss(logits_neural, labels)
-        
-        # Focal Loss (class imbalance)
-        loss_focal = self._compute_focal_loss(logits_neural, labels)
-        
-        # Symbolic Constraint Loss
-        loss_symbolic = self._compute_symbolic_loss(outputs)
+        # 2. Cross-Entropy Loss (auxiliary frame-level supervision)
+        loss_ce = self._compute_ce_loss(logits_constrained, labels)
         
         # Total weighted loss
-        total_loss = (
-            self.lambda_ctc * loss_ctc +
-            self.lambda_ce * loss_ce +
-            self.lambda_focal * loss_focal +
-            self.lambda_symbolic * loss_symbolic
-        )
+        total_loss = self.lambda_ctc * loss_ctc + self.lambda_ce * loss_ce
         
         return {
             'loss': total_loss,
             'loss_ctc': loss_ctc,
-            'loss_ce': loss_ce,
-            'loss_focal': loss_focal,
-            'loss_symbolic': loss_symbolic
+            'loss_ce': loss_ce
         }
     
     def _compute_ctc_loss(
@@ -282,28 +215,6 @@ class DysarthriaASRLightning(pl.LightningModule):
         labels_flat = labels_aligned.reshape(-1)
         
         return self.ce_loss(logits_flat, labels_flat)
-    
-    def _compute_focal_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute focal loss with label alignment."""
-        time_steps_logits = logits.size(1)
-        labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
-        return self.focal_loss(logits, labels_aligned)
-    
-    def _compute_symbolic_loss(self, outputs: Dict) -> torch.Tensor:
-        """Compute symbolic constraint loss using KL divergence."""
-        P_neural = outputs.get('P_neural')
-        P_constrained = outputs.get('P_constrained')
-        
-        if P_neural is None or P_constrained is None:
-            return torch.tensor(0.0, device=self.device)
-        
-        # KL divergence: encourage constrained to be close to neural when confident
-        return F.kl_div(
-            P_constrained.log(),
-            P_neural,
-            reduction='batchmean',
-            log_target=False
-        )
     
     def _align_labels_to_logits(self, labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
         """
@@ -364,9 +275,9 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.log('train/loss', losses['loss'], on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/loss_ctc', losses['loss_ctc'], on_step=False, on_epoch=True)
         self.log('train/loss_ce', losses['loss_ce'], on_step=False, on_epoch=True)
-        self.log('train/loss_focal', losses['loss_focal'], on_step=False, on_epoch=True)
-        self.log('train/loss_symbolic', losses['loss_symbolic'], on_step=False, on_epoch=True)
-        self.log('train/beta', outputs['beta'], on_step=False, on_epoch=True)
+        # Log average beta to monitor neuro-symbolic weight activation
+        beta_val = outputs['beta'].mean() if isinstance(outputs['beta'], torch.Tensor) else outputs['beta']
+        self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
         
         return losses['loss']
     
@@ -398,8 +309,8 @@ class DysarthriaASRLightning(pl.LightningModule):
         losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
         
         # Decode predictions for PER computation
-        predictions = self._decode_predictions(logits_constrained)
-        references = self._decode_references(labels)
+        predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
+        references = decode_references(labels, self.id_to_phn)
         
         # Compute PER
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
@@ -495,8 +406,8 @@ class DysarthriaASRLightning(pl.LightningModule):
         losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
         
         # Decode and compute PER
-        predictions = self._decode_predictions(logits_constrained)
-        references = self._decode_references(labels)
+        predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
+        references = decode_references(labels, self.id_to_phn)
         
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
         avg_per = np.mean(per_scores) if per_scores else 0.0
@@ -506,66 +417,6 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.log('test/per', avg_per)
         
         return losses
-    
-    def _decode_predictions(self, logits: torch.Tensor) -> List[List[str]]:
-        """
-        Decode logits to phoneme sequences using greedy decoding.
-        
-        Args:
-            logits: Model logits [batch, time, num_classes]
-            
-        Returns:
-            List of phoneme sequences
-        """
-        predictions = []
-        pred_ids = torch.argmax(logits, dim=-1)  # [batch, time]
-        
-        for seq in pred_ids:
-            phonemes = []
-            prev_id = None
-            
-            for phone_id in seq.cpu().numpy():
-                # Skip blanks and padding
-                if phone_id == self.phn_to_id['<BLANK>']:
-                    prev_id = None
-                    continue
-                if phone_id == self.phn_to_id['<PAD>']:
-                    continue
-                # Skip repetitions (CTC-style)
-                if phone_id == prev_id:
-                    continue
-                
-                phoneme = self.id_to_phn.get(phone_id, '<UNK>')
-                phonemes.append(phoneme)
-                prev_id = phone_id
-            
-            predictions.append(phonemes)
-        
-        return predictions
-    
-    def _decode_references(self, labels: torch.Tensor) -> List[List[str]]:
-        """
-        Decode reference labels to phoneme sequences.
-        
-        Args:
-            labels: Label tensor [batch, seq_len]
-            
-        Returns:
-            List of phoneme sequences
-        """
-        references = []
-        
-        for seq in labels:
-            phonemes = []
-            for phone_id in seq.cpu().numpy():
-                phone_id = int(phone_id)
-                if phone_id == -100:  # Padding
-                    break
-                phoneme = self.id_to_phn.get(phone_id, '<UNK>')
-                phonemes.append(phoneme)
-            references.append(phonemes)
-        
-        return references
     
     def configure_optimizers(self):
         """
@@ -745,19 +596,22 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     )
     
     # Setup callbacks
+    checkpoint_dir = get_project_root() / "checkpoints" / config.experiment.run_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
     checkpoint_callback = ModelCheckpoint(
-        dirpath=Path("checkpoints") / config.experiment.run_name,
+        dirpath=str(checkpoint_dir),
         filename='epoch={epoch:02d}-val_per={val/per:.3f}',
-        monitor=config.training.checkpoint_metric,
-        mode=config.training.checkpoint_mode,
+        monitor=config.training.monitor_metric,
+        mode=config.training.monitor_mode,
         save_top_k=config.training.save_top_k,
         save_last=True
     )
     
     early_stop_callback = EarlyStopping(
-        monitor=config.training.early_stopping_metric,
+        monitor=config.training.monitor_metric,
         patience=config.training.early_stopping_patience,
-        mode=config.training.early_stopping_mode,
+        mode=config.training.monitor_mode,
         verbose=True
     )
     
@@ -784,12 +638,43 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     
     # Test on best checkpoint
     print("📈 Evaluating on test set...")
+    best_model_path = checkpoint_callback.best_model_path
+    print(f"✅ Best checkpoint: {best_model_path}")
+    
     trainer.test(lightning_model, test_loader, ckpt_path='best')
     
-    print("✅ Training complete!")
-    print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
+    # Load best checkpoint for comprehensive evaluation
+    print("🔄 Loading best model for detailed evaluation...")
+    best_model = DysarthriaASRLightning.load_from_checkpoint(
+        best_model_path,
+        model=model,
+        config=config,
+        phn_to_id=dataset.phn_to_id,
+        id_to_phn=dataset.id_to_phn,
+        strict=False
+    )
     
-    return lightning_model, trainer
+    # Run comprehensive evaluation with visualizations
+    print("📊 Generating clinical diagnostic plots...")
+    results_dir = get_project_root() / "results" / config.experiment.run_name
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    evaluate_model(
+        model=best_model.model,
+        dataloader=test_loader,
+        device=config.device,
+        phn_to_id=dataset.phn_to_id,
+        id_to_phn=dataset.id_to_phn,
+        results_dir=results_dir,
+        symbolic_rules=config.symbolic.substitution_rules  # Enable rule hit-rate graph
+    )
+    
+    print("✅ Training and evaluation complete!")
+    print(f"\n📁 Directory Structure:")
+    print(f"  Checkpoints: {checkpoint_dir}")
+    print(f"  Results:     {results_dir}")
+    
+    return best_model, trainer
 
 
 def main() -> None:
