@@ -13,7 +13,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import HubertModel
 
-from config import ModelConfig, SymbolicConfig
+try:
+    from utils.config import ModelConfig, SymbolicConfig
+except ImportError:
+    # Handle imports when called from different locations
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from utils.config import ModelConfig, SymbolicConfig
 
 
 class ArticulatoryFeatureEncoder:
@@ -424,7 +431,10 @@ class NeuroSymbolicASR(nn.Module):
 
 
 def main() -> None:
-    from config import get_default_config
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from utils.config import get_default_config
     
     config = get_default_config()
     

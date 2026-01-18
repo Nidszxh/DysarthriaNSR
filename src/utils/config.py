@@ -4,6 +4,17 @@ from typing import Dict, List, Tuple
 import torch
 
 
+def get_project_root() -> Path:
+    """Get the project root directory."""
+    # Navigate from src/utils/config.py to project root
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def get_processed_dir() -> Path:
+    """Get the processed data directory."""
+    return get_project_root() / "data" / "processed"
+
+
 @dataclass
 class ModelConfig:
     
@@ -14,7 +25,7 @@ class ModelConfig:
     
     # Phoneme Classifier
     hidden_dim: int = 512
-    num_phonemes: int = 67  # Updated from dataset vocabulary
+    num_phonemes: int = 42  # Updated from dataset vocabulary
     classifier_dropout: float = 0.1
     
     # Symbolic Constraint Layer
@@ -74,9 +85,9 @@ class DataConfig:
     # Data pipeline configuration.
     
     # Paths
-    data_dir: Path = field(default_factory=lambda: Path("./data"))
+    data_dir: Path = field(default_factory=lambda: get_project_root() / "data")
     manifest_path: Path = field(
-        default_factory=lambda: Path("./data/torgo_neuro_symbolic_manifest.csv"))
+        default_factory=lambda: get_processed_dir() / "torgo_neuro_symbolic_manifest.csv")
     
     # Dataset Split
     train_split: float = 0.7
@@ -96,7 +107,7 @@ class ExperimentConfig:
     # Experiment Tracking
     experiment_name: str = "DysarthriaNSR"
     run_name: str = "baseline_v1"
-    tracking_uri: str = "file:./mlruns"
+    tracking_uri: str = field(default_factory=lambda: f"file:{get_project_root() / 'mlruns'}")
     
     # Logging
     log_every_n_steps: int = 10
