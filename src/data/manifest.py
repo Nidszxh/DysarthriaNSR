@@ -53,7 +53,6 @@ PHONEME_ARTICULATION = {
     'AY': 'diphthong', 'AW': 'diphthong', 'OY': 'diphthong',
 }
 
-# --- HELPERS ---
 
 class SymbolicProcessor:
     """Handles G2P and phoneme-to-articulatory mapping."""
