@@ -21,6 +21,14 @@
 - ⚠️ High insertion rate (21,290 insertions vs. 376 deletions) - model over-predicting phonemes
 - ⚠️ Counter-intuitive dysarthric vs. control PER - needs stratified analysis by utterance length
 
+**Immediate Diagnostic Plan (Feb 2026)**:
+- Inspect blank posterior statistics (mean, histogram, blank vs non-blank ratio)
+- Compare blank probability distributions for dysarthric vs control
+- Track per-frame entropy to detect overconfident non-blank emissions
+- Add insertion-sensitive decoding (length penalty or insertion penalty)
+- Test blank-regularization (blank-weighted CE or blank prior KL)
+- Run ablations: neural-only, symbolic-only, fixed beta sweeps
+
 ---
 
 ## ✅ COMPLETED: Data Pipeline & Preprocessing
@@ -751,6 +759,21 @@ rule_precision = (correct_rule_applications) / (total_rule_applications)
 **Attribution Consistency:**
 - Inter-rater agreement between model explanations and expert phonetic analysis
 
+### 8.4 Stratified Evaluation and Statistical Testing
+
+**Length-Stratified PER:**
+- Buckets: 0-5, 6-10, 11-20, 21+ phonemes
+- Report mean PER with bootstrap confidence intervals per bucket
+
+**Speaker-Stratified PER:**
+- Per-speaker PER with mean and std
+- Compare dysarthric vs control with statistical testing
+
+**Statistical Tests:**
+- Paired tests for model comparisons (paired t-test or Wilcoxon)
+- Group tests for dysarthric vs control (Welch t-test or Mann-Whitney U)
+- Correct for multiple comparisons (Holm or Bonferroni)
+
 ---
 
 ## 9. System Integration & Deployment
@@ -798,6 +821,14 @@ Client Request (Audio)
     ↓
 API Gateway (FastAPI)
     ↓
+
+### 9.3 ONNX Export Checklist
+
+1. Export HuBERT encoder + classifier + symbolic layer with dynamic axes.
+2. Validate ONNX parity on a small batch (logits + PER spot check).
+3. Run ONNX Runtime CPU inference for a short sample.
+4. Optional: keep CTC decoding outside ONNX to avoid dynamic control flow.
+5. Package model and inference config for deployment.
 Preprocessing Service
     ↓
 GPU Inference Service (HuBERT + Phoneme Model)

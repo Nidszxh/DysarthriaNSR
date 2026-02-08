@@ -311,7 +311,7 @@ for layer_idx in freeze_encoder_layers:
 
 ## Key Files & Directories
 
-- [Overview.md](Overview.md): Detailed system architecture and research motivation
+- [ROADMAP.md](ROADMAP.md): Detailed system architecture and research motivation
 - [download.py](download.py): Dataset download with safe path extraction
 - [manifest.py](manifest.py): Neuro-symbolic manifest generation with articulatory and robustness features
 - [dataloader.py](dataloader.py): PyTorch dataset and dataloader for CTC training with HF streaming
