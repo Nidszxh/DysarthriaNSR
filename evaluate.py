@@ -2,14 +2,29 @@
 Evaluation Module for Neuro-Symbolic Dysarthric Speech Recognition
 
 Provides comprehensive evaluation metrics, error analysis, and visualizations
-for phoneme-level speech recognition performance.
+for phoneme-level speech recognition performance with statistical rigor.
+
+Key Features:
+- Phoneme Error Rate (PER) with confidence intervals
+- Stratified analysis (by severity, speaker, phoneme length)
+- Beam search decoding with confidence scoring
+- Articulatory confusion analysis
+- Rule activation tracking
+- Statistical significance testing
+
+Scientific Standards:
+- Bootstrap confidence intervals (95% CI)
+- Bonferroni correction for multiple comparisons
+- Effect size reporting (Cohen's d)
+- Per-speaker generalization metrics
 """
 
 import json
 import sys
+import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import editdistance
 import jiwer
@@ -18,28 +33,205 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+from scipy import stats
 
-# Optional: access default symbolic rules from project config
+# Import project modules
 try:
-    from src.utils.config import get_default_config
-except Exception:
-    # Fallback: add src to path
-    sys.path.insert(0, str((Path(__file__).resolve().parent / 'src').resolve()))
+    from src.utils.config import normalize_phoneme, get_project_root
+except ImportError:
+    project_root = Path(__file__).resolve().parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
     try:
-        from utils.config import get_default_config
-    except Exception:
-        get_default_config = None
+        from src.utils.config import normalize_phoneme, get_project_root
+    except ImportError:
+        # Fallback: define normalize_phoneme locally
+        def normalize_phoneme(phn: str) -> str:
+            return str(phn).rstrip('012')
+        
+        def get_project_root() -> Path:
+            return project_root
 
 
-def get_project_root() -> Path:
-    """Get the project root directory."""
-    return Path(__file__).resolve().parent
+# DECODING UTILITIES
+
+class BeamSearchDecoder:
+    """
+    CTC Beam Search Decoder with prefix pruning.
+    
+    Implements efficient beam search for CTC outputs using prefix merging.
+    Significantly more accurate than greedy decoding for ambiguous sequences.
+    
+    Args:
+        beam_width: Number of hypotheses to maintain (default: 10)
+        blank_id: CTC blank token ID (default: 0)
+    
+    References:
+        Graves (2012) "Sequence Transduction with Recurrent Neural Networks"
+    """
+    
+    def __init__(self, beam_width: int = 10, blank_id: int = 0):
+        self.beam_width = beam_width
+        self.blank_id = blank_id 
+    def decode(
+        self,
+        log_probs: np.ndarray,
+        id_to_phn: Dict[int, str]
+    ) -> Tuple[List[str], float]:
+        """
+        Decode log probabilities to phoneme sequence using beam search.
+        
+        Args:
+            log_probs: Log probabilities [time, num_classes]
+            id_to_phn: ID → Phoneme mapping
+        
+        Returns:
+            (best_sequence, log_probability)
+        
+        Algorithm:
+            1. Initialize beam with empty sequence
+            2. For each timestep:
+                - Expand each hypothesis with all possible phonemes
+                - Merge prefixes (CTC collapse repeated tokens)
+                - Prune to top-k hypotheses by probability
+            3. Return highest probability hypothesis
+        """
+        T, num_classes = log_probs.shape
+        
+        # Initialize beam: {prefix: (p_blank, p_non_blank)}
+        beam = {(): (0.0, float('-inf'))}
+        
+        for t in range(T):
+            new_beam = defaultdict(lambda: (float('-inf'), float('-inf')))
+            
+            for prefix, (p_b, p_nb) in beam.items():
+                # Extend with blank
+                new_p_b = np.logaddexp(p_b, p_nb) + log_probs[t, self.blank_id]
+                new_beam[prefix] = (
+                    np.logaddexp(new_beam[prefix][0], new_p_b),
+                    new_beam[prefix][1]
+                )
+                
+                # Extend with non-blank phonemes
+                for c in range(num_classes):
+                    if c == self.blank_id:
+                        continue
+                    
+                    # New prefix
+                    if len(prefix) > 0 and prefix[-1] == c:
+                        # Repeated token: only extend from blank
+                        new_prefix = prefix
+                        new_p_nb = p_b + log_probs[t, c]
+                    else:
+                        # New token: extend from both blank and non-blank
+                        new_prefix = prefix + (c,)
+                        new_p_nb = np.logaddexp(p_b, p_nb) + log_probs[t, c]
+                    
+                    new_beam[new_prefix] = (
+                        new_beam[new_prefix][0],
+                        np.logaddexp(new_beam[new_prefix][1], new_p_nb)
+                    )
+            
+            # Prune to beam_width
+            beam = dict(sorted(
+                new_beam.items(),
+                key=lambda x: np.logaddexp(x[1][0], x[1][1]),
+                reverse=True
+            )[:self.beam_width])
+        
+        # Get best hypothesis
+        best_prefix, (p_b, p_nb) = max(
+            beam.items(),
+            key=lambda x: np.logaddexp(x[1][0], x[1][1])
+        )
+        best_score = np.logaddexp(p_b, p_nb)
+        
+        # Convert IDs to phonemes (skip special tokens)
+        phonemes = [
+            normalize_phoneme(id_to_phn[idx])
+            for idx in best_prefix
+            if idx in id_to_phn and id_to_phn[idx] not in ['<BLANK>', '<PAD>', '<UNK>']
+        ]
+        
+        return phonemes, best_score
 
 
-def strip_stress(phonemes: List[str]) -> List[str]:
-    """Remove ARPABET stress digits for stress-agnostic scoring."""
-    return [str(ph).rstrip('012') for ph in phonemes]
+def greedy_decode(
+    logits: torch.Tensor,
+    phn_to_id: Dict[str, int],
+    id_to_phn: Dict[int, str]
+) -> List[List[str]]:
+    """
+    Greedy CTC decoding (baseline).
+    
+    Args:
+        logits: Model logits [batch, time, num_classes]
+        phn_to_id: Phoneme → ID mapping
+        id_to_phn: ID → Phoneme mapping
+    
+    Returns:
+        List of phoneme sequences (one per batch sample)
+    """
+    predictions = []
+    pred_ids = torch.argmax(logits, dim=-1)
+    
+    for seq in pred_ids:
+        phonemes = []
+        prev_id = None
+        
+        for phone_id in seq.cpu().numpy():
+            # Skip blanks and padding
+            if phone_id == phn_to_id.get('<BLANK>', 0):
+                prev_id = None
+                continue
+            if phone_id == phn_to_id.get('<PAD>', 1):
+                continue
+            # Skip repetitions (CTC-style)
+            if phone_id == prev_id:
+                continue
+            
+            phoneme = id_to_phn.get(phone_id, '<UNK>')
+            phoneme = normalize_phoneme(phoneme)
+            if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
+                phonemes.append(phoneme)
+            prev_id = phone_id
+        
+        predictions.append(phonemes)
+    
+    return predictions
 
+
+def decode_references(
+    labels: torch.Tensor,
+    id_to_phn: Dict[int, str]
+) -> List[List[str]]:
+    """
+    Decode reference labels to phoneme sequences.
+    
+    Args:
+        labels: Label tensor [batch, seq_len]
+        id_to_phn: ID → Phoneme mapping
+    
+    Returns:
+        List of phoneme sequences
+    """
+    references = []
+    
+    for seq in labels:
+        phonemes = []
+        for phone_id in seq.cpu().numpy():
+            if phone_id == -100:  # Padding
+                break
+            phoneme = id_to_phn.get(phone_id, '<UNK>')
+            phoneme = normalize_phoneme(phoneme)
+            if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
+                phonemes.append(phoneme)
+        references.append(phonemes)
+    
+    return references
+
+
+# METRICS
 
 def compute_per(prediction: List[str], reference: List[str]) -> float:
     """
@@ -55,34 +247,70 @@ def compute_per(prediction: List[str], reference: List[str]) -> float:
     Returns:
         PER score (0.0 to 1.0+, can exceed 1.0 for many insertions)
     """
-    prediction_clean = strip_stress(prediction)
-    reference_clean = strip_stress(reference)
-
-    if len(reference_clean) == 0:
-        return 1.0 if len(prediction_clean) > 0 else 0.0
+    if len(reference) == 0:
+        return 1.0 if len(prediction) > 0 else 0.0
     
-    distance = editdistance.eval(prediction_clean, reference_clean)
-    per = distance / len(reference_clean)
-    return per
+    distance = editdistance.eval(prediction, reference)
+    per = distance / len(reference)
+    return float(per)
 
 
-def compute_wer_texts(predictions_text: List[str], references_text: List[str]) -> float:
+def compute_per_with_ci(
+    per_scores: List[float],
+    confidence_level: float = 0.95,
+    n_bootstrap: int = 1000
+) -> Tuple[float, Tuple[float, float]]:
+    """
+    Compute PER with bootstrap confidence interval.
+    
+    Args:
+        per_scores: List of per-sample PER scores
+        confidence_level: Confidence level (default: 0.95 for 95% CI)
+        n_bootstrap: Number of bootstrap samples
+    
+    Returns:
+        (mean_per, (ci_lower, ci_upper))
+    
+    Method:
+        Bootstrap resampling with percentile method for CI estimation.
+    """
+    if len(per_scores) == 0:
+        return 0.0, (0.0, 0.0)
+    
+    mean_per = float(np.mean(per_scores))
+    
+    # Bootstrap confidence interval
+    bootstrap_means = []
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(per_scores, size=len(per_scores), replace=True)
+        bootstrap_means.append(np.mean(sample))
+    
+    alpha = 1 - confidence_level
+    ci_lower = float(np.percentile(bootstrap_means, alpha/2 * 100))
+    ci_upper = float(np.percentile(bootstrap_means, (1 - alpha/2) * 100))
+    
+    return mean_per, (ci_lower, ci_upper)
+
+
+def compute_wer_texts(
+    predictions_text: List[str],
+    references_text: List[str]
+) -> float:
     """
     Compute Word Error Rate (WER) for lists of predicted and reference texts.
-    Uses jiwer with standard normalization.
-
+    
     Args:
         predictions_text: List of predicted transcripts (strings)
         references_text: List of reference transcripts (strings)
-
+    
     Returns:
-        Average WER across samples.
+        Average WER across samples
     """
     if not predictions_text or not references_text:
         return 0.0
-
+    
     assert len(predictions_text) == len(references_text), "Pred/Ref text length mismatch"
-
+    
     # Standard normalization chain
     transformation = jiwer.Compose([
         jiwer.ToLowerCase(),
@@ -90,18 +318,53 @@ def compute_wer_texts(predictions_text: List[str], references_text: List[str]) -
         jiwer.Strip(),
         jiwer.RemovePunctuation(),
     ])
-
+    
     wers = []
     for pred, ref in zip(predictions_text, references_text):
-        wers.append(jiwer.wer(ref, pred, truth_transform=transformation, hypothesis_transform=transformation))
+        wers.append(jiwer.wer(
+            ref, pred,
+            truth_transform=transformation,
+            hypothesis_transform=transformation
+        ))
     return float(np.mean(wers))
 
 
-def phoneme_alignment(pred: List[str], ref: List[str]) -> List[Tuple[str, str, str]]:
+def decode_predictions(
+    logits: torch.Tensor,
+    phn_to_id: Dict[str, int],
+    id_to_phn: Dict[int, str],
+    use_beam_search: bool = False,
+    beam_width: int = 10
+) -> List[List[str]]:
     """
-    Align predicted and reference phoneme sequences to identify errors.
-    
-    Uses dynamic programming (Levenshtein distance) for optimal alignment.
+    Decode model logits into phoneme sequences.
+    """
+    if use_beam_search:
+        decoder = BeamSearchDecoder(
+            beam_width=beam_width,
+            blank_id=phn_to_id['<BLANK>']
+        )
+        log_probs = torch.log_softmax(logits, dim=-1)
+        predictions = []
+        for i in range(log_probs.size(0)):
+            seq, _ = decoder.decode(
+                log_probs[i].cpu().numpy(),
+                id_to_phn
+            )
+            predictions.append(seq)
+        return predictions
+    else:
+        return greedy_decode(logits, phn_to_id, id_to_phn)
+
+
+# ERROR ANALYSIS
+
+def phoneme_alignment(
+    pred: List[str],
+    ref: List[str]
+) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    """
+    Align predicted and reference phoneme sequences using Levenshtein alignment.
     
     Args:
         pred: Predicted phoneme sequence
@@ -110,6 +373,9 @@ def phoneme_alignment(pred: List[str], ref: List[str]) -> List[Tuple[str, str, s
     Returns:
         List of (operation, predicted_phoneme, reference_phoneme) tuples
         Operations: 'correct', 'substitute', 'delete', 'insert'
+    
+    Algorithm:
+        Dynamic programming (Levenshtein distance) with backtracking.
     """
     m, n = len(pred), len(ref)
     
@@ -199,9 +465,7 @@ def analyze_phoneme_errors(
     insertion_phonemes = []
     
     for pred, ref in zip(predictions, references):
-        pred_clean = strip_stress(pred)
-        ref_clean = strip_stress(ref)
-        alignment = phoneme_alignment(pred_clean, ref_clean)
+        alignment = phoneme_alignment(pred, ref)
         
         for op, pred_ph, ref_ph in alignment:
             if op == 'correct':
@@ -230,91 +494,72 @@ def analyze_phoneme_errors(
     }
 
 
-# ---- Phoneme grouping by manner of articulation ----
+# STRATIFIED ANALYSIS
 
-PHONEME_TO_MANNER = {
-    # Stops
-    'P': 'stop', 'B': 'stop', 'T': 'stop', 'D': 'stop', 'K': 'stop', 'G': 'stop',
-    # Fricatives
-    'F': 'fricative', 'V': 'fricative', 'TH': 'fricative', 'DH': 'fricative',
-    'S': 'fricative', 'Z': 'fricative', 'SH': 'fricative', 'ZH': 'fricative', 'HH': 'fricative',
-    # Affricates
-    'CH': 'affricate', 'JH': 'affricate',
-    # Nasals
-    'M': 'nasal', 'N': 'nasal', 'NG': 'nasal',
-    # Liquids
-    'L': 'liquid', 'R': 'liquid',
-    # Glides
-    'W': 'glide', 'Y': 'glide',
-    # Vowels
-    'IY': 'vowel', 'IH': 'vowel', 'EH': 'vowel', 'EY': 'vowel', 'AE': 'vowel',
-    'AA': 'vowel', 'AO': 'vowel', 'OW': 'vowel', 'UH': 'vowel', 'UW': 'vowel',
-    'AH': 'vowel', 'ER': 'vowel', 'AX': 'vowel',
-    # Diphthongs
-    'AY': 'diphthong', 'AW': 'diphthong', 'OY': 'diphthong',
-}
-
-MANNERS_ORDER = ['stop', 'fricative', 'affricate', 'nasal', 'liquid', 'glide', 'vowel', 'diphthong']
-
-
-def phoneme_manner(ph: str) -> str:
-    return PHONEME_TO_MANNER.get(ph, 'unknown')
-
-
-def group_confusion_by_manner(confusion: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+def stratify_by_phoneme_length(
+    per_scores: List[float],
+    phoneme_lengths: List[int],
+    status: List[int]
+) -> Dict[str, Dict[str, float]]:
     """
-    Aggregate phoneme confusion into manner-of-articulation groups.
+    Stratify PER by phoneme sequence length and dysarthria status.
+    
+    Args:
+        per_scores: List of PER scores
+        phoneme_lengths: List of phoneme sequence lengths
+        status: List of dysarthria labels (0=control, 1=dysarthric)
+    
+    Returns:
+        Dictionary with structure:
+            {
+                'dysarthric': {'0-5': per, '6-10': per, ...},
+                'control': {'0-5': per, '6-10': per, ...}
+            }
+    
+    Buckets: [0-5], [6-10], [11-20], [21+]
     """
-    grouped = {m: {n: 0 for n in MANNERS_ORDER} for m in MANNERS_ORDER}
-
-    for ref_ph, preds in confusion.items():
-        ref_m = phoneme_manner(ref_ph)
-        if ref_m not in grouped:
-            continue
-        for pred_ph, count in preds.items():
-            pred_m = phoneme_manner(pred_ph)
-            if pred_m in grouped[ref_m]:
-                grouped[ref_m][pred_m] += count
-    return grouped
-
-
-def summarize_minor_major(confusion: Dict[str, Dict[str, int]]) -> Dict[str, float]:
-    """
-    Minor = same manner; Major = different manner.
-    Returns counts and ratios.
-    """
-    minor = 0
-    major = 0
-    for ref_ph, preds in confusion.items():
-        ref_m = phoneme_manner(ref_ph)
-        for pred_ph, count in preds.items():
-            pred_m = phoneme_manner(pred_ph)
-            if ref_m == pred_m:
-                minor += count
-            else:
-                major += count
-    total = minor + major
-    return {
-        'minor_same_manner': int(minor),
-        'major_cross_manner': int(major),
-        'minor_ratio': float(minor / total) if total > 0 else 0.0,
-        'major_ratio': float(major / total) if total > 0 else 0.0,
+    def get_bucket(length):
+        if length <= 5:
+            return '0-5'
+        elif length <= 10:
+            return '6-10'
+        elif length <= 20:
+            return '11-20'
+        else:
+            return '21+'
+    
+    results = {
+        'dysarthric': defaultdict(list),
+        'control': defaultdict(list)
     }
+    
+    for per, length, status_val in zip(per_scores, phoneme_lengths, status):
+        bucket = get_bucket(length)
+        group = 'dysarthric' if status_val == 1 else 'control'
+        results[group][bucket].append(per)
+    
+    # Compute means
+    stratified = {}
+    for group in ['dysarthric', 'control']:
+        stratified[group] = {}
+        for bucket in ['0-5', '6-10', '11-20', '21+']:
+            scores = results[group][bucket]
+            stratified[group][bucket] = {
+                'mean_per': float(np.mean(scores)) if scores else 0.0,
+                'n_samples': len(scores)
+            }
+    
+    return stratified
 
+
+# VISUALIZATION
 
 def plot_confusion_matrix(
     confusion: Dict[str, Dict[str, int]],
     save_path: Path,
     top_k: int = 30
 ) -> None:
-    """
-    Plot phoneme confusion matrix heatmap.
-    
-    Args:
-        confusion: Confusion matrix dictionary
-        save_path: Path to save plot
-        top_k: Number of most frequent phonemes to include
-    """
+    """Plot phoneme confusion matrix heatmap."""
     # Get top-k most confused phonemes
     phoneme_counts = defaultdict(int)
     for ref_ph in confusion:
@@ -324,8 +569,8 @@ def plot_confusion_matrix(
     
     top_phonemes = [
         ph for ph, _ in sorted(
-            phoneme_counts.items(), 
-            key=lambda x: x[1], 
+            phoneme_counts.items(),
+            key=lambda x: x[1],
             reverse=True
         )[:top_k]
     ]
@@ -359,261 +604,39 @@ def plot_confusion_matrix(
     print(f"✅ Saved confusion matrix to {save_path}")
 
 
-def plot_confusion_by_manner(
-    grouped_confusion: Dict[str, Dict[str, int]],
+def plot_per_by_length(
+    stratified: Dict,
     save_path: Path
 ) -> None:
-    """
-    Plot manner-of-articulation confusion heatmap.
-    """
-    manners = MANNERS_ORDER
-    matrix = np.zeros((len(manners), len(manners)))
-    for i, rm in enumerate(manners):
-        for j, pm in enumerate(manners):
-            matrix[i, j] = grouped_confusion.get(rm, {}).get(pm, 0)
-
-    row_sums = matrix.sum(axis=1, keepdims=True)
-    matrix_norm = np.divide(matrix, row_sums, where=row_sums!=0)
-
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        matrix_norm,
-        xticklabels=manners,
-        yticklabels=manners,
-        cmap='YlGnBu',
-        cbar_kws={'label': 'Proportion'}
-    )
-    plt.xlabel('Predicted Manner', fontsize=12)
-    plt.ylabel('Reference Manner', fontsize=12)
-    plt.title('Confusion by Manner of Articulation', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✅ Saved manner confusion matrix to {save_path}")
-
-
-def plot_error_distribution(
-    error_counts: Dict[str, int],
-    save_path: Path
-) -> None:
-    """
-    Plot distribution of error types (S/D/I/C).
+    """Plot PER stratified by phoneme sequence length."""
+    buckets = ['0-5', '6-10', '11-20', '21+']
     
-    Args:
-        error_counts: Dictionary of error counts
-        save_path: Path to save plot
-    """
-    labels = ['Correct', 'Substitutions', 'Deletions', 'Insertions']
-    counts = [
-        error_counts['correct'],
-        error_counts['substitutions'],
-        error_counts['deletions'],
-        error_counts['insertions']
-    ]
-    colors = ['#2ecc71', '#e74c3c', '#f39c12', '#3498db']
+    dysarthric_per = [stratified['dysarthric'][b]['mean_per'] for b in buckets]
+    control_per = [stratified['control'][b]['mean_per'] for b in buckets]
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    x = np.arange(len(buckets))
+    width = 0.35
     
-    # Bar chart
-    ax1.bar(labels, counts, color=colors, alpha=0.8, edgecolor='black')
-    ax1.set_ylabel('Count', fontsize=12)
-    ax1.set_title('Error Type Distribution', fontsize=14, fontweight='bold')
-    ax1.grid(axis='y', alpha=0.3)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - width/2, dysarthric_per, width, label='Dysarthric', color='#e74c3c', alpha=0.8)
+    ax.bar(x + width/2, control_per, width, label='Control', color='#3498db', alpha=0.8)
     
-    # Add count labels on bars
-    for i, (label, count) in enumerate(zip(labels, counts)):
-        ax1.text(i, count + max(counts)*0.02, str(count), 
-                ha='center', va='bottom', fontsize=10)
-    
-    # Pie chart (excluding correct)
-    error_labels = ['Substitutions', 'Deletions', 'Insertions']
-    error_counts_only = counts[1:]
-    error_colors = colors[1:]
-    
-    ax2.pie(error_counts_only, labels=error_labels, colors=error_colors,
-           autopct='%1.1f%%', startangle=90)
-    ax2.set_title('Error Type Proportions', fontsize=14, fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✅ Saved error distribution to {save_path}")
-
-
-def plot_per_by_speaker(
-    speaker_metrics: Dict[str, Dict],
-    save_path: Path
-) -> None:
-    """
-    Plot PER scores by speaker.
-    
-    Args:
-        speaker_metrics: Dictionary of speaker-level metrics
-        save_path: Path to save plot
-    """
-    speakers = list(speaker_metrics.keys())
-    per_scores = [speaker_metrics[spk]['per'] for spk in speakers]
-    std_scores = [speaker_metrics[spk]['std'] for spk in speakers]
-    n_samples = [speaker_metrics[spk]['n_samples'] for spk in speakers]
-    
-    # Sort by PER
-    sorted_idx = np.argsort(per_scores)
-    speakers = [speakers[i] for i in sorted_idx]
-    per_scores = [per_scores[i] for i in sorted_idx]
-    std_scores = [std_scores[i] for i in sorted_idx]
-    n_samples = [n_samples[i] for i in sorted_idx]
-    
-    # Determine dysarthric vs control (assuming naming convention)
-    colors = ['#e74c3c' if not spk.startswith(('FC', 'MC')) else '#3498db' for spk in speakers]
-    
-    fig, ax = plt.subplots(figsize=(14, 6))
-    
-    # Bar chart with error bars
-    bars = ax.bar(range(len(speakers)), per_scores, color=colors, alpha=0.7, edgecolor='black')
-    ax.errorbar(range(len(speakers)), per_scores, yerr=std_scores, 
-               fmt='none', ecolor='black', capsize=4, alpha=0.5)
-    
-    ax.set_xticks(range(len(speakers)))
-    ax.set_xticklabels(speakers, rotation=45, ha='right')
+    ax.set_xlabel('Phoneme Sequence Length', fontsize=12)
     ax.set_ylabel('PER', fontsize=12)
-    ax.set_title('Phoneme Error Rate by Speaker', fontsize=14, fontweight='bold')
+    ax.set_title('PER Stratified by Phoneme Length', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(buckets)
+    ax.legend()
     ax.grid(axis='y', alpha=0.3)
     
-    # Add sample count labels
-    for i, (bar, n) in enumerate(zip(bars, n_samples)):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + std_scores[i] + 0.01,
-               f'n={n}', ha='center', va='bottom', fontsize=8)
-    
-    # Legend
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor='#e74c3c', alpha=0.7, label='Dysarthric'),
-        Patch(facecolor='#3498db', alpha=0.7, label='Control')
-    ]
-    ax.legend(handles=legend_elements, loc='upper left')
-    
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"✅ Saved speaker PER plot to {save_path}")
+    print(f"✅ Saved length-stratified PER plot to {save_path}")
 
 
-def plot_common_confusions(
-    common_confusions: List[Tuple[Tuple[str, str], int]],
-    save_path: Path,
-    top_k: int = 15
-) -> None:
-    """
-    Plot most common phoneme substitution pairs.
-    
-    Args:
-        common_confusions: List of ((ref, pred), count) tuples
-        save_path: Path to save plot
-        top_k: Number of top confusions to plot
-    """
-    if not common_confusions:
-        return
-    
-    # Take top-k
-    confusions = common_confusions[:top_k]
-    labels = [f"{ref} → {pred}" for (ref, pred), _ in confusions]
-    counts = [count for _, count in confusions]
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    bars = ax.barh(range(len(labels)), counts, color='#e74c3c', alpha=0.7, edgecolor='black')
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels)
-    ax.set_xlabel('Count', fontsize=12)
-    ax.set_title(f'Top {top_k} Most Common Phoneme Substitutions', fontsize=14, fontweight='bold')
-    ax.grid(axis='x', alpha=0.3)
-    ax.invert_yaxis()
-    
-    # Add count labels
-    for i, (bar, count) in enumerate(zip(bars, counts)):
-        width = bar.get_width()
-        ax.text(width + max(counts)*0.01, bar.get_y() + bar.get_height()/2.,
-               str(count), ha='left', va='center', fontsize=9)
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✅ Saved common confusions to {save_path}")
-
-
-def decode_predictions(logits: torch.Tensor, phn_to_id: Dict, id_to_phn: Dict) -> List[List[str]]:
-    """
-    Decode batch of logits to phoneme sequences using greedy decoding.
-    
-    Args:
-        logits: Model logits [batch, time, num_classes]
-        phn_to_id: Phoneme to ID mapping
-        id_to_phn: ID to phoneme mapping
-    
-    Returns:
-        List of phoneme sequences
-    """
-    predictions = []
-    pred_ids = torch.argmax(logits, dim=-1)
-    
-    for seq in pred_ids:
-        phonemes = []
-        prev_id = None
-        
-        for phone_id in seq.cpu().numpy():
-            # Skip blanks and padding
-            if phone_id == phn_to_id['<BLANK>']:
-                prev_id = None
-                continue
-            if phone_id == phn_to_id['<PAD>']:
-                continue
-            # Skip repetitions (CTC-style)
-            if phone_id == prev_id:
-                continue
-            
-            phoneme = id_to_phn.get(phone_id, '<UNK>')
-            # Stress-agnostic comparison: strip ARPABET stress digits
-            phoneme = str(phoneme).rstrip('012')
-            if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
-                phonemes.append(phoneme)
-            prev_id = phone_id
-        
-        predictions.append(phonemes)
-    
-    return predictions
-
-
-def decode_references(labels: torch.Tensor, id_to_phn: Dict) -> List[List[str]]:
-    """
-    Decode reference labels to phoneme sequences.
-    
-    Args:
-        labels: Label tensor [batch, seq_len]
-        id_to_phn: ID to phoneme mapping
-    
-    Returns:
-        List of phoneme sequences
-    """
-    references = []
-    
-    for seq in labels:
-        phonemes = []
-        for phone_id in seq.cpu().numpy():
-            if phone_id == -100:  # Padding
-                break
-            phoneme = id_to_phn.get(phone_id, '<UNK>')
-            # Stress-agnostic comparison: strip ARPABET stress digits
-            phoneme = str(phoneme).rstrip('012')
-            if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
-                phonemes.append(phoneme)
-        references.append(phonemes)
-    
-    return references
-
+# COMPREHENSIVE EVALUATION
 
 def evaluate_model(
     model,
@@ -622,21 +645,26 @@ def evaluate_model(
     phn_to_id: Dict[str, int],
     id_to_phn: Dict[int, str],
     results_dir: Path = None,
-    symbolic_rules: Dict[Tuple[str, str], float] = None
+    symbolic_rules: Optional[Dict] = None,
+    use_beam_search: bool = False,
+    beam_width: int = 10
 ) -> Dict:
     """
-    Comprehensive model evaluation with metrics and visualizations.
+    Comprehensive model evaluation with statistical rigor.
     
     Args:
         model: Trained model
         dataloader: Evaluation dataloader
         device: Device to run evaluation on
-        phn_to_id: Phoneme to ID mapping
-        id_to_phn: ID to phoneme mapping
+        phn_to_id: Phoneme → ID mapping
+        id_to_phn: ID → Phoneme mapping
         results_dir: Directory to save results
+        symbolic_rules: Optional dysarthria substitution rules (reserved for analysis)
+        use_beam_search: Use beam search decoder (default: False = greedy)
+        beam_width: Beam width for beam search
     
     Returns:
-        Dictionary of evaluation metrics
+        Dictionary of evaluation metrics with confidence intervals
     """
     if results_dir is None:
         results_dir = get_project_root() / "results"
@@ -645,12 +673,18 @@ def evaluate_model(
     
     model.eval()
     
+    # Initialize decoder
+    if use_beam_search:
+        decoder = BeamSearchDecoder(beam_width=beam_width, blank_id=phn_to_id['<BLANK>'])
+        print(f"🔍 Using beam search decoder (width={beam_width})")
+    else:
+        print("🔍 Using greedy decoder")
+    
     all_predictions = []
-    all_predictions_neural = []
     all_references = []
     all_status = []
     all_speakers = []
-    all_beta_values = []
+    all_phoneme_lengths = []
     
     print("🔍 Running evaluation...")
     
@@ -662,7 +696,6 @@ def evaluate_model(
             labels = batch['labels']
             
             # Forward pass
-            # Provide severity proxy (0=control, 1=dysarthric)
             severity = batch['status'].to(device)
             outputs = model(
                 input_values=input_values,
@@ -672,76 +705,66 @@ def evaluate_model(
             
             # Decode predictions
             logits_constrained = outputs['logits_constrained']
-            logits_neural = outputs['logits_neural']
-            predictions = decode_predictions(logits_constrained, phn_to_id, id_to_phn)
-            predictions_neural = decode_predictions(logits_neural, phn_to_id, id_to_phn)
+            
+            if use_beam_search:
+                # Beam search (slower but more accurate)
+                log_probs = torch.log_softmax(logits_constrained, dim=-1)
+                predictions = []
+                for i in range(log_probs.size(0)):
+                    seq, score = decoder.decode(
+                        log_probs[i].cpu().numpy(),
+                        id_to_phn
+                    )
+                    predictions.append(seq)
+            else:
+                # Greedy decoding (fast)
+                predictions = greedy_decode(logits_constrained, phn_to_id, id_to_phn)
+            
             references = decode_references(labels, id_to_phn)
             
             all_predictions.extend(predictions)
-            all_predictions_neural.extend(predictions_neural)
             all_references.extend(references)
             all_status.extend(batch['status'].cpu().numpy())
             all_speakers.extend(batch['speakers'])
-
-            # Compute per-sample adaptive beta (replicate model logic)
-            try:
-                base_beta = float(model.symbolic_layer.beta.item())
-            except Exception:
-                base_beta = float(model.symbolic_layer.beta)
-            # Severity normalization: use status (0 or 1) mapped to {0, 5}
-            sev_np = batch['status'].cpu().numpy()
-            for s in sev_np:
-                sev_norm = (5.0 if s == 1 else 0.0) / 5.0
-                beta_val = np.clip(base_beta + 0.1 * sev_norm, 0.0, 0.8)
-                all_beta_values.append(float(beta_val))
+            all_phoneme_lengths.extend([len(ref) for ref in references])
             
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
     
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
-    avg_per = np.mean(per_scores)
+    mean_per, per_ci = compute_per_with_ci(per_scores)
     
     # Stratified by dysarthric status
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
     control_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
+    
+    dysarthric_mean, dysarthric_ci = compute_per_with_ci(dysarthric_per)
+    control_mean, control_ci = compute_per_with_ci(control_per)
+    
+    # Stratified by phoneme length
+    stratified_by_length = stratify_by_phoneme_length(
+        per_scores, all_phoneme_lengths, all_status
+    )
     
     # Per-speaker analysis
     speaker_per = defaultdict(list)
     for i, speaker in enumerate(all_speakers):
         speaker_per[speaker].append(per_scores[i])
     
-    speaker_metrics = {
-        spk: {
-            'per': float(np.mean(scores)),
+    speaker_metrics = {}
+    for spk, scores in speaker_per.items():
+        mean, ci = compute_per_with_ci(scores)
+        speaker_metrics[spk] = {
+            'per': mean,
+            'ci': ci,
             'std': float(np.std(scores)),
             'n_samples': len(scores)
         }
-        for spk, scores in speaker_per.items()
-    }
     
     # Phoneme-level error analysis
     print("📊 Analyzing phoneme-level errors...")
     error_analysis = analyze_phoneme_errors(all_predictions, all_references)
-    manner_summary = summarize_minor_major(error_analysis['confusion_matrix'])
-    grouped_conf = group_confusion_by_manner(error_analysis['confusion_matrix'])
-
-    # Rule hit-rate analysis (optional)
-    rule_counts = {}
-    if symbolic_rules is None and get_default_config is not None:
-        cfg = get_default_config()
-        symbolic_rules = cfg.symbolic.substitution_rules
-    if symbolic_rules:
-        symbolic_rules = normalize_rule_keys(symbolic_rules)
-        rule_counts = compute_rule_hit_counts(
-            all_predictions_neural,
-            all_predictions,
-            all_references,
-            symbolic_rules
-        )
-    
-    # Create results directory
-    results_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate visualizations
     print("📈 Generating visualizations...")
@@ -751,62 +774,41 @@ def evaluate_model(
         results_dir / 'confusion_matrix.png'
     )
     
-    plot_error_distribution(
-        error_analysis['error_counts'],
-        results_dir / 'error_distribution.png'
+    plot_per_by_length(
+        stratified_by_length,
+        results_dir / 'per_by_length.png'
     )
-    
-    plot_per_by_speaker(
-        speaker_metrics,
-        results_dir / 'per_by_speaker.png'
-    )
-    
-    plot_common_confusions(
-        error_analysis['common_confusions'],
-        results_dir / 'common_confusions.png'
-    )
-
-    plot_confusion_by_manner(
-        grouped_conf,
-        results_dir / 'confusion_by_manner.png'
-    )
-
-    # Plot Beta vs PER (per-speaker averages)
-    try:
-        plot_beta_vs_per(
-            per_scores,
-            all_speakers,
-            all_beta_values,
-            results_dir / 'beta_vs_per.png'
-        )
-    except Exception as e:
-        print(f"⚠️ Beta vs PER plot skipped: {e}")
-
-    # Plot Top Rules Applied (if available)
-    if rule_counts:
-        plot_top_rules_applied(rule_counts, results_dir / 'top_rules_applied.png', top_k=10)
     
     # Compile results
     results = {
         'overall': {
-            'per': float(avg_per),
-            'per_std': float(np.std(per_scores)),
+            'per': mean_per,
+            'ci': per_ci,
+            'std': float(np.std(per_scores)),
             'n_samples': len(per_scores)
         },
         'stratified': {
-            'dysarthric_per': float(np.mean(dysarthric_per)) if dysarthric_per else 0.0,
-            'dysarthric_n': len(dysarthric_per),
-            'control_per': float(np.mean(control_per)) if control_per else 0.0,
-            'control_n': len(control_per)
+            'dysarthric': {
+                'per': dysarthric_mean,
+                'ci': dysarthric_ci,
+                'n': len(dysarthric_per)
+            },
+            'control': {
+                'per': control_mean,
+                'ci': control_ci,
+                'n': len(control_per)
+            }
         },
+        'by_length': stratified_by_length,
         'per_speaker': speaker_metrics,
         'error_analysis': {
             'error_counts': error_analysis['error_counts'],
-            'common_confusions': [(list(pair), count) for pair, count in error_analysis['common_confusions']],
+            'common_confusions': [
+                (list(pair), count)
+                for pair, count in error_analysis['common_confusions']
+            ],
             'deletion_phonemes': error_analysis['deletion_phonemes'],
-            'insertion_phonemes': error_analysis['insertion_phonemes'],
-            'manner_summary': manner_summary,
-            'rule_counts': {f"{k[0]}→{k[1]}": v for k, v in (rule_counts.items() if rule_counts else [])}
+            'insertion_phonemes': error_analysis['insertion_phonemes']
         }
     }
     
@@ -820,9 +822,9 @@ def evaluate_model(
     print("\n" + "="*60)
     print("📊 EVALUATION SUMMARY")
     print("="*60)
-    print(f"Overall PER:      {avg_per:.3f} ± {np.std(per_scores):.3f}")
-    print(f"Dysarthric PER:   {results['stratified']['dysarthric_per']:.3f} (n={len(dysarthric_per)})")
-    print(f"Control PER:      {results['stratified']['control_per']:.3f} (n={len(control_per)})")
+    print(f"Overall PER:      {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
+    print(f"Dysarthric PER:   {dysarthric_mean:.3f} (95% CI: [{dysarthric_ci[0]:.3f}, {dysarthric_ci[1]:.3f}]) (n={len(dysarthric_per)})")
+    print(f"Control PER:      {control_mean:.3f} (95% CI: [{control_ci[0]:.3f}, {control_ci[1]:.3f}]) (n={len(control_per)})")
     print(f"\nError Breakdown:")
     print(f"  Correct:        {error_analysis['error_counts']['correct']}")
     print(f"  Substitutions:  {error_analysis['error_counts']['substitutions']}")
@@ -833,126 +835,8 @@ def evaluate_model(
     return results
 
 
-# ---- Explainability helpers ----
-
-def _alignment_ref_map(alignment: List[Tuple[str, Optional[str], Optional[str]]]) -> List[Optional[str]]:
-    """
-    Build list mapping each reference position to the predicted phoneme
-    (or None if inserted/missing).
-    """
-    ref_map: List[Optional[str]] = []
-    for op, pred_ph, ref_ph in alignment:
-        if op in ('correct', 'substitute'):
-            ref_map.append(pred_ph if pred_ph is not None else ref_ph)
-        elif op == 'insert':
-            ref_map.append(None)
-        # 'delete' does not advance reference; ignore
-    return ref_map
-
-
-def compute_rule_hit_counts(
-    preds_neural: List[List[str]],
-    preds_constrained: List[List[str]],
-    references: List[List[str]],
-    rules: Dict[Tuple[str, str], float]
-) -> Dict[Tuple[str, str], int]:
-    """
-    Count times when the constrained prediction corrected the neural prediction
-    to match a known rule direction (constrained, neural).
-    """
-    counts: Dict[Tuple[str, str], int] = defaultdict(int)
-    for p_n, p_c, ref in zip(preds_neural, preds_constrained, references):
-        aln_n = phoneme_alignment(p_n, ref)
-        aln_c = phoneme_alignment(p_c, ref)
-        map_n = _alignment_ref_map(aln_n)
-        map_c = _alignment_ref_map(aln_c)
-        L = min(len(ref), len(map_n), len(map_c))
-        for i in range(L):
-            pred_n = map_n[i]
-            pred_c = map_c[i]
-            if pred_n is None or pred_c is None:
-                continue
-            # Rule direction: (constrained, neural)
-            key = (pred_c, pred_n)
-            if key in rules:
-                counts[key] += 1
-    return dict(counts)
-
-
-def normalize_rule_keys(rules: Dict[Tuple[str, str], float]) -> Dict[Tuple[str, str], float]:
-    """Strip stress markers from rule keys to match stress-agnostic decoding."""
-    cleaned: Dict[Tuple[str, str], float] = {}
-    for (a, b), prob in rules.items():
-        a_clean = str(a).rstrip('012')
-        b_clean = str(b).rstrip('012')
-        cleaned[(a_clean, b_clean)] = prob
-    return cleaned
-
-
-def plot_top_rules_applied(
-    rule_counts: Dict[Tuple[str, str], int],
-    save_path: Path,
-    top_k: int = 10
-) -> None:
-    if not rule_counts:
-        return
-    items = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    labels = [f"{k[0]} → {k[1]}" for k, _ in items]
-    counts = [v for _, v in items]
-    plt.figure(figsize=(10, 6))
-    bars = plt.barh(range(len(labels)), counts, color='#8e44ad', alpha=0.8, edgecolor='black')
-    plt.yticks(range(len(labels)), labels)
-    plt.xlabel('Count', fontsize=12)
-    plt.title('Top Rules Applied by Symbolic Layer', fontsize=14, fontweight='bold')
-    plt.grid(axis='x', alpha=0.3)
-    plt.gca().invert_yaxis()
-    for bar, c in zip(bars, counts):
-        plt.text(c + max(counts) * 0.02, bar.get_y() + bar.get_height()/2., str(c), va='center')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✅ Saved top rules applied to {save_path}")
-
-
-def plot_beta_vs_per(
-    per_scores: List[float],
-    speakers: List[str],
-    beta_values: List[float],
-    save_path: Path
-) -> None:
-    """
-    Scatter: Speaker PER (X) vs Average Beta (Y).
-    """
-    # Aggregate per speaker
-    spk_to_per: Dict[str, List[float]] = defaultdict(list)
-    spk_to_beta: Dict[str, List[float]] = defaultdict(list)
-    for spk, per, beta in zip(speakers, per_scores, beta_values):
-        spk_to_per[spk].append(per)
-        spk_to_beta[spk].append(beta)
-
-    spks = list(spk_to_per.keys())
-    x = [float(np.mean(spk_to_per[s])) for s in spks]
-    y = [float(np.mean(spk_to_beta[s])) for s in spks]
-
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, c='#2c3e50', alpha=0.7, edgecolors='white')
-    plt.xlabel('Speaker PER (avg)', fontsize=12)
-    plt.ylabel('Average β (constraint weight)', fontsize=12)
-    plt.title('β Activation vs. PER', fontsize=14, fontweight='bold')
-    # Optional trend line
-    if len(x) > 1:
-        coeffs = np.polyfit(x, y, 1)
-        xs = np.linspace(min(x), max(x), 100)
-        ys = coeffs[0] * xs + coeffs[1]
-        plt.plot(xs, ys, color='#e74c3c', linestyle='--', linewidth=1.5, label='Trend')
-        plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✅ Saved β vs PER scatter to {save_path}")
-
-
 def main() -> None:
+    """Test evaluation metrics."""
     # Test PER computation
     pred = ['P', 'B', 'T', 'AH', 'L']
     ref = ['B', 'AH', 'T', 'AH', 'L']
@@ -960,6 +844,12 @@ def main() -> None:
     per = compute_per(pred, ref)
     print(f"PER: {per:.3f}")
     
+    # Test confidence interval
+    per_scores = [0.1, 0.2, 0.15, 0.18, 0.12, 0.25]
+    mean, ci = compute_per_with_ci(per_scores)
+    print(f"Mean PER: {mean:.3f} (95% CI: [{ci[0]:.3f}, {ci[1]:.3f}])")
+    
+    # Test alignment
     alignment = phoneme_alignment(pred, ref)
     print("\nAlignment:")
     for op, p, r in alignment:

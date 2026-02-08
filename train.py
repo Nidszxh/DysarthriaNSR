@@ -22,12 +22,12 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 # Add src directory to path for imports
 project_root = Path(__file__).resolve().parent
-sys.path.insert(0, str(project_root / "src"))
+sys.path.insert(2, str(project_root / "src"))
 
-from utils.config import Config, get_default_config, get_project_root
-from data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+from src.utils.config import Config, get_default_config, get_project_root
+from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
 import os
-from models.model import NeuroSymbolicASR
+from src.models.model import NeuroSymbolicASR
 
 # Import evaluate functions from root level
 from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
@@ -300,14 +300,29 @@ class DysarthriaASRLightning(pl.LightningModule):
         labels = batch['labels']
         label_lengths = (labels != -100).sum(dim=1)
 
-        # Guard against label sequences longer than available frames to avoid CTC inf
-        if (label_lengths > input_lengths).any():
-            # Align lengths conservatively to avoid invalid CTC; log once per hit
-            input_lengths = torch.maximum(input_lengths, label_lengths)
-            self.log('train/ctc_length_adjust', (label_lengths > input_lengths).float().mean(), on_step=True, prog_bar=False)
+        # Drop samples where target length exceeds input length (invalid for CTC)
+        valid_mask = label_lengths <= input_lengths
+        if not valid_mask.all():
+            invalid_frac = 1.0 - valid_mask.float().mean()
+            self.log('train/ctc_invalid_frac', invalid_frac, on_step=True, prog_bar=False)
+
+        if valid_mask.sum() == 0:
+            zero_loss = torch.zeros((), device=logits_constrained.device, requires_grad=True)
+            self.log('train/loss', zero_loss, on_step=True, on_epoch=True, prog_bar=True)
+            return zero_loss
+
+        outputs_filtered = {'logits_constrained': logits_constrained[valid_mask]}
+        labels_filtered = labels[valid_mask]
+        input_lengths_filtered = input_lengths[valid_mask]
+        label_lengths_filtered = label_lengths[valid_mask]
         
         # Compute losses
-        losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
+        losses = self.compute_loss(
+            outputs_filtered,
+            labels_filtered,
+            input_lengths_filtered,
+            label_lengths_filtered
+        )
         
         # Log metrics
         self.log('train/loss', losses['loss'], on_step=True, on_epoch=True, prog_bar=True)
@@ -340,7 +355,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         """
         outputs = self(batch)
         
-        # Compute losses
+        # Compute lengths
         logits_constrained = outputs['logits_constrained']
         input_lengths = torch.full(
             (logits_constrained.size(0),),
@@ -351,8 +366,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         
         labels = batch['labels']
         label_lengths = (labels != -100).sum(dim=1)
-        
-        losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
+
+        # Drop invalid CTC samples for validation metrics
+        valid_mask = label_lengths <= input_lengths
+        if valid_mask.sum() == 0:
+            return {}
+
+        logits_constrained = logits_constrained[valid_mask]
+        labels = labels[valid_mask]
+        input_lengths = input_lengths[valid_mask]
+        label_lengths = label_lengths[valid_mask]
+
+        losses = self.compute_loss(
+            {'logits_constrained': logits_constrained},
+            labels,
+            input_lengths,
+            label_lengths
+        )
         
         # Decode predictions for PER computation
         predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
@@ -368,7 +398,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             'per': avg_per,
             'predictions': predictions,
             'references': references,
-            'status': batch['status']
+            'status': batch['status'][valid_mask]
         })
         
         return losses
@@ -437,7 +467,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         """
         outputs = self(batch)
         
-        # Compute losses
+        # Compute lengths
         logits_constrained = outputs['logits_constrained']
         input_lengths = torch.full(
             (logits_constrained.size(0),),
@@ -448,8 +478,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         
         labels = batch['labels']
         label_lengths = (labels != -100).sum(dim=1)
+
+        # Drop invalid CTC samples for test metrics
+        valid_mask = label_lengths <= input_lengths
+        if valid_mask.sum() == 0:
+            return {}
+
+        logits_constrained = logits_constrained[valid_mask]
+        labels = labels[valid_mask]
+        input_lengths = input_lengths[valid_mask]
+        label_lengths = label_lengths[valid_mask]
         
-        losses = self.compute_loss(outputs, labels, input_lengths, label_lengths)
+        losses = self.compute_loss(
+            {'logits_constrained': logits_constrained},
+            labels,
+            input_lengths,
+            label_lengths
+        )
         
         # Decode and compute PER
         predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
