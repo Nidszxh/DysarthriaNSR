@@ -11,17 +11,10 @@ Key Features:
 - Articulatory confusion analysis
 - Rule activation tracking
 - Statistical significance testing
-
-Scientific Standards:
-- Bootstrap confidence intervals (95% CI)
-- Bonferroni correction for multiple comparisons
-- Effect size reporting (Cohen's d)
-- Per-speaker generalization metrics
 """
 
 import json
 import sys
-import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -53,6 +46,26 @@ except ImportError:
             return project_root
 
 
+def _align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
+    """
+    Align label sequence length to match logits time dimension.
+
+    Pads with -100 (ignored) or truncates to fit the logits time axis.
+    """
+    batch_size = labels.size(0)
+    time_steps_labels = labels.size(1)
+
+    if time_steps_labels < time_steps_logits:
+        padding = torch.full(
+            (batch_size, time_steps_logits - time_steps_labels),
+            -100,
+            dtype=labels.dtype,
+            device=labels.device
+        )
+        return torch.cat([labels, padding], dim=1)
+    return labels[:, :time_steps_logits]
+
+
 # DECODING UTILITIES
 
 class BeamSearchDecoder:
@@ -61,13 +74,6 @@ class BeamSearchDecoder:
     
     Implements efficient beam search for CTC outputs using prefix merging.
     Significantly more accurate than greedy decoding for ambiguous sequences.
-    
-    Args:
-        beam_width: Number of hypotheses to maintain (default: 10)
-        blank_id: CTC blank token ID (default: 0)
-    
-    References:
-        Graves (2012) "Sequence Transduction with Recurrent Neural Networks"
     """
     
     def __init__(self, beam_width: int = 10, blank_id: int = 0):
@@ -239,13 +245,6 @@ def compute_per(prediction: List[str], reference: List[str]) -> float:
     
     PER = (S + D + I) / N
     where S = substitutions, D = deletions, I = insertions, N = reference length
-    
-    Args:
-        prediction: List of predicted phonemes
-        reference: List of reference phonemes
-    
-    Returns:
-        PER score (0.0 to 1.0+, can exceed 1.0 for many insertions)
     """
     if len(reference) == 0:
         return 1.0 if len(prediction) > 0 else 0.0
@@ -330,7 +329,7 @@ def compute_wer_texts(
 
 
 def decode_predictions(
-    logits: torch.Tensor,
+    log_probs: torch.Tensor,
     phn_to_id: Dict[str, int],
     id_to_phn: Dict[int, str],
     use_beam_search: bool = False,
@@ -344,7 +343,6 @@ def decode_predictions(
             beam_width=beam_width,
             blank_id=phn_to_id['<BLANK>']
         )
-        log_probs = torch.log_softmax(logits, dim=-1)
         predictions = []
         for i in range(log_probs.size(0)):
             seq, _ = decoder.decode(
@@ -354,7 +352,7 @@ def decode_predictions(
             predictions.append(seq)
         return predictions
     else:
-        return greedy_decode(logits, phn_to_id, id_to_phn)
+        return greedy_decode(log_probs, phn_to_id, id_to_phn)
 
 
 # ERROR ANALYSIS
@@ -636,6 +634,43 @@ def plot_per_by_length(
     print(f"✅ Saved length-stratified PER plot to {save_path}")
 
 
+def plot_rule_impact(stats: Dict, save_path: Path) -> None:
+    """Visualize the most active symbolic corrections."""
+    if not stats or not stats.get('top_rules'):
+        return
+
+    rules = [f"{r[0][0]}->{r[0][1]}" for r in stats['top_rules']]
+    counts = [r[1] for r in stats['top_rules']]
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=counts, y=rules, palette="viridis")
+    plt.title("Top Symbolic Corrections (Rule Activations)")
+    plt.xlabel("Frequency of Activation")
+    plt.ylabel("Phoneme Substitution (Neural -> Symbolic)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_clinical_gap(
+    dysarthric_mean: float,
+    control_mean: float,
+    save_path: Path
+) -> None:
+    """Plot performance gap between dysarthric and control speakers."""
+    labels = ["Dysarthric", "Control"]
+    values = [dysarthric_mean, control_mean]
+
+    plt.figure(figsize=(6, 4))
+    sns.barplot(x=labels, y=values, palette=["#e74c3c", "#3498db"])
+    plt.ylabel("PER")
+    plt.title("Clinical Diagnostic: Dysarthric vs Control")
+    plt.ylim(0.0, max(values) * 1.1 if values else 1.0)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 # COMPREHENSIVE EVALUATION
 
 def evaluate_model(
@@ -682,9 +717,11 @@ def evaluate_model(
     
     all_predictions = []
     all_references = []
+    all_predictions_neural = []
     all_status = []
     all_speakers = []
     all_phoneme_lengths = []
+    articulatory_results = {"manner": [], "place": [], "voice": []}
     
     print("🔍 Running evaluation...")
     
@@ -704,21 +741,25 @@ def evaluate_model(
             )
             
             # Decode predictions
-            logits_constrained = outputs['logits_constrained']
+            log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
+            logits_neural = outputs.get('logits_neural')
             
             if use_beam_search:
                 # Beam search (slower but more accurate)
-                log_probs = torch.log_softmax(logits_constrained, dim=-1)
                 predictions = []
-                for i in range(log_probs.size(0)):
+                for i in range(log_probs_constrained.size(0)):
                     seq, score = decoder.decode(
-                        log_probs[i].cpu().numpy(),
+                        log_probs_constrained[i].cpu().numpy(),
                         id_to_phn
                     )
                     predictions.append(seq)
             else:
                 # Greedy decoding (fast)
-                predictions = greedy_decode(logits_constrained, phn_to_id, id_to_phn)
+                predictions = greedy_decode(log_probs_constrained, phn_to_id, id_to_phn)
+
+            if logits_neural is not None:
+                predictions_neural = greedy_decode(logits_neural, phn_to_id, id_to_phn)
+                all_predictions_neural.extend(predictions_neural)
             
             references = decode_references(labels, id_to_phn)
             
@@ -727,6 +768,17 @@ def evaluate_model(
             all_status.extend(batch['status'].cpu().numpy())
             all_speakers.extend(batch['speakers'])
             all_phoneme_lengths.extend([len(ref) for ref in references])
+
+            if outputs.get('logits_manner') is not None and 'articulatory_labels' in batch:
+                for key in ['manner', 'place', 'voice']:
+                    logits = outputs[f'logits_{key}']
+                    labels = batch['articulatory_labels'][key].to(device)
+                    labels = _align_labels_to_logits(labels, logits.size(1))
+                    mask = labels != -100
+                    if mask.any():
+                        preds = torch.argmax(logits, dim=-1)
+                        acc = (preds[mask] == labels[mask]).float().mean().item()
+                        articulatory_results[key].append(acc)
             
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
@@ -734,6 +786,13 @@ def evaluate_model(
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
     mean_per, per_ci = compute_per_with_ci(per_scores)
+
+    neural_per_scores = []
+    if all_predictions_neural:
+        neural_per_scores = [
+            compute_per(p, r) for p, r in zip(all_predictions_neural, all_references)
+        ]
+    mean_per_neural = float(np.mean(neural_per_scores)) if neural_per_scores else None
     
     # Stratified by dysarthric status
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
@@ -778,6 +837,27 @@ def evaluate_model(
         stratified_by_length,
         results_dir / 'per_by_length.png'
     )
+
+    plot_clinical_gap(
+        dysarthric_mean,
+        control_mean,
+        results_dir / 'clinical_gap.png'
+    )
+
+    rule_stats = None
+    if hasattr(model, 'get_rule_statistics'):
+        rule_stats = model.get_rule_statistics()
+        if rule_stats is not None:
+            if isinstance(rule_stats.get('unique_rules'), set):
+                rule_stats['unique_rules'] = [list(item) for item in rule_stats['unique_rules']]
+            if isinstance(rule_stats.get('top_rules'), list):
+                rule_stats['top_rules'] = [
+                    [list(pair), count] if isinstance(pair, tuple) else [pair, count]
+                    for pair, count in rule_stats['top_rules']
+                ]
+        plot_rule_impact(rule_stats, results_dir / 'rule_impact.png')
+
+    t_stat, p_val = stats.ttest_ind(dysarthric_per, control_per, equal_var=False) if dysarthric_per and control_per else (0.0, 1.0)
     
     # Compile results
     results = {
@@ -787,6 +867,21 @@ def evaluate_model(
             'std': float(np.std(per_scores)),
             'n_samples': len(per_scores)
         },
+        'symbolic_impact': {
+            'per_neural': mean_per_neural,
+            'per_constrained': mean_per,
+            'delta_per': (mean_per_neural - mean_per) if mean_per_neural is not None else None
+        },
+        'articulatory_accuracy': {
+            key: float(np.mean(vals)) if vals else 0.0
+            for key, vals in articulatory_results.items()
+        },
+        'stats': {
+            't_statistic': float(t_stat),
+            'p_value': float(p_val),
+            'significant': bool(p_val < 0.05)
+        },
+        'rule_impact': rule_stats,
         'stratified': {
             'dysarthric': {
                 'per': dysarthric_mean,

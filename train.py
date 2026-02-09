@@ -87,7 +87,8 @@ class DysarthriaASRLightning(pl.LightningModule):
         config: Config,
         phn_to_id: Dict[str, int],
         id_to_phn: Dict[int, str],
-        class_weights: Optional[torch.Tensor] = None
+        class_weights: Optional[torch.Tensor] = None,
+        articulatory_weights: Optional[Dict[str, torch.Tensor]] = None
     ):
         """
         Initialize Lightning module.
@@ -104,6 +105,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.phn_to_id = phn_to_id
         self.id_to_phn = id_to_phn
         self.class_weights = class_weights
+        self.articulatory_weights = articulatory_weights or {}
         
         # Save hyperparameters (exclude complex objects)
         self.save_hyperparameters(ignore=['model', 'config', 'phn_to_id', 'id_to_phn'])
@@ -142,15 +144,26 @@ class DysarthriaASRLightning(pl.LightningModule):
         if '<PAD>' in self.phn_to_id:
             ce_weights[self.phn_to_id['<PAD>']] = float(ce_weights[self.phn_to_id['<PAD>']]) * 1.5
 
-        self.ce_loss = nn.CrossEntropyLoss(
+        self.ce_loss = nn.NLLLoss(
             weight=ce_weights,
-            ignore_index=-100,
-            label_smoothing=self.config.training.label_smoothing
+            ignore_index=-100
         )
+
+        self.art_ce_losses = {}
+        for key in ["manner", "place", "voice"]:
+            weights = self.articulatory_weights.get(key)
+            if weights is not None:
+                weights = weights.clone().detach().float()
+            self.art_ce_losses[key] = nn.CrossEntropyLoss(
+                weight=weights,
+                ignore_index=-100,
+                label_smoothing=self.config.training.label_smoothing
+            )
         
         # Register loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
         self.register_buffer('lambda_ce', torch.tensor(self.config.training.lambda_ce))
+        self.register_buffer('lambda_articulatory', torch.tensor(self.config.training.lambda_articulatory))
 
     def on_fit_start(self) -> None:
         """Ensure loss weights reside on the correct device once available."""
@@ -159,6 +172,12 @@ class DysarthriaASRLightning(pl.LightningModule):
                 self.ce_loss.weight = self.ce_loss.weight.to(self.device)
             except Exception:
                 pass
+        for loss_fn in self.art_ce_losses.values():
+            if hasattr(loss_fn, 'weight') and loss_fn.weight is not None:
+                try:
+                    loss_fn.weight = loss_fn.weight.to(self.device)
+                except Exception:
+                    pass
     
     def forward(self, batch: Dict) -> Dict:
         """
@@ -184,7 +203,8 @@ class DysarthriaASRLightning(pl.LightningModule):
         outputs: Dict,
         labels: torch.Tensor,
         input_lengths: torch.Tensor,
-        label_lengths: torch.Tensor
+        label_lengths: torch.Tensor,
+        articulatory_labels: Optional[Dict[str, torch.Tensor]] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute multi-task loss (simplified to CTC + CE).
@@ -198,35 +218,55 @@ class DysarthriaASRLightning(pl.LightningModule):
         Returns:
             Dictionary with individual and total losses
         """
-        logits_constrained = outputs['logits_constrained']
+        log_probs_constrained = outputs['logits_constrained']
         
         # 1. CTC Loss (primary alignment loss)
         loss_ctc = self._compute_ctc_loss(
-            logits_constrained, labels, input_lengths, label_lengths
+            log_probs_constrained, labels, input_lengths, label_lengths
         )
         
         # 2. Cross-Entropy Loss (auxiliary frame-level supervision)
-        loss_ce = self._compute_ce_loss(logits_constrained, labels)
+        loss_ce = self._compute_ce_loss(log_probs_constrained, labels)
         
+        loss_art = None
+        if articulatory_labels and outputs.get('logits_manner') is not None:
+            art_losses = []
+            for key in ["manner", "place", "voice"]:
+                logits = outputs.get(f"logits_{key}")
+                labels_art = articulatory_labels.get(key)
+                if logits is None or labels_art is None:
+                    continue
+                art_losses.append(self._compute_articulatory_ce_loss(logits, labels_art, key))
+            if art_losses:
+                loss_art = torch.stack(art_losses).mean()
+
         # Total weighted loss
         total_loss = self.lambda_ctc * loss_ctc + self.lambda_ce * loss_ce
+        if loss_art is not None:
+            total_loss = total_loss + self.lambda_articulatory * loss_art
         
         return {
             'loss': total_loss,
             'loss_ctc': loss_ctc,
-            'loss_ce': loss_ce
+            'loss_ce': loss_ce,
+            'loss_art': loss_art
         }
     
     def _compute_ctc_loss(
         self,
-        logits: torch.Tensor,
+        log_probs: torch.Tensor,
         labels: torch.Tensor,
         input_lengths: torch.Tensor,
         label_lengths: torch.Tensor
     ) -> torch.Tensor:
         """Compute CTC loss."""
-        log_probs = F.log_softmax(logits, dim=-1)
         log_probs_transposed = log_probs.transpose(0, 1)  # [time, batch, num_classes]
+
+        # Clamp to actual time dimension to avoid off-by-one length mismatches
+        input_lengths = torch.clamp(
+            input_lengths,
+            max=log_probs_transposed.size(0)
+        )
         
         return self.ctc_loss(
             log_probs_transposed,
@@ -235,18 +275,30 @@ class DysarthriaASRLightning(pl.LightningModule):
             label_lengths
         )
     
-    def _compute_ce_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute cross-entropy loss with label alignment."""
-        batch_size, time_steps_logits, num_classes = logits.shape
+    def _compute_ce_loss(self, log_probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute NLL loss using constrained log-probabilities."""
+        batch_size, time_steps_logits, num_classes = log_probs.shape
         
         # Align labels to logits time dimension
         labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
         
         # Compute loss
-        logits_flat = logits.reshape(-1, num_classes)
+        logits_flat = log_probs.reshape(-1, num_classes)
         labels_flat = labels_aligned.reshape(-1)
         
         return self.ce_loss(logits_flat, labels_flat)
+
+    def _compute_articulatory_ce_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        key: str
+    ) -> torch.Tensor:
+        batch_size, time_steps_logits, num_classes = logits.shape
+        labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
+        logits_flat = logits.reshape(-1, num_classes)
+        labels_flat = labels_aligned.reshape(-1)
+        return self.art_ce_losses[key](logits_flat, labels_flat)
     
     def _align_labels_to_logits(self, labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
         """
@@ -289,16 +341,36 @@ class DysarthriaASRLightning(pl.LightningModule):
         outputs = self(batch)
         
         # Compute lengths
-        logits_constrained = outputs['logits_constrained']
-        input_lengths = torch.full(
-            (logits_constrained.size(0),),
-            logits_constrained.size(1),
-            dtype=torch.long,
-            device=logits_constrained.device
-        )
-        
+        log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        label_lengths = (labels != -100).sum(dim=1)
+        input_lengths = batch.get('input_lengths')
+        if input_lengths is None:
+            input_lengths = torch.full(
+                (log_probs_constrained.size(0),),
+                log_probs_constrained.size(1),
+                dtype=torch.long,
+                device=log_probs_constrained.device
+            )
+        else:
+            input_lengths = input_lengths.to(log_probs_constrained.device)
+
+        # Guard against off-by-one or padding-induced length mismatch
+        input_lengths = torch.clamp(
+            input_lengths,
+            max=log_probs_constrained.size(1)
+        )
+
+        # Guard against off-by-one or padding-induced length mismatch
+        input_lengths = torch.clamp(
+            input_lengths,
+            max=log_probs_constrained.size(1)
+        )
+
+        label_lengths = batch.get('label_lengths')
+        if label_lengths is None:
+            label_lengths = (labels != -100).sum(dim=1)
+        else:
+            label_lengths = label_lengths.to(log_probs_constrained.device)
 
         # Drop samples where target length exceeds input length (invalid for CTC)
         valid_mask = label_lengths <= input_lengths
@@ -307,27 +379,43 @@ class DysarthriaASRLightning(pl.LightningModule):
             self.log('train/ctc_invalid_frac', invalid_frac, on_step=True, prog_bar=False)
 
         if valid_mask.sum() == 0:
-            zero_loss = torch.zeros((), device=logits_constrained.device, requires_grad=True)
+            zero_loss = torch.zeros((), device=log_probs_constrained.device, requires_grad=True)
             self.log('train/loss', zero_loss, on_step=True, on_epoch=True, prog_bar=True)
             return zero_loss
 
-        outputs_filtered = {'logits_constrained': logits_constrained[valid_mask]}
+        logits_manner = outputs.get('logits_manner')
+        logits_place = outputs.get('logits_place')
+        logits_voice = outputs.get('logits_voice')
+
+        outputs_filtered = {
+            'logits_constrained': log_probs_constrained[valid_mask],
+            'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
+            'logits_place': logits_place[valid_mask] if logits_place is not None else None,
+            'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
+        }
         labels_filtered = labels[valid_mask]
         input_lengths_filtered = input_lengths[valid_mask]
         label_lengths_filtered = label_lengths[valid_mask]
         
         # Compute losses
+        art_labels = batch.get('articulatory_labels')
+        if art_labels is not None:
+            art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
+
         losses = self.compute_loss(
             outputs_filtered,
             labels_filtered,
             input_lengths_filtered,
-            label_lengths_filtered
+            label_lengths_filtered,
+            articulatory_labels=art_labels
         )
         
         # Log metrics
         self.log('train/loss', losses['loss'], on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/loss_ctc', losses['loss_ctc'], on_step=False, on_epoch=True)
         self.log('train/loss_ce', losses['loss_ce'], on_step=False, on_epoch=True)
+        if losses.get('loss_art') is not None:
+            self.log('train/loss_art', losses['loss_art'], on_step=False, on_epoch=True)
         # Log average beta to monitor neuro-symbolic weight activation
         beta_val = outputs['beta'].mean() if isinstance(outputs['beta'], torch.Tensor) else outputs['beta']
         self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
@@ -356,36 +444,64 @@ class DysarthriaASRLightning(pl.LightningModule):
         outputs = self(batch)
         
         # Compute lengths
-        logits_constrained = outputs['logits_constrained']
-        input_lengths = torch.full(
-            (logits_constrained.size(0),),
-            logits_constrained.size(1),
-            dtype=torch.long,
-            device=logits_constrained.device
-        )
-        
+        log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        label_lengths = (labels != -100).sum(dim=1)
+        input_lengths = batch.get('input_lengths')
+        if input_lengths is None:
+            input_lengths = torch.full(
+                (log_probs_constrained.size(0),),
+                log_probs_constrained.size(1),
+                dtype=torch.long,
+                device=log_probs_constrained.device
+            )
+        else:
+            input_lengths = input_lengths.to(log_probs_constrained.device)
+
+        # Guard against off-by-one or padding-induced length mismatch
+        input_lengths = torch.clamp(
+            input_lengths,
+            max=log_probs_constrained.size(1)
+        )
+
+        label_lengths = batch.get('label_lengths')
+        if label_lengths is None:
+            label_lengths = (labels != -100).sum(dim=1)
+        else:
+            label_lengths = label_lengths.to(log_probs_constrained.device)
 
         # Drop invalid CTC samples for validation metrics
         valid_mask = label_lengths <= input_lengths
         if valid_mask.sum() == 0:
             return {}
 
-        logits_constrained = logits_constrained[valid_mask]
+        log_probs_constrained = log_probs_constrained[valid_mask]
         labels = labels[valid_mask]
         input_lengths = input_lengths[valid_mask]
         label_lengths = label_lengths[valid_mask]
 
+        logits_manner = outputs.get('logits_manner')
+        logits_place = outputs.get('logits_place')
+        logits_voice = outputs.get('logits_voice')
+
+        art_labels = batch.get('articulatory_labels')
+        if art_labels is not None:
+            art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
+
         losses = self.compute_loss(
-            {'logits_constrained': logits_constrained},
+            {
+                'logits_constrained': log_probs_constrained,
+                'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
+                'logits_place': logits_place[valid_mask] if logits_place is not None else None,
+                'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
+            },
             labels,
             input_lengths,
-            label_lengths
+            label_lengths,
+            articulatory_labels=art_labels
         )
         
         # Decode predictions for PER computation
-        predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
+        predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
         references = decode_references(labels, self.id_to_phn)
         
         # Compute PER
@@ -468,36 +584,58 @@ class DysarthriaASRLightning(pl.LightningModule):
         outputs = self(batch)
         
         # Compute lengths
-        logits_constrained = outputs['logits_constrained']
-        input_lengths = torch.full(
-            (logits_constrained.size(0),),
-            logits_constrained.size(1),
-            dtype=torch.long,
-            device=logits_constrained.device
-        )
-        
+        log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        label_lengths = (labels != -100).sum(dim=1)
+        input_lengths = batch.get('input_lengths')
+        if input_lengths is None:
+            input_lengths = torch.full(
+                (log_probs_constrained.size(0),),
+                log_probs_constrained.size(1),
+                dtype=torch.long,
+                device=log_probs_constrained.device
+            )
+        else:
+            input_lengths = input_lengths.to(log_probs_constrained.device)
+
+        label_lengths = batch.get('label_lengths')
+        if label_lengths is None:
+            label_lengths = (labels != -100).sum(dim=1)
+        else:
+            label_lengths = label_lengths.to(log_probs_constrained.device)
 
         # Drop invalid CTC samples for test metrics
         valid_mask = label_lengths <= input_lengths
         if valid_mask.sum() == 0:
             return {}
 
-        logits_constrained = logits_constrained[valid_mask]
+        log_probs_constrained = log_probs_constrained[valid_mask]
         labels = labels[valid_mask]
         input_lengths = input_lengths[valid_mask]
         label_lengths = label_lengths[valid_mask]
         
+        logits_manner = outputs.get('logits_manner')
+        logits_place = outputs.get('logits_place')
+        logits_voice = outputs.get('logits_voice')
+
+        art_labels = batch.get('articulatory_labels')
+        if art_labels is not None:
+            art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
+
         losses = self.compute_loss(
-            {'logits_constrained': logits_constrained},
+            {
+                'logits_constrained': log_probs_constrained,
+                'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
+                'logits_place': logits_place[valid_mask] if logits_place is not None else None,
+                'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
+            },
             labels,
             input_lengths,
-            label_lengths
+            label_lengths,
+            articulatory_labels=art_labels
         )
         
         # Decode and compute PER
-        predictions = decode_predictions(logits_constrained, self.phn_to_id, self.id_to_phn)
+        predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
         references = decode_references(labels, self.id_to_phn)
         
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
@@ -579,6 +717,37 @@ def create_dataloaders(
     train_idx = df[df['speaker'].isin(train_speakers)].index.tolist()
     val_idx = df[df['speaker'].isin(val_speakers)].index.tolist()
     test_idx = df[df['speaker'].isin(test_speakers)].index.tolist()
+
+    # Fallback for tiny speaker counts: ensure non-empty splits
+    if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+        print(
+            "⚠️  Speaker-level split produced empty split(s). "
+            "Falling back to sample-level split for this run."
+        )
+        total_samples = len(df)
+        rng = np.random.default_rng(config.experiment.seed)
+        shuffled_idx = rng.permutation(total_samples)
+
+        if total_samples <= 2:
+            n_train = max(1, total_samples)
+            n_val = max(0, total_samples - n_train)
+            n_test = 0
+        else:
+            n_train = max(1, int(total_samples * config.data.train_split))
+            n_val = max(1, int(total_samples * config.data.val_split))
+            n_test = total_samples - n_train - n_val
+
+            # Ensure test split is non-empty when possible
+            if n_test == 0:
+                n_test = 1
+                if n_train > n_val:
+                    n_train -= 1
+                else:
+                    n_val -= 1
+
+        train_idx = shuffled_idx[:n_train].tolist()
+        val_idx = shuffled_idx[n_train:n_train + n_val].tolist()
+        test_idx = shuffled_idx[n_train + n_val:n_train + n_val + n_test].tolist()
     
     # Create subset datasets
     train_dataset = Subset(dataset, train_idx)
@@ -687,7 +856,10 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         model_config=config.model,
         symbolic_config=config.symbolic,
         phn_to_id=dataset.phn_to_id,
-        id_to_phn=dataset.id_to_phn
+        id_to_phn=dataset.id_to_phn,
+        manner_to_id=dataset.manner_to_id,
+        place_to_id=dataset.place_to_id,
+        voice_to_id=dataset.voice_to_id
     )
     
     # Wrap in Lightning module
@@ -696,7 +868,8 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         config=config,
         phn_to_id=dataset.phn_to_id,
         id_to_phn=dataset.id_to_phn,
-        class_weights=dataset.get_loss_weights()
+        class_weights=dataset.get_loss_weights(),
+        articulatory_weights=dataset.get_articulatory_loss_weights()
     )
     
     # Setup callbacks

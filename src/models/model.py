@@ -132,7 +132,8 @@ class ArticulatoryFeatureEncoder:
             similarity = exp(-decay_factor * distance)
         """
         if ph1 not in cls.PHONEME_FEATURES or ph2 not in cls.PHONEME_FEATURES:
-            return 1.0  # Maximum distance for unknown phonemes
+            # Unknown phonemes should not contribute strong similarity.
+            return 0.0
         
         f1, f2 = cls.PHONEME_FEATURES[ph1], cls.PHONEME_FEATURES[ph2]
         
@@ -212,6 +213,7 @@ class SymbolicConstraintLayer(nn.Module):
             Constraint matrix of shape [num_phonemes, num_phonemes]
         """
         C = torch.eye(self.num_phonemes)
+        special_tokens = {'<BLANK>', '<PAD>', '<UNK>'}
         
         # Articulatory distance weights
         weights = {
@@ -231,6 +233,11 @@ class SymbolicConstraintLayer(nn.Module):
                 # Normalize to stress-agnostic form
                 ph_i_clean = normalize_phoneme(ph_i)
                 ph_j_clean = normalize_phoneme(ph_j)
+
+                # Keep special tokens isolated (no cross-token leakage)
+                if ph_i_clean in special_tokens or ph_j_clean in special_tokens:
+                    C[i, j] = 1.0 if i == j else 0.0
+                    continue
                 
                 # Check for explicit substitution rule
                 if (ph_i_clean, ph_j_clean) in self.config.substitution_rules:
@@ -245,6 +252,10 @@ class SymbolicConstraintLayer(nn.Module):
                     )
                     C[i, j] = similarity
         
+        # Row-normalize to keep a valid distribution per source phoneme
+        row_sums = C.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        C = C / row_sums
+
         return C
     
     def forward(
@@ -279,6 +290,7 @@ class SymbolicConstraintLayer(nn.Module):
         # Apply symbolic constraints via matrix multiplication
         # P_constrained[b,t,j] = Σ_i P_neural[b,t,i] * C[i,j]
         P_constrained = torch.matmul(P_neural, self.constraint_matrix)
+        P_constrained = P_constrained / P_constrained.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         
         # Adaptive fusion based on speaker severity (if provided)
         if speaker_severity is not None:
@@ -288,19 +300,22 @@ class SymbolicConstraintLayer(nn.Module):
         
         # Weighted fusion
         P_final = beta_adaptive * P_constrained + (1 - beta_adaptive) * P_neural
+        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         
         # Track rule activations (for explainability)
+        shift_metric = None
         if self.rule_activations is not None:
-            self._track_activations(P_neural, P_final, beta_adaptive)
+            shift_metric = self._track_activations(P_neural, P_final, beta_adaptive)
         
         # Convert back to logits for loss computation
-        logits_constrained = torch.log(P_final + 1e-8)
+        log_probs_constrained = torch.log(P_final + 1e-12)
         
         return {
-            'logits': logits_constrained,
+            'log_probs': log_probs_constrained,
             'beta': beta_adaptive.mean() if speaker_severity is not None else self.beta,
             'P_neural': P_neural,
             'P_constrained': P_constrained,
+            'rule_shift': shift_metric,
         }
     
     def _compute_adaptive_beta(
@@ -333,7 +348,7 @@ class SymbolicConstraintLayer(nn.Module):
         P_neural: torch.Tensor,
         P_final: torch.Tensor,
         beta: torch.Tensor
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """
         Track which symbolic rules were activated during forward pass.
         
@@ -347,41 +362,36 @@ class SymbolicConstraintLayer(nn.Module):
         
         Stores:
             rule_activations: List of dicts with:
-                - timestep: Frame index
-                - neural_pred: Neural top-1 phoneme
-                - final_pred: Final top-1 phoneme
-                - beta: Constraint weight used
-                - prob_shift: Change in probability
+                - shift: Mean probability shift per frame
+                - neural_pred: Neural top-1 phoneme (subset)
+                - final_pred: Final top-1 phoneme (subset)
+                - top_influence: Top constraint target from C[neural_pred]
         """
-        if self.rule_activations is None:
-            return
-        
-        # Get top-1 predictions
-        neural_preds = torch.argmax(P_neural, dim=-1)  # [batch, time]
-        final_preds = torch.argmax(P_final, dim=-1)    # [batch, time]
-        
-        # Find frames where predictions changed
+        if self.rule_activations is None or self.training:
+            return None
+
+        shift = (P_final - P_neural).abs().sum(dim=-1).mean().detach()
+
+        if len(self.rule_activations) < 10000:
+            self.rule_activations.append({'shift': float(shift.item())})
+
+        neural_preds = torch.argmax(P_neural, dim=-1)
+        final_preds = torch.argmax(P_final, dim=-1)
         changed = neural_preds != final_preds
-        
-        # Extract beta value (handle both tensor and scalar)
-        beta_val = beta.item() if isinstance(beta, torch.Tensor) and beta.numel() == 1 else beta
-        
-        # Log activations (limit to prevent memory bloat)
-        if len(self.rule_activations) < 10000:  # Max 10K activations
-            for b in range(P_neural.size(0)):
-                for t in range(P_neural.size(1)):
-                    if changed[b, t]:
-                        neural_id = neural_preds[b, t].item()
-                        final_id = final_preds[b, t].item()
-                        
-                        self.rule_activations.append({
-                            'batch': b,
-                            'timestep': t,
-                            'neural_pred': self.id_to_phn.get(neural_id, '<UNK>'),
-                            'final_pred': self.id_to_phn.get(final_id, '<UNK>'),
-                            'beta': float(beta_val) if not isinstance(beta_val, torch.Tensor) else float(beta_val[b].item()),
-                            'prob_shift': float((P_final[b, t, final_id] - P_neural[b, t, final_id]).item())
-                        })
+        if changed.any() and len(self.rule_activations) < 10000:
+            indices = torch.nonzero(changed, as_tuple=False)
+            max_samples = 100
+            for b, t in indices[:max_samples].tolist():
+                neural_id = int(neural_preds[b, t].item())
+                final_id = int(final_preds[b, t].item())
+                top_j = int(torch.argmax(self.constraint_matrix[neural_id]).item())
+                self.rule_activations.append({
+                    'neural_pred': self.id_to_phn.get(neural_id, '<UNK>'),
+                    'final_pred': self.id_to_phn.get(final_id, '<UNK>'),
+                    'top_influence': self.id_to_phn.get(top_j, '<UNK>')
+                })
+
+        return shift
     
     def get_rule_statistics(self) -> Dict[str, any]:
         """
@@ -402,23 +412,22 @@ class SymbolicConstraintLayer(nn.Module):
                 'avg_beta': 0.0
             }
         
-        # Count substitution patterns
+        shifts = [entry.get('shift') for entry in self.rule_activations if 'shift' in entry]
+
         substitutions = defaultdict(int)
-        betas = []
-        
         for activation in self.rule_activations:
-            key = (activation['neural_pred'], activation['final_pred'])
-            substitutions[key] += 1
-            betas.append(activation['beta'])
-        
-        # Get top-10 most frequent rules
+            if 'neural_pred' in activation and 'final_pred' in activation:
+                key = (activation['neural_pred'], activation['final_pred'])
+                substitutions[key] += 1
+
         top_rules = sorted(substitutions.items(), key=lambda x: x[1], reverse=True)[:10]
-        
+
         return {
             'total_activations': len(self.rule_activations),
             'unique_rules': set(substitutions.keys()),
             'top_rules': top_rules,
-            'avg_beta': float(np.mean(betas)) if betas else 0.0
+            'avg_beta': 0.0,
+            'avg_shift': float(np.mean(shifts)) if shifts else 0.0
         }
     
     def clear_activations(self) -> None:
@@ -450,7 +459,7 @@ class PhonemeClassifier(nn.Module):
         self.dropout = nn.Dropout(config.classifier_dropout)
         self.classifier = nn.Linear(config.hidden_dim, config.num_phonemes)
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, return_features: bool = False):
         """
         Forward pass through phoneme classifier.
         
@@ -465,6 +474,8 @@ class PhonemeClassifier(nn.Module):
         x = self.activation(x)
         x = self.dropout(x)
         logits = self.classifier(x)
+        if return_features:
+            return logits, x
         return logits
 
 
@@ -497,7 +508,10 @@ class NeuroSymbolicASR(nn.Module):
         model_config: ModelConfig,
         symbolic_config: SymbolicConfig,
         phn_to_id: Dict[str, int],
-        id_to_phn: Dict[int, str]
+        id_to_phn: Dict[int, str],
+        manner_to_id: Optional[Dict[str, int]] = None,
+        place_to_id: Optional[Dict[str, int]] = None,
+        voice_to_id: Optional[Dict[str, int]] = None
     ):
         super().__init__()
         self.model_config = model_config
@@ -525,6 +539,14 @@ class NeuroSymbolicASR(nn.Module):
         
         # Phoneme Classifier Head
         self.phoneme_classifier = PhonemeClassifier(model_config)
+
+        self.manner_head = None
+        self.place_head = None
+        self.voice_head = None
+        if manner_to_id and place_to_id and voice_to_id:
+            self.manner_head = nn.Linear(model_config.hidden_dim, len(manner_to_id))
+            self.place_head = nn.Linear(model_config.hidden_dim, len(place_to_id))
+            self.voice_head = nn.Linear(model_config.hidden_dim, len(voice_to_id))
         
         # Symbolic Constraint Layer
         self.symbolic_layer = SymbolicConstraintLayer(
@@ -598,7 +620,15 @@ class NeuroSymbolicASR(nn.Module):
         hidden_states = hubert_outputs.last_hidden_state  # [batch, time, 768]
         
         # Phoneme prediction (neural)
-        logits_neural = self.phoneme_classifier(hidden_states)
+        logits_neural, shared_features = self.phoneme_classifier(hidden_states, return_features=True)
+
+        logits_manner = None
+        logits_place = None
+        logits_voice = None
+        if self.manner_head is not None:
+            logits_manner = self.manner_head(shared_features)
+            logits_place = self.place_head(shared_features)
+            logits_voice = self.voice_head(shared_features)
         
         # Apply symbolic constraints
         symbolic_outputs = self.symbolic_layer(
@@ -608,11 +638,16 @@ class NeuroSymbolicASR(nn.Module):
         
         return {
             'logits_neural': logits_neural,
-            'logits_constrained': symbolic_outputs['logits'],
+            'logits_constrained': symbolic_outputs['log_probs'],
+            'log_probs_constrained': symbolic_outputs['log_probs'],
             'hidden_states': hidden_states,
             'beta': symbolic_outputs['beta'],
             'P_neural': symbolic_outputs.get('P_neural'),
             'P_constrained': symbolic_outputs.get('P_constrained'),
+            'rule_shift': symbolic_outputs.get('rule_shift'),
+            'logits_manner': logits_manner,
+            'logits_place': logits_place,
+            'logits_voice': logits_voice,
         }
     
     def freeze_encoder(self) -> None:
@@ -670,7 +705,6 @@ class NeuroSymbolicASR(nn.Module):
 
 def main() -> None:
     """Test model module."""
-    import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from utils.config import get_default_config
