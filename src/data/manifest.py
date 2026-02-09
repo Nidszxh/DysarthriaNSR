@@ -1,10 +1,8 @@
-import argparse
-import os
-import warnings
+import hashlib
 import concurrent.futures
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 import librosa
@@ -19,9 +17,9 @@ from tqdm import tqdm
 class DataPaths:
     """Path configuration matching your finalized download.py structure."""
     root: Path = Path(__file__).resolve().parents[2]
-    data_dir: Path = None
-    raw_dir: Path = None
-    processed_dir: Path = None
+    data_dir: Path = field(init=False)
+    raw_dir: Path = field(init=False)
+    processed_dir: Path = field(init=False)
     
     def __post_init__(self):
         # Set derived paths to match the finalized project structure
@@ -29,29 +27,63 @@ class DataPaths:
         object.__setattr__(self, "raw_dir", self.data_dir / "raw")
         object.__setattr__(self, "processed_dir", self.data_dir / "processed")
 
-# Phoneme-to-Articulatory-Class Mapping (American English ARPABET)
-PHONEME_ARTICULATION = {
+# Phoneme-to-Articulatory details (American English ARPABET)
+# Format: (Manner, Place, Voicing)
+PHONEME_DETAILS = {
     # Stops (Plosives)
-    'P': 'stop', 'B': 'stop', 'T': 'stop', 'D': 'stop', 'K': 'stop', 'G': 'stop',
+    'P': ('stop', 'bilabial', 'voiceless'),
+    'B': ('stop', 'bilabial', 'voiced'),
+    'T': ('stop', 'alveolar', 'voiceless'),
+    'D': ('stop', 'alveolar', 'voiced'),
+    'K': ('stop', 'velar', 'voiceless'),
+    'G': ('stop', 'velar', 'voiced'),
     # Fricatives
-    'F': 'fricative', 'V': 'fricative', 'TH': 'fricative', 'DH': 'fricative',
-    'S': 'fricative', 'Z': 'fricative', 'SH': 'fricative', 'ZH': 'fricative',
-    'HH': 'fricative',
+    'F': ('fricative', 'labiodental', 'voiceless'),
+    'V': ('fricative', 'labiodental', 'voiced'),
+    'TH': ('fricative', 'dental', 'voiceless'),
+    'DH': ('fricative', 'dental', 'voiced'),
+    'S': ('fricative', 'alveolar', 'voiceless'),
+    'Z': ('fricative', 'alveolar', 'voiced'),
+    'SH': ('fricative', 'palatal', 'voiceless'),
+    'ZH': ('fricative', 'palatal', 'voiced'),
+    'HH': ('fricative', 'glottal', 'voiceless'),
     # Affricates
-    'CH': 'affricate', 'JH': 'affricate',
+    'CH': ('affricate', 'palatal', 'voiceless'),
+    'JH': ('affricate', 'palatal', 'voiced'),
     # Nasals
-    'M': 'nasal', 'N': 'nasal', 'NG': 'nasal',
+    'M': ('nasal', 'bilabial', 'voiced'),
+    'N': ('nasal', 'alveolar', 'voiced'),
+    'NG': ('nasal', 'velar', 'voiced'),
     # Liquids
-    'L': 'liquid', 'R': 'liquid',
+    'L': ('liquid', 'alveolar', 'voiced'),
+    'R': ('liquid', 'palatal', 'voiced'),
     # Glides
-    'W': 'glide', 'Y': 'glide',
+    'W': ('glide', 'bilabial', 'voiced'),
+    'Y': ('glide', 'palatal', 'voiced'),
     # Vowels (Monophthongs)
-    'IY': 'vowel', 'IH': 'vowel', 'EH': 'vowel', 'EY': 'vowel', 'AE': 'vowel',
-    'AA': 'vowel', 'AO': 'vowel', 'OW': 'vowel', 'UH': 'vowel', 'UW': 'vowel',
-    'AH': 'vowel', 'ER': 'vowel', 'AX': 'vowel', 'IX': 'vowel', 'AXR': 'vowel',
+    'IY': ('vowel', 'front', 'voiced'),
+    'IH': ('vowel', 'front', 'voiced'),
+    'EH': ('vowel', 'front', 'voiced'),
+    'EY': ('vowel', 'front', 'voiced'),
+    'AE': ('vowel', 'front', 'voiced'),
+    'AA': ('vowel', 'back', 'voiced'),
+    'AO': ('vowel', 'back', 'voiced'),
+    'OW': ('vowel', 'back', 'voiced'),
+    'UH': ('vowel', 'back', 'voiced'),
+    'UW': ('vowel', 'back', 'voiced'),
+    'AH': ('vowel', 'central', 'voiced'),
+    'ER': ('vowel', 'central', 'voiced'),
+    'AX': ('vowel', 'central', 'voiced'),
+    'IX': ('vowel', 'central', 'voiced'),
+    'AXR': ('vowel', 'central', 'voiced'),
     # Diphthongs
-    'AY': 'diphthong', 'AW': 'diphthong', 'OY': 'diphthong',
+    'AY': ('diphthong', 'front', 'voiced'),
+    'AW': ('diphthong', 'back', 'voiced'),
+    'OY': ('diphthong', 'back', 'voiced'),
 }
+
+MIN_PHONEME_COUNT = 2
+MAX_PHONEMES_PER_SEC = 20
 
 
 class SymbolicProcessor:
@@ -66,19 +98,39 @@ class SymbolicProcessor:
             print("⚠️ g2p_en not found. Phoneme extraction will be skipped.")
 
     @lru_cache(maxsize=2048)
-    def get_features(self, text: str) -> Tuple[str, str, int]:
-        """Convert transcript to phonemes and classes with caching for speed."""
+    def get_features(self, text: str) -> Dict[str, object]:
+        """Convert transcript to phonemes and multi-dimensional classes."""
         if not self.g2p or not text:
-            return "", "", 0
-        
-        # Clean: keep alphanumeric phonemes, strip stress markers (0,1,2)
-        raw_phonemes = self.g2p(text)
+            return {"phn": "", "manner": "", "place": "", "voice": "", "count": 0}
+
+        # Remove bracketed noise tokens like [SILENCE], [NOISE]
+        clean_text = " ".join(
+            word for word in text.split()
+            if not (word.startswith("[") and word.endswith("]"))
+        )
+        if not clean_text:
+            return {"phn": "", "manner": "", "place": "", "voice": "", "count": 0}
+
+        # Keep alphanumeric phonemes, strip stress markers (0,1,2)
+        raw_phonemes = self.g2p(clean_text)
         phonemes = [p.rstrip('012') for p in raw_phonemes if p.strip() and p.isalnum()]
-        
-        # Map to articulatory classes
-        classes = [PHONEME_ARTICULATION.get(p, 'other') for p in phonemes]
-        
-        return " ".join(phonemes), " ".join(classes), len(phonemes)
+        if not phonemes:
+            return {"phn": "", "manner": "", "place": "", "voice": "", "count": 0}
+
+        manners, places, voices = [], [], []
+        for phn in phonemes:
+            manner, place, voice = PHONEME_DETAILS.get(phn, ('other', 'other', 'other'))
+            manners.append(manner)
+            places.append(place)
+            voices.append(voice)
+
+        return {
+            "phn": " ".join(phonemes),
+            "manner": " ".join(manners),
+            "place": " ".join(places),
+            "voice": " ".join(voices),
+            "count": len(phonemes),
+        }
 
 def calculate_audio_metrics(audio_path: Path) -> Dict:
     """Extracts RMS energy and duration. Designed for parallel execution."""
@@ -119,16 +171,23 @@ def main():
     matched_samples = []
     for split in ds.keys():
         for sample in tqdm(ds[split], desc=f"Matching {split}"):
-            # Because decode=False, 'audio' is a dict containing 'path'
             audio_info = sample.get("audio", {})
             hf_raw_path = audio_info.get("path", "")
-            
+        
             if hf_raw_path:
-                fname = Path(hf_raw_path).name
-                if fname in local_files:
+                # Replicate the hashing logic from your download script
+                path_hash = hashlib.md5(hf_raw_path.encode()).hexdigest()[:8]
+                speaker = sample.get('speaker_id', 'unknown')
+                original_name = Path(hf_raw_path).name
+            
+                # This matches the filename format: {speaker}_{hash}_{name}
+                expected_filename = f"{speaker}_{path_hash}_{original_name}"
+            
+                if expected_filename in local_files:
                     matched_samples.append({
                         "metadata": sample,
-                        "local_path": local_files[fname]
+                        "local_path": local_files[expected_filename],
+                        "hf_path": hf_raw_path,
                     })
 
     if not matched_samples:
@@ -161,18 +220,32 @@ def main():
         path = bundle["local_path"]
         transcript = meta.get("transcription", "").strip().upper()
         
-        phn, art, count = processor.get_features(transcript)
-        
+        features = processor.get_features(transcript)
+        if features["count"] < MIN_PHONEME_COUNT:
+            continue
+
+        phn_rate = features["count"] / metrics["duration"]
+        if phn_rate > MAX_PHONEMES_PER_SEC:
+            continue
+
+        hf_path = bundle.get("hf_path", "")
+        session_id = Path(hf_path).parent.name if hf_path else "unknown"
+        speaker_id = meta.get("speaker_id", path.name.split('_')[0])
+
         rows.append({
-            "sample_id": path.name,
+            "sample_id": f"{speaker_id}_{session_id}_{Path(hf_path).name}" if hf_path else path.name,
             "path": str(path),
-            "speaker": path.name.split('_')[0],
+            "speaker": speaker_id,
             "status": meta["speech_status"],
             "label": 1 if meta["speech_status"] == "dysarthria" else 0,
             "transcript": transcript,
-            "phonemes": phn,
-            "articulatory_classes": art,
-            "phn_count": count,
+            "phonemes": features["phn"],
+            "articulatory_classes": features["manner"],
+            "manner_classes": features["manner"],
+            "place_classes": features["place"],
+            "voice_classes": features["voice"],
+            "phn_count": features["count"],
+            "phonemes_per_sec": round(float(phn_rate), 3),
             "duration": metrics["duration"],
             "rms_energy": metrics["rms"],
             "gender": meta.get("gender", "unknown")
@@ -187,7 +260,6 @@ def main():
     print(f"Output: {out_path}")
     print(f"Total Samples: {len(df)}")
     print(f"Total Hours:   {df['duration'].sum() / 3600:.2f} hrs")
-
 
 
 if __name__ == "__main__":

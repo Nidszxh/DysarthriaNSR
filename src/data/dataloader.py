@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 import torchaudio
 import torchaudio.functional as taF
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import AutoFeatureExtractor, AutoProcessor
 
 # Import from project config (single source of truth)
@@ -18,6 +18,7 @@ except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from src.utils.config import ProjectPaths, normalize_phoneme
+
 
 
 class TorgoNeuroSymbolicDataset(Dataset):
@@ -54,10 +55,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
         
         # Pre-calculate inverse-frequency phoneme weights
         self.phoneme_weights = self._calculate_phoneme_weights()
+        self.articulatory_weights = self._calculate_articulatory_weights()
         
         print(f"✅ Dataset initialized: {len(self.df)} samples from {manifest_path}")
         print(f"   Vocabulary: {len(self.phn_to_id)} phonemes")
-        print(f"   Articulatory classes: {len(self.art_to_id)}")
+        print(f"   Articulatory classes: {len(self.manner_to_id)}")
     
     def _validate_and_clean_manifest(self) -> None:
         """
@@ -157,31 +159,47 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.pad_id = 1
         self.unk_id = 2
         
-        # Build articulatory class vocabulary (if available)
-        if 'articulatory_classes' in self.df.columns:
-            art_classes = sorted(set(
+        # Build articulatory class vocabularies (manner/place/voice)
+        self.manner_to_id = self._build_articulatory_vocab("manner_classes", fallback="articulatory_classes")
+        self.place_to_id = self._build_articulatory_vocab("place_classes")
+        self.voice_to_id = self._build_articulatory_vocab("voice_classes")
+
+        self.id_to_manner = {idx: art for art, idx in self.manner_to_id.items()}
+        self.id_to_place = {idx: art for art, idx in self.place_to_id.items()}
+        self.id_to_voice = {idx: art for art, idx in self.voice_to_id.items()}
+
+        self.art_pad_id = 0
+        self.art_unk_id = 1
+
+    def _build_articulatory_vocab(self, column: str, fallback: Optional[str] = None) -> Dict[str, int]:
+        values = []
+        if column in self.df.columns:
+            values.extend(
                 art
-                for art_str in self.df['articulatory_classes'].fillna("")
+                for art_str in self.df[column].fillna("")
                 for art in art_str.split()
                 if art.strip()
-            ))
-            
-            self.art_to_id = {
-                '<PAD>': 0,
-                '<UNK>': 1,
-            }
-            for i, art in enumerate(art_classes):
-                self.art_to_id[art] = i + 2
-            
-            self.id_to_art = {idx: art for art, idx in self.art_to_id.items()}
-            self.art_pad_id = 0
-            self.art_unk_id = 1
-        else:
-            # Fallback if articulatory classes not present
-            self.art_to_id = {'<PAD>': 0, '<UNK>': 1}
-            self.id_to_art = {0: '<PAD>', 1: '<UNK>'}
-            self.art_pad_id = 0
-            self.art_unk_id = 1
+            )
+        elif fallback and fallback in self.df.columns:
+            values.extend(
+                art
+                for art_str in self.df[fallback].fillna("")
+                for art in art_str.split()
+                if art.strip()
+            )
+
+        art_classes = sorted(set(values))
+        vocab = {
+            '<PAD>': 0,
+            '<UNK>': 1,
+            'other': 2,
+        }
+        for i, art in enumerate(art_classes):
+            if art in vocab:
+                continue
+            vocab[art] = i + 3
+
+        return vocab
     
     def _calculate_phoneme_weights(self) -> torch.Tensor:
         """
@@ -218,18 +236,50 @@ class TorgoNeuroSymbolicDataset(Dataset):
                 weights[phn_id] = 1.0
         
         # Adjust special tokens
-        # BLANK: Slightly lower weight to discourage over-insertion
-        weights[self.phn_to_id['<BLANK>']] *= 0.8
+        # BLANK: Higher weight to discourage over-insertion
+        weights[self.phn_to_id['<BLANK>']] *= 1.2
         # PAD: Higher weight since ignored in loss (doesn't affect training)
         weights[self.phn_to_id['<PAD>']] *= 1.5
         
         # Clamp for numerical stability
-        weights = torch.clamp(weights, min=0.5, max=5.0)
+        weights = torch.clamp(weights, min=0.7, max=3.0)
         
         return weights
+
+    def _calculate_articulatory_weights(self) -> Dict[str, torch.Tensor]:
+        def build_weights(column: str, vocab: Dict[str, int]) -> torch.Tensor:
+            tokens: List[str] = []
+            if column in self.df.columns:
+                for row in self.df[column].fillna(""):
+                    tokens.extend([t for t in str(row).split() if t.strip()])
+
+            counts = pd.Series(tokens).value_counts()
+            median_freq = float(counts.median()) if not counts.empty else 1.0
+            weights = torch.ones(len(vocab), dtype=torch.float32)
+
+            for token, token_id in vocab.items():
+                if token in counts:
+                    freq = float(counts[token])
+                    weights[token_id] = np.sqrt(median_freq / max(freq, 1.0))
+                else:
+                    weights[token_id] = 1.0
+
+            weights[vocab['<PAD>']] *= 1.2
+            weights[vocab['<UNK>']] *= 1.1
+            weights = torch.clamp(weights, min=0.7, max=3.0)
+            return weights
+
+        return {
+            "manner": build_weights("manner_classes", self.manner_to_id),
+            "place": build_weights("place_classes", self.place_to_id),
+            "voice": build_weights("voice_classes", self.voice_to_id),
+        }
     
     def get_loss_weights(self) -> torch.Tensor:
         return self.phoneme_weights
+
+    def get_articulatory_loss_weights(self) -> Dict[str, torch.Tensor]:
+        return self.articulatory_weights
     
     def _load_audio(self, audio_path: str) -> torch.Tensor:
         """
@@ -299,11 +349,27 @@ class TorgoNeuroSymbolicDataset(Dataset):
             normalize_phoneme(phn) for phn in phonemes_str.split() if phn.strip()
         ]
         return [self.phn_to_id.get(phn, self.unk_id) for phn in phoneme_list]
-    
-    def _encode_articulatory_classes(self, art_str: str) -> List[int]:
-        
-        art_list = [a for a in art_str.split() if a.strip()]
-        return [self.art_to_id.get(art, self.art_unk_id) for art in art_list]
+    def _encode_articulatory_classes(self, art_list: List[str], vocab: Dict[str, int]) -> List[int]:
+        return [vocab.get(art, self.art_unk_id) for art in art_list]
+
+    def _get_articulatory_tokens(
+        self,
+        row: pd.Series,
+        column: str,
+        target_len: int,
+        fallback_column: Optional[str] = None
+    ) -> List[str]:
+        if column in self.df.columns:
+            tokens = [a for a in str(row.get(column, "")).split() if a.strip()]
+        elif fallback_column and fallback_column in self.df.columns:
+            tokens = [a for a in str(row.get(fallback_column, "")).split() if a.strip()]
+        else:
+            tokens = []
+
+        if not tokens:
+            return ["other"] * target_len
+
+        return tokens
     
     def __len__(self) -> int:
         """Return dataset size."""
@@ -320,29 +386,49 @@ class TorgoNeuroSymbolicDataset(Dataset):
             sampling_rate=self.sampling_rate,
             return_tensors="pt"
         ).input_values.squeeze(0)
+        if self.max_audio_samples is not None and audio_features.numel() > self.max_audio_samples:
+            audio_features = audio_features[:self.max_audio_samples]
         
         # Encode phoneme and articulatory sequences
         phonemes_str = str(row['phonemes'])
         phoneme_ids = self._encode_phonemes(phonemes_str)
         
-        art_str = str(row.get('articulatory_classes', ""))
-        art_ids = self._encode_articulatory_classes(art_str)
+        manner_tokens = self._get_articulatory_tokens(
+            row, "manner_classes", len(phoneme_ids), fallback_column="articulatory_classes"
+        )
+        place_tokens = self._get_articulatory_tokens(
+            row, "place_classes", len(phoneme_ids)
+        )
+        voice_tokens = self._get_articulatory_tokens(
+            row, "voice_classes", len(phoneme_ids)
+        )
+
+        manner_ids = self._encode_articulatory_classes(manner_tokens, self.manner_to_id)
+        place_ids = self._encode_articulatory_classes(place_tokens, self.place_to_id)
+        voice_ids = self._encode_articulatory_classes(voice_tokens, self.voice_to_id)
         
-        # CRITICAL: Validate 1:1 alignment (phoneme ↔ articulatory class)
-        if len(phoneme_ids) != len(art_ids):
-            raise ValueError(
-                f"⚠️  Data quality error in sample {idx} (speaker: {row['speaker']}): "
-                f"Phoneme sequence length ({len(phoneme_ids)}) ≠ "
-                f"Articulatory class length ({len(art_ids)}). "
-                f"This indicates misalignment during manifest generation. "
-                f"Phonemes: {phonemes_str[:80]}... "
-                f"Articulatory: {art_str[:80]}..."
+        # Validate 1:1 alignment (phoneme ↔ articulatory class)
+        if len(phoneme_ids) != len(manner_ids):
+            min_len = min(len(phoneme_ids), len(manner_ids))
+            warnings.warn(
+                f"Alignment mismatch for sample {idx} (speaker: {row['speaker']}): "
+                f"phonemes={len(phoneme_ids)} vs manner={len(manner_ids)}. "
+                "Truncating to min length.",
+                UserWarning
             )
+            phoneme_ids = phoneme_ids[:min_len]
+            manner_ids = manner_ids[:min_len]
+            place_ids = place_ids[:min_len]
+            voice_ids = voice_ids[:min_len]
         
         return {
             "input_values": audio_features,
             "labels": torch.tensor(phoneme_ids, dtype=torch.long),
-            "articulatory_labels": torch.tensor(art_ids, dtype=torch.long),
+            "articulatory_labels": {
+                "manner": torch.tensor(manner_ids, dtype=torch.long),
+                "place": torch.tensor(place_ids, dtype=torch.long),
+                "voice": torch.tensor(voice_ids, dtype=torch.long),
+            },
             "metadata": {
                 "speaker": row['speaker'],
                 "is_dysarthric": torch.tensor(row['label'], dtype=torch.long),
@@ -365,9 +451,10 @@ class NeuroSymbolicCollator:
         pad_id: Padding token ID (default: 1)
     """
     
-    def __init__(self, processor, pad_id: int = 1):
+    def __init__(self, processor, pad_id: int = 1, ctc_stride: int = 320):
         self.processor = processor
         self.pad_id = pad_id
+        self.ctc_stride = ctc_stride
     
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
@@ -390,10 +477,18 @@ class NeuroSymbolicCollator:
         labels_padded = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=-100
         )
-        
-        art_padded = torch.nn.utils.rnn.pad_sequence(
-            art_labels, batch_first=True, padding_value=-100
+
+        art_padded = {
+            key: torch.nn.utils.rnn.pad_sequence(
+                [item[key] for item in art_labels], batch_first=True, padding_value=-100
+            )
+            for key in ["manner", "place", "voice"]
+        }
+
+        input_lengths = torch.tensor(
+            [len(x) // self.ctc_stride for x in input_values], dtype=torch.long
         )
+        label_lengths = torch.tensor([len(x) for x in labels], dtype=torch.long)
         
         # Aggregate metadata
         status = torch.stack([item["metadata"]["is_dysarthric"] for item in batch])
@@ -404,6 +499,8 @@ class NeuroSymbolicCollator:
             "input_values": input_padded,
             "attention_mask": attention_mask,
             "labels": labels_padded,
+            "input_lengths": input_lengths,
+            "label_lengths": label_lengths,
             "articulatory_labels": art_padded,
             "status": status,
             "speakers": speakers,
@@ -429,10 +526,23 @@ def create_dataloaders(
     
     collator = NeuroSymbolicCollator(dataset.processor)
     
+    label_series = dataset.df['label']
+    class_counts = label_series.value_counts().to_dict()
+    class_weights = {
+        label: 1.0 / count for label, count in class_counts.items()
+    }
+    sample_weights = [class_weights[label] for label in label_series]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
+        sampler=sampler,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=True
