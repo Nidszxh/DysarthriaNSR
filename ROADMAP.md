@@ -1,204 +1,61 @@
-# Implementation Status & Detailed System Architecture
+# Implementation Status & Architecture (Feb 2026)
 
-**Current Status**: Core system (data pipeline, model, training) is **fully implemented and tested** ✅. System handles dysarthric speech recognition with neuro-symbolic constraints and produces evaluation artifacts (confusion matrices, per-speaker metrics, rule activations).
+## Current Status
+- Core pipeline is implemented and runs end-to-end: download -> manifest -> dataloader -> training -> evaluation.
+- Training uses PyTorch Lightning with MLflow logging and saves results under `checkpoints/` and `results/`.
+- Baseline results (baseline_v1, Jan 2026) are recorded under `results/baseline_v1/`.
 
-**Baseline Performance (baseline_v1 - Jan 2026)**:
-- **Test PER**: 0.567 ± 0.365 on 3,553 samples (3 TORGO speakers)
-- **Dysarthric PER**: 0.541 | **Control PER**: 0.575
-- **Model**: 94.8M params (416K trainable), HuBERT encoder with symbolic constraint layer
-- **Dataset**: 16,552 samples (13.68 hours), 15 speakers total
-- **Training**: 10 speakers train, 2 val, 3 test | Best epoch: 17/50
+**Baseline Performance (baseline_v1 - Jan 2026)**
+- Test PER: 0.567 ± 0.365 on 3,553 samples (3 TORGO speakers)
+- Dysarthric PER: 0.541 | Control PER: 0.575
+- Model: 94.8M params (416K trainable), HuBERT encoder with symbolic constraint layer
 
-**Recent optimizations** (Jan 2026):
-- ✅ Inverse-frequency CE class weights + weighted sampler for class balance
-- ✅ Symbolic constraint weight increased to β=0.5 for stronger early guidance
-- ✅ CTC length guard to prevent inf losses on short utterances
-- ✅ Memory reduction: batch_size=2, gradient_accumulation=8, max_epochs=50
-- ✅ CUDA memory fragmentation mitigation via `PYTORCH_ALLOC_CONF=expandable_segments:True`
-- ✅ Result persistence: Automatic checkpoint and evaluation artifact saving
-
-**Known Issues**:
-- ⚠️ High insertion rate (21,290 insertions vs. 376 deletions) - model over-predicting phonemes
-- ⚠️ Counter-intuitive dysarthric vs. control PER - needs stratified analysis by utterance length
-
-**Immediate Diagnostic Plan (Feb 2026)**:
-- Inspect blank posterior statistics (mean, histogram, blank vs non-blank ratio)
-- Compare blank probability distributions for dysarthric vs control
-- Track per-frame entropy to detect overconfident non-blank emissions
-- Add insertion-sensitive decoding (length penalty or insertion penalty)
-- Test blank-regularization (blank-weighted CE or blank prior KL)
-- Run ablations: neural-only, symbolic-only, fixed beta sweeps
-
----
-
-## ✅ COMPLETED: Data Pipeline & Preprocessing
-
-### 1.1 Dataset Structure (TORGO)
+## Architecture and Data Flow
 ```
-TORGO Dataset Composition:
-├── Speakers: 8 dysarthric (4 male, 4 female) + 7 control (non-dysarthric)
-├── Audio Format: WAV files (16kHz sampling rate target)
-├── Transcription Types:
-│   ├── Word-level alignments
-│   ├── Phoneme-level alignments (with timestamps)
-│   └── Severity metadata (per speaker)
-└── Session Structure: Multiple recording sessions per speaker
+download.py  -> data/raw/audio + data/processed/raw_extraction_map.csv
+manifest.py  -> data/processed/torgo_neuro_symbolic_manifest.csv
+dataloader.py -> train.py -> evaluate.py (utilities)
 ```
 
-**Data Loading Process:**
-1. **Hugging Face Dataset Access**
-   - Use `datasets` library to stream/download TORGO
-   - Parse metadata: speaker ID, severity level, session info
-   - Extract audio arrays and corresponding transcription labels
+## Data Pipeline (Implemented)
+- `download.py`: pulls `abnerh/TORGO-database`, writes audio under `data/raw/audio/` using `{speaker}_{hash}_{original_name}` naming, and logs a raw extraction map.
+- `manifest.py`: loads HF metadata with `Audio(decode=False)`, matches local audio, runs `g2p_en`, and writes phonemes + articulatory classes + audio metrics into the manifest.
+- `dataloader.py`: loads audio from local paths, peak-normalizes, truncates to `max_audio_length`, and pads labels with `-100` for CTC/CE.
 
-2. **Audio Preprocessing Chain**
-   ```
-   Raw WAV → Resampling (16kHz) → Normalization → Silence Trimming → Feature Extraction
-   ```
-   
-   - **Resampling**: Convert all audio to 16kHz (HuBERT's expected rate)
-   - **Amplitude Normalization**: Scale to [-1, 1] range using peak normalization or RMS
-   - **Silence Removal**: Trim leading/trailing silence using energy-based VAD
-   - **Segmentation**: Split long utterances if needed (handle variable-length sequences)
+## Model (Implemented)
+- HuBERT base (`facebook/hubert-base-ls960`) with gradient checkpointing.
+- Feature extractor is always frozen; encoder layers in `ModelConfig.freeze_encoder_layers` stay frozen after warmup.
+- Phoneme classifier head: 768 -> 512 -> vocab.
+- Symbolic layer blends neural probabilities with articulatory similarity + substitution rules. Adaptive beta is severity-aware and clamped to 0.8.
+- Optional articulatory heads (manner/place/voice) are trained when vocab is present.
 
-3. **Phoneme Alignment Processing**
-   - Extract phoneme sequences from forced alignments
-   - Create phoneme-to-frame mapping (timestamp → frame index)
-   - Build phoneme vocabulary (ARPAbet or IPA representation)
-   - Generate phoneme boundary markers for training
+## Training (Implemented)
+- Losses: CTC + frame-level CE + articulatory CE (manner/place/voice).
+- Default weights: `lambda_ctc=0.8`, `lambda_ce=0.2`, `lambda_articulatory=0.1`.
+- Class balancing: inverse-frequency phoneme weights for CE + `WeightedRandomSampler` for dysarthric/control.
+- CTC length guard drops samples where `label_lengths > input_lengths`.
+- MLflow logging with flattened config parameters.
 
-### 1.2 Data Augmentation Strategy
+**Current defaults (see `src/utils/config.py`)**
+- Learning rate: 3e-5, OneCycleLR warmup ratio 0.05
+- Batch size: 4, gradient accumulation: 16
+- Max audio length: 8.0s, mixed precision `16-mixed`
+- Encoder warmup epochs: 5
 
-**Dysarthria-Specific Augmentations:**
-- **Time Stretching** (0.8x - 1.2x): Simulate variable speech rate
-- **Pitch Shifting** (±2 semitones): Account for prosodic variability
-- **Formant Shifting**: Mimic articulatory imprecision
-- **Additive Noise**: Low SNR clinical recording conditions (15-25 dB)
+## Evaluation (Implemented)
+- `train.py` runs `evaluate_model()` after fitting and writes outputs to `results/{run_name}/`.
+- `evaluate.py` provides PER/WER, bootstrap CI, confusion matrices, and beam search decoding utilities.
 
-**Controlled Augmentation Application:**
-- Apply only to dysarthric samples to balance class distribution
-- Preserve original control samples to maintain reference acoustic space
+## Known Issues (Observed)
+- High insertion rate in baseline evaluation suggests blank suppression in CTC.
+- Dysarthric vs control PER differences likely need length-stratified analysis.
 
----
-
-## 2. HuBERT Encoder Architecture
-
-### 2.1 Model Selection & Initialization
-
-**HuBERT Variant:**
-```python
-Model: facebook/hubert-base-ls960
-Parameters: ~95M
-Pretraining: LibriSpeech 960h (clean speech)
-Architecture: 12 transformer layers, 768 hidden dimensions
-```
-
-**Initialization Strategy:**
-- Load pretrained weights from Hugging Face
-- Freeze initial layers (0-6) to preserve low-level acoustic features
-- Fine-tune upper layers (7-11) for dysarthric speech adaptation
-
-### 2.2 Forward Pass Detailed Flow
-
-**Input Processing:**
-```
-Audio Waveform [batch, samples]
-    ↓
-Feature Extraction (CNN)
-    ↓ (7 CNN layers, stride 320 → 50Hz frame rate)
-Convolutional Features [batch, frames, 768]
-    ↓
-Positional Encoding
-    ↓
-Transformer Encoder (12 layers)
-    ↓
-Contextualized Representations [batch, frames, 768]
-```
-
-**Layer-by-Layer Transformations:**
-
-1. **CNN Feature Extractor**
-   - 7 convolutional blocks with GELU activation
-   - Temporal downsampling: 16000 samples/sec → 50 frames/sec
-   - Output: Local acoustic features (512-dim → projected to 768)
-
-2. **Transformer Layers (×12)**
-   - **Self-Attention Mechanism:**
-     ```
-     Q, K, V = Linear(x)
-     Attention(Q,K,V) = softmax(QK^T/√d_k)V
-     Context = MultiHead(Attention) + Residual
-     ```
-   - **Feed-Forward Network:**
-     ```
-     FFN(x) = GELU(Linear1(x)) → Linear2(x)
-     Output = LayerNorm(FFN(x) + x)
-     ```
-   - Captures long-range phonetic dependencies (up to 400ms context)
-
-3. **Hidden State Extraction**
-   - Extract from multiple layers: [6, 9, 12] for multi-scale features
-   - Weighted sum of layers (learned weights α):
-     ```
-     h_combined = Σ(α_i × h_layer_i)
-     ```
-
-### 2.3 Fine-Tuning Strategy
-
-**Key Hyperparameters** (see [src/utils/config.py](src/utils/config.py)):
-- Learning rate: 5e-5 (OneCycleLR with 10% warmup, cosine annealing)
-- Batch size: 2 (effective: 16 with gradient_accumulation=8)
-- Max epochs: 50 (early stopping patience=10, monitor=val/per)
-- Symbolic constraint: β=0.5 (initial), learnable, severity-adaptive
-- Loss weights: λ_ctc=0.7, λ_ce=0.3
-- Freeze encoder layers: 0-7 initially, unfreeze after 3 warmup epochs
-
----
-
-## 3. Phoneme-Level Prediction Module
-
-### 3.1 Architecture Design
-
-**Phoneme Classifier Head:**
-```
-HuBERT Hidden States [batch, frames, 768]
-    ↓
-Linear Projection [batch, frames, 512]
-    ↓
-Layer Normalization
-    ↓
-GELU Activation
-    ↓
-Dropout (p=0.1)
-    ↓
-Linear Classification [batch, frames, num_phonemes]
-    ↓
-Log Softmax
-    ↓
-Phoneme Probabilities [batch, frames, 44]  # 44 = phoneme vocabulary size
-```
-
-### 3.2 Phoneme Vocabulary
-
-**ARPAbet-Based Phoneme Set (44 units):**
-```
-Vowels (15): AA, AE, AH, AO, AW, AY, EH, ER, EY, IH, IY, OW, OY, UH, UW
-Consonants (24): B, CH, D, DH, F, G, HH, JH, K, L, M, N, NG, P, R, S, SH, T, TH, V, W, Y, Z, ZH
-Special (5): SIL (silence), SPN (spoken noise), NSN (non-speech noise), LAU (laughter), <blank>
-```
-
-### 3.3 Training Objectives
-
-**Multi-Task Loss Function:**
-```python
-Total_Loss = λ_ctc × CTC_Loss + λ_ce × CrossEntropy_Loss + λ_focal × Focal_Loss
-
-Where:
-- CTC_Loss: Connectionist Temporal Classification (handles alignment)
-- CrossEntropy_Loss: Frame-level phoneme classification
-- Focal_Loss: Addresses class imbalance (rare phonemes)
-- λ_ctc = 0.5, λ_ce = 0.3, λ_focal = 0.2
-```
+## Short-Term Diagnostic Plan (Actionable)
+- Inspect blank posterior statistics (mean, histogram, blank vs non-blank ratio).
+- Compare blank probability distributions for dysarthric vs control.
+- Add insertion-sensitive decoding (length penalty or insertion penalty).
+- Test blank-regularization (blank-weighted CE or blank prior KL).
+- Run ablations: neural-only, symbolic-only, fixed beta sweeps.
 
 **CTC Loss Details:**
 - Allows variable-length alignment between input frames and phoneme sequence

@@ -8,16 +8,15 @@ DysarthriaNSR combines neural and symbolic approaches to build an explainable AS
 - Self-supervised learning (HuBERT) for robust acoustic-phonetic representations.
 - Symbolic constraints (articulatory features) for phoneme-level reasoning and clinical interpretability.
 - TORGO dataset with dysarthric and control (normal) speech samples.
-- Multi-task learning for joint phoneme recognition and dysarthria classification.
+- Multi-task learning for phoneme alignment plus articulatory auxiliary heads.
 
 For a detailed architecture walkthrough, see [ROADMAP.md](ROADMAP.md).
 
 ## Recent Updates (Feb 2026)
 
-- Centralized path configuration and phoneme normalization in [src/utils/config.py](src/utils/config.py) with expanded documentation and VRAM checks.
-- Strengthened data validation, audio loading robustness, and class-weighting utilities in [src/data/dataloader.py](src/data/dataloader.py).
-- Added beam search decoding, bootstrap confidence intervals, and length-stratified PER analysis in [evaluate.py](evaluate.py).
-- Consolidated overlapping project documentation into this README; [ROADMAP.md](ROADMAP.md) remains the long-form architecture reference.
+- Training defaults moved into dataclasses in [src/utils/config.py](src/utils/config.py) (VRAM-aware batch/precision settings, warmup, and loss weights).
+- Dataloader now computes inverse-frequency phoneme weights and adds articulatory class labels (manner/place/voice).
+- Training pipeline logs MLflow metrics and runs full evaluation at the end of training.
 
 ## Quick Start
 
@@ -28,7 +27,7 @@ python download.py
 
 ### 2) Generate Manifest
 ```bash
-python src/data/manifest.py --data-dir ./data --out ./data/processed/torgo_neuro_symbolic_manifest.csv
+python src/data/manifest.py
 ```
 
 ### 3) Train Model
@@ -52,9 +51,9 @@ Results are saved to:
 
 - HuBERT encoder with selective layer freezing and gradient checkpointing.
 - Symbolic constraint layer using articulatory similarity with adaptive beta weighting.
-- Multi-task learning (CTC phoneme alignment + frame-level CE loss).
+- Multi-task learning (CTC phoneme alignment + frame-level CE + articulatory CE heads).
 - Class balancing via inverse-frequency weights and weighted sampling.
-- VRAM-aware defaults: 8s truncation, batch size 2, gradient accumulation 8, mixed precision.
+- VRAM-aware defaults: 8s truncation, batch size 4, gradient accumulation 16, mixed precision.
 - Evaluation metrics: PER, WER, confusion matrices, per-speaker analysis, and rule activation counts.
 
 ## Project Structure
@@ -89,16 +88,17 @@ Audio Input
 
 Key hyperparameters live in [src/utils/config.py](src/utils/config.py). Defaults are chosen for 8GB VRAM with mixed precision:
 
-- Learning rate: 5e-5 (OneCycleLR with warmup)
-- Batch size: 2 (effective 16 with gradient accumulation)
+- Learning rate: 3e-5 (OneCycleLR with warmup ratio 0.05)
+- Batch size: 4 (effective 64 with gradient accumulation 16)
 - Max epochs: 50 (early stopping on val/per)
 - Max audio length: 8 seconds
-- Loss weights: CTC 0.7, CE 0.3
-- Symbolic constraint init: beta=0.5 (learnable, severity-adaptive)
+- Loss weights: CTC 0.8, CE 0.2, articulatory 0.1
+- Symbolic constraint init: beta=0.05 (learnable, severity-adaptive)
+- Frozen layers: feature extractor + encoder layers 0-5; unfreeze after 5 warmup epochs
 
 ## Evaluation
 
-Evaluation provides PER/ WER, confusion matrices, and stratified analysis. Beam search is available in [evaluate.py](evaluate.py) via `use_beam_search=True`.
+Evaluation provides PER/WER, confusion matrices, and stratified analysis. The full evaluation run happens at the end of `train.py` via `evaluate_model()`; [evaluate.py](evaluate.py) is a utility module (its `main()` is a small self-test).
 
 ## Baseline Performance (baseline_v1)
 - Dataset: 16,552 samples (13.68 hours) across 15 TORGO speakers.
