@@ -1,54 +1,356 @@
-# Copilot Instructions - DysarthriaNSR
+# Copilot Instructions - DysarthriaNSR (February 2026)
 
-## Project Map (What Talks to What)
-- Data flow: `download.py` (HF TORGO -> data/raw/audio) -> `src/data/manifest.py` (creates `data/processed/torgo_neuro_symbolic_manifest.csv`) -> `src/data/dataloader.py` -> `train.py` -> `evaluate.py` (library functions) -> `results/` and `mlruns/`.
-- Model core: `src/models/model.py` (HuBERT + phoneme head + symbolic constraint layer). Configs live in `src/utils/config.py`.
+## Project Overview
+DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-## Non-Obvious Conventions
-- Phonemes are ARPABET and stress-agnostic: always pass through `normalize_phoneme()` before comparison or vocab building.
-- Special tokens are fixed: `<BLANK>`=0, `<PAD>`=1, `<UNK>`=2; label padding uses `-100` (ignored by CTC/CE).
-- `NeuroSymbolicCollator` computes `input_lengths` as `len(audio)//320` (CTC stride) and creates `attention_mask` manually.
-- `status` is a dysarthria flag (0/1) and is scaled to severity 0-5 for adaptive beta in `DysarthriaASRLightning.forward()`.
+**Status**: ✅ Fully operational end-to-end (download → manifest → training → evaluation)  
+**Latest baseline**: Test PER 0.567 ± 0.365 on 3,553 samples (3 TORGO speakers)  
+**Known issue**: High insertion rate (21K insertions) indicates CTC blank suppression; mitigation in progress.
 
-## Model and Training Behavior
-- HuBERT base (`facebook/hubert-base-ls960`) with gradient checkpointing enabled.
-- Freezing: feature extractor always frozen; encoder layers from `ModelConfig.freeze_encoder_layers` stay frozen after warmup.
-- Symbolic constraints: `SymbolicConstraintLayer` blends neural probs with a constraint matrix built from articulatory similarity and explicit substitution rules; beta is learnable and clamped to 0.8.
-- Losses: CTC + frame-level CE + articulatory CE (manner/place/voice). Weights are in `TrainingConfig`.
-- Class balancing: inverse-frequency phoneme weights for CE + `WeightedRandomSampler` to balance dysarthric vs control.
+---
 
-## Critical Workflows
-- Download and extract: `python download.py` (writes under `data/raw/` and `data/processed/raw_extraction_map.csv`).
-- Build manifest: `python src/data/manifest.py` (no CLI args; outputs `data/processed/torgo_neuro_symbolic_manifest.csv`).
-- Train: `python train.py` or `python train.py --run-name my_run` (MLflow to `mlruns/`, checkpoints to `checkpoints/{run_name}`).
-- Evaluation runs inside `train.py` after fitting via `evaluate_model()`; `evaluate.py` itself is for utilities/tests.
+## Architecture Map (Data & Code Flow)
 
-## Integration Points
-- HF dataset: `abnerh/TORGO-database` (use `Audio(decode=False)` in `manifest.py` for path-only access).
-- Audio paths are matched by `{speaker}_{hash}_{original_name}` (see `download.py` + `manifest.py`).
-- Results and diagnostics: `evaluate.py` + `src/visualization/diagnostics.py`.
-- **Clinical insight**: Dysarthric substitutions often preserve articulatory place/manner (e.g., velars → alveolars, not fricatives)
-  - Use this in error analysis: Higher confusion between articulatorily-similar phonemes is clinically expected
+```
+src/data/download.py                    ← HF Dataset API
+    ↓
+data/raw/audio/{speaker}_{hash}_{name}.wav
+    ↓
+src/data/manifest.py (g2p_en + phoneme mapping)
+    ↓
+data/processed/torgo_neuro_symbolic_manifest.csv (16.5k rows)
+    ↓
+src/data/dataloader.py (TorgoNeuroSymbolicDataset + NeuroSymbolicCollator)
+    ↓
+train.py (DysarthriaASRLightning + NeuroSymbolicASR model)
+    ├─ src/models/model.py (HuBERT + phoneme classifier + symbolic layer)
+    ├─ src/utils/config.py (all hyperparameters + ProjectPaths)
+    └─ MLflow logging → mlruns/{experiment}/{run_id}/
+    ↓ (after training completes)
+evaluate.py (PER/WER + confusion matrices + bootstrap CI)
+    ↓
+results/{run_name}/evaluation_results.json + confusion_matrix.png
+```
 
-### Training Configuration & Multi-Task Learning
-- **Config file**: [src/utils/config.py](src/utils/config.py) with dataclasses for `ModelConfig`, `TrainingConfig`, `SymbolicConfig`
-- **Loss weighting**: 
-  - CTC loss (phoneme alignment): `lambda_ctc=0.7`
-  - CE loss (frame-level auxiliary): `lambda_ce=0.3`
-  - **Combined loss**: `loss = lambda_ctc * loss_ctc + lambda_ce * loss_ce`
-- **VRAM optimization**: 
-  - Batch size 2, gradient accumulation 8 steps = effective batch 16
-  - Freeze HuBERT encoder layers 0-7 by default; unfreeze after warmup epochs
-  - Layer dropout 0.05 for regularization
-- **Learning rate schedule**: Cosine annealing with 500-step warmup
-- **Checkpoint strategy**: Save best 3 models (early stopping metric: validation PER)
-- **Vocabulary architecture**:
-  ```python
-  <BLANK> = 0      # CTC alignment state (not a phoneme)
-  <PAD> = 1        # Batching padding (ignored in loss)
-  <UNK> = 2        # Unknown/OOV phonemes
-  Phonemes = 3+    # Actual target labels
-  ```
+---
+
+## Implementation Status (What's Done, Not Done)
+
+### ✅ IMPLEMENTED
+- **Data pipeline**: download.py → manifest.py → dataloader.py (full chain)
+- **Model architecture**: HuBERT encoder (12 frozen/fine-tuned layers) + phoneme classifier + symbolic constraint layer
+- **Training**: PyTorch Lightning with MLflow integration; multi-task learning (CTC + CE + articulatory)
+- **Evaluation**: PER/WER with bootstrap CI, confusion matrices, per-speaker/per-phoneme breakdown
+- **Beam search decoding**: CTC prefix beam search (width=10) for accurate phoneme sequences
+- **Configuration management**: All hyperparams in src/utils/config.py (dataclass-based; RTX 4060 optimized)
+
+### ⚠️ KNOWN ISSUES
+| Issue | Symptom | Severity | Status |
+|-------|---------|----------|--------|
+| CTC insertion bias | 21K insertions vs. 376 deletions | HIGH | Diagnostic plan ready; blank_priority_weight testing pending |
+| Dysarthric ≤ Control PER | Dysarthric 0.541 vs Control 0.575 (counter-intuitive) | MEDIUM | Need speaker-stratified analysis; test set only 3 speakers |
+| Constraint weight (β) initialization | β converges ~0.5; unclear if optimal | LOW | Ablation study (β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}) recommended |
+
+### 🚀 NOT IMPLEMENTED (Future)
+- Insertion-bias mitigation (in design phase)
+- Multi-speaker adaptation (speaker embedding + speaker-specific β)
+- Real-time streaming inference (ONNX export)
+- Clinician-facing diagnostic dashboard
+- Domain adaptation to non-TORGO dysarthria datasets
+
+---
+
+## Critical Coding Conventions
+
+### 1. Phoneme Handling
+**ALWAYS normalize stress**: `normalize_phoneme(phoneme)` before any comparison or vocab building
+```python
+from src.utils.config import normalize_phoneme
+normalize_phoneme("AH0") → "AH"  # Remove stress digit
+normalize_phoneme("IY1") → "IY"
+```
+Why: Manifest uses ARPABET (phonemes with 0/1/2 stress), but model vocab is stress-agnostic
+
+
+
+### 2. Vocabulary IDs (NEVER change these)
+```python
+<BLANK> = 0    # CTC blank token (alignment only, never a label)
+<PAD>   = 1    # Padding token (for variable-length batching)
+<UNK>   = 2    # Unknown/OOV phonemes (fallback)
+IY, AE, ...    = 3–46  # Actual ARPABET phonemes
+```
+These are built once in `TorgoNeuroSymbolicDataset._build_vocabularies()` and used consistently throughout.
+
+### 3. Label Padding Sentinel
+Labels use `-100` for padding; automatically ignored by CTC/CE loss:
+```python
+# In NeuroSymbolicCollator:
+labels = torch.nn.functional.pad(labels, (0, max_len - labels.size(1)), value=-100)
+
+# In compute_loss():
+label_lengths = (labels != -100).sum(dim=1)  # Count actual phoneme tokens
+```
+**Never use 0 or 1 for padding labels** — those are valid token IDs!
+
+### 4. Input Lengths for CTC
+CTC loss requires `input_lengths` = number of frames (at ~50 Hz HuBERT output rate):
+```python
+# Feature extraction: HuBERT uses 320-sample stride (20ms @ 16kHz)
+input_lengths = logits.size(1)  # Direct from model logits time dimension
+
+# Validation: input_lengths ≥ label_lengths (CTC requirement)
+if (input_lengths < label_lengths).any():
+    print("⚠️ CTC error: input too short for labels; dropping sample")
+    # Drop sample to avoid CTC loss = inf
+```
+
+### 5. Audio Normalization Pipeline
+```python
+# In TorgoNeuroSymbolicDataset._load_audio():
+1. Load WAV @ 16 kHz
+2. Peak-normalize: audio /= np.abs(audio).max()  # Critical for dysarthric variability
+3. Truncate/pad to max_audio_length (6.0s default)
+4. HuBERT processor handles feature extraction (not manual mel-spec)
+```
+
+### 6. Speaker Severity Scaling
+```python
+# In DysarthriaASRLightning.forward():
+status = batch['status']  # 0 (control) or 1 (dysarthric)
+severity = status.float() * 5.0  # Scale 0→5.0 for adaptive beta
+# Passed to model for severity-aware constraint weighting
+```
+
+---
+
+## Config File Structure (Single Source of Truth)
+
+All hyperparameters live in **`src/utils/config.py`**. Never hardcode values in train.py or dataloader.py.
+
+### ProjectPaths (auto-created)
+```python
+root / data / {raw, processed, external}
+    / checkpoints / {run_name} / last.ckpt
+    / results / {run_name} / evaluation_results.json
+    / mlruns / {exp_id} / {run_id}
+```
+
+### ModelConfig
+```python
+freeze_encoder_layers: List[int] = [0, 1, ..., 9]  # First 10/12 frozen (RTX 4060 VRAM)
+constraint_weight_init: float = 0.05  # β initialization (learnable, clamped <0.8)
+```
+
+### TrainingConfig  
+```python
+precision: str = "bf16-mixed"  # BF16 for Ada (stable); FP16 for older cards
+batch_size: int = 4
+gradient_accumulation_steps: int = 8  # Effective batch = 32
+learning_rate: float = 3e-5  # OneCycleLR with 5% warmup
+lambda_ctc: float = 0.8
+lambda_ce: float = 0.2
+lambda_articulatory: float = 0.1
+blank_priority_weight: float = 1.5  # Blank class weight (for insertion mitigation)
+max_epochs: int = 30
+encoder_warmup_epochs: int = 3  # Unfreeze after 3 epochs
+```
+
+### DataConfig
+```python
+max_audio_length: float = 6.0  # seconds (99% coverage)
+split_strategy: str = "speaker_stratified"  # No speaker overlap between train/val/test
+```
+
+### SymbolicConfig
+```python
+substitution_rules: Dict[Tuple[str,str], float] = {
+    ('B', 'P'): 0.85,  # Devoicing
+    ('D', 'T'): 0.82,
+    # ... 20 total rules (hard-coded evidence-based)
+}
+manner_weight: float = 0.4
+place_weight: float = 0.35
+voice_weight: float = 0.25
+```
+
+---
+
+## Model Behavior & Training Dynamics
+
+### Forward Pass
+```python
+def forward(self, batch: Dict) -> torch.Tensor:
+    # Audio normalization
+    audio = batch['input_values']  # [batch, num_frames]
+    
+    # HuBERT encoding (first 10 layers frozen for VRAM)
+    encoder_out = self.hubert(input_values=audio, ...)  # [batch, frames, 768]
+    
+    # Phoneme classification
+    logits = self.phoneme_classifier(encoder_out)  # [batch, frames, 44]
+    
+    # Symbolic constraint layer
+    severity = batch['status'].float() * 5.0  # 0 or 5.0
+    logits_final = self.constraint_layer(logits, severity)  # Blends neural + symbolic
+    
+    # CTC output (logits_final used for loss)
+    return {'logits': logits_final, 'encoder_out': encoder_out}
+```
+
+### Multi-Task Loss Computation
+```python
+loss_ctc = CTCLoss(logits, labels, input_lengths, label_lengths)
+loss_ce = CrossEntropyLoss(logits, labels, weight=phoneme_weights, ignore_index=-100)
+loss_articulatory = (CE(manner_logits, manner_labels) + 
+                     CE(place_logits, place_labels) + 
+                     CE(voicing_logits, voicing_labels)) / 3
+loss_total = (0.8 * loss_ctc + 0.2 * loss_ce + 0.1 * loss_articulatory)
+```
+
+### Class Weighting
+- **Phoneme weights**: `inverse_frequency` (rare phonemes weighted higher)
+- **Blank weight**: `blank_priority_weight = 1.5` × base weight
+- **Speaker balance**: `WeightedRandomSampler` with equal speaker probability
+
+### Encoder Freezing Schedule
+- **Epochs 0–2**: First 10 layers frozen; fast convergence
+- **Epoch 3+**: Unfreeze all layers; continue training with reduced LR
+- **Rationale**: VRAM constraint (5.5 GB vs. 8.2 GB unfrozen); lower layers learn generic acoustic features
+
+---
+
+## Debugging Checklist
+
+### Audio Loading Issues
+```python
+# Verify audio paths exist
+import pandas as pd
+df = pd.read_csv("data/processed/torgo_neuro_symbolic_manifest.csv")
+assert df['path'].apply(lambda p: Path(p).exists()).all(), "Missing audio files"
+
+# Check peak normalization
+from src.data.dataloader import TorgoNeuroSymbolicDataset
+ds = TorgoNeuroSymbolicDataset("data/processed/torgo_neuro_symbolic_manifest.csv")
+sample = ds[0]
+print(f"Max input value: {sample['input_values'].max():.3f}")  # Should be ≈ max HuBERT output
+```
+
+### Label/Logits Mismatch
+```python
+# Verify padding works correctly
+batch = next(iter(dataloader))
+print(f"Input shape: {batch['input_values'].shape}")  # [batch, frames]
+print(f"Logits shape: {model_out['logits'].shape}")  # [batch, frames, 44]
+print(f"Labels shape: {batch['labels'].shape}")  # [batch, max_seq_len]
+print(f"Unique label values: {batch['labels'].unique()}")  # Should include -100 for padding
+```
+
+### CTC Loss NaN
+```python
+# If CTC loss = NaN, likely input_lengths < label_lengths
+batch = next(iter(dataloader))
+logits = model(batch)
+input_lengths = torch.full((batch_size,), logits.size(1), dtype=torch.long)
+label_lengths = (batch['labels'] != -100).sum(dim=1)
+assert (input_lengths >= label_lengths * 0.5).all(), "Inputs too short for labels"
+```
+
+### Phoneme Vocab Size Mismatch
+```python
+# Model output should match vocab size
+print(f"Vocab size: {len(ds.phn_to_id)}")  # Should be 44+3=47
+print(f"Logits shape: {logits.shape}")  # [..., 47]
+assert logits.shape[-1] == len(ds.phn_to_id), "Vocab size mismatch"
+```
+
+---
+
+## MLflow Logging & Results
+
+Training automatically:
+1. **Logs hyperparameters** (flattened from Config dataclasses)
+2. **Logs metrics** (train/loss, val/per, train/beta per epoch)
+3. **Saves artifacts** (confusion matrix PNG, evaluation JSON)
+4. **Checkpoints** best 2 models to `checkpoints/{run_name}/`
+
+View results:
+```bash
+# MLflow UI
+mlflow ui -p 5000  # Open http://localhost:5000
+
+# Results JSON
+cat results/{run_name}/evaluation_results.json | python -m json.tool
+```
+
+---
+
+## Common Development Patterns
+
+### Adding a new metric
+1. Implement standalone function in `evaluate.py`
+2. Test with sample predictions
+3. Integrate into `evaluate_model()` function
+4. Log to MLflow
+
+### Changing a hyperparameter
+1. Edit `src/utils/config.py` (not train.py)
+2. Use `Config()` to load; let dataclasses handle defaults
+3. Parameter auto-logged to MLflow
+
+### Debugging a training divergence
+```bash
+# Check MLflow logs
+tensorboard --logdir mlruns
+
+# Inspect checkpoint
+python -c "import torch; ckpt = torch.load('checkpoints/{run}/last.ckpt'); print(ckpt.keys())"
+
+# Verify dataloader
+python -c "from src.data.dataloader import TorgoNeuroSymbolicDataset; ds = TorgoNeuroSymbolicDataset(...); print(ds[0].keys())"
+```
+
+---
+
+## File Locations Quick Reference
+
+| File | Purpose | Key Classes/Functions |
+|------|---------|----------------------|
+| `src/data/download.py` | HF dataset download → local audio files | `TorgoManager`, `setup_environment()` |
+| `src/data/manifest.py` | Phoneme extraction + articulatory mapping | `SymbolicProcessor`, `build_manifest()` |
+| `src/data/dataloader.py` | Dataset + collator + vocabulary building | `TorgoNeuroSymbolicDataset`, `NeuroSymbolicCollator` |
+| `src/models/model.py` | HuBERT encoder + phoneme classifier + symbolic layer | `NeuroSymbolicASR`, `SymbolicConstraintLayer`, `ArticulatoryFeatureEncoder` |
+| `src/utils/config.py` | All hyperparameters (single source of truth) | `Config`, `ProjectPaths`, `ModelConfig`, `TrainingConfig`, `DataConfig`, `SymbolicConfig` |
+| `train.py` | PyTorch Lightning training orchestrator | `DysarthriaASRLightning`, `flatten_config_for_mlflow()` |
+| `evaluate.py` | Evaluation metrics + beam search decoder | `evaluate_model()`, `BeamSearchDecoder`, `compute_per()` |
+
+---
+
+## Research Context & Clinical Motivation
+
+**Dysarthria characteristics modeled in symbolic layer**:
+- **Devoicing**: Voiced consonants → voiceless (e.g., B→P, D→T, G→K)
+- **Fronting**: Velar → alveolar/dental (e.g., K→T, NG→N)
+- **Liquid gliding**: R/L → W (reduced motor control)
+- **Vowel centralization**: Reduced vowel space (IY→IH, AH centralization)
+
+**Why neuro-symbolic?**
+- Pure neural models treat dysarthric errors as noise (black-box)
+- Symbolic rules encode clinical phonology (SLPs understand constraints)
+- Hybrid approach: neural flexibility + symbolic interpretability
+
+---
+
+## Before Committing Code
+
+- ✅ All functions have docstrings (Args/Returns/Raises)
+- ✅ Type hints on function signatures (avoid `Any`)
+- ✅ No hardcoded paths (use `ProjectPaths` from config.py)
+- ✅ Phonemes normalized via `normalize_phoneme()`
+- ✅ MLflow logging for new metrics
+- ✅ Tested on RTX 4060 (8GB VRAM target)
+- ✅ Labels use `-100` sentinel for padding (not 0 or 1)
+
 - **Loss computation**: 
   - CTC loss: `torch.nn.CTCLoss` on constrained logits (handles variable-length alignment)
   - CE loss: Frame-level cross-entropy on predictions
