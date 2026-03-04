@@ -333,7 +333,6 @@ Planned work:
 - Analyze blank probabilities and add insertion regularization.
 - Add ablation scripts (neural-only vs. symbolic-only).
 - Expand speaker-level stratified metrics and statistical testing.
-- Prepare ONNX export for deployment.
 
 ## References
 

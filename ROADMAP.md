@@ -684,17 +684,17 @@ for beta in variants:
 - **Approach**: Speaker embedding + speaker-specific β
 - **Architecture change**: Add speaker_embedding(speaker_id) → scale β
 
-#### 5. Real-time inference
-- **Task**: Enable deployment for speech therapy applications
-- **Approach**: ONNX export; streaming CTC decoder (instead of batch)
-- **Success metric**: Latency <100ms for real-time feedback
-
-#### 6. Expanded symbol rules  
+#### 5. Expanded symbol rules  
 - **Task**: Auto-extract dysarthric substitution patterns from confusion matrix
 - **Approach**: Data-driven rule extraction (threshold-based)
 - **Output**: Learned substitution matrix instead of hard-coded
 
 ### Long-term (3–6 months)
+
+#### 6. Real-time inference
+- **Task**: Enable deployment for speech therapy applications
+- **Approach**: ONNX export; streaming CTC decoder (instead of batch)
+- **Success metric**: Latency <100ms for real-time feedback
 
 #### 7. Domain adaptation to other dysarthria datasets
 - **Task**: Test on dysarthric speech outside TORGO (e.g., UASPEECH, DysarthricSpeech dataset)
@@ -1254,25 +1254,25 @@ Response (Transcription + Explanations)
 ## 📋 Not Yet Implemented
 
 ### Explainability & Analysis
+
 - [ ] Interactive dashboard (phoneme confusion heatmaps, rule activation maps)
 - [ ] Per-speaker error attribution with clinical interpretability
 - [ ] Rule activation tracking for symbolic constraint layer
 - [ ] Attention visualization for HuBERT layer analysis
 
-### Model Deployment & Checkpoints
+### Model Checkpoints
+
 - [ ] Pretrained model checkpoints (dysarthric/control baselines)
-- [ ] ONNX export for inference optimization
-- [ ] TorchScript export for production deployment
-- [ ] Streaming inference API (FastAPI)
 
 ### Advanced Features
+
 - [ ] Automatic dysarthric substitution rule discovery (from confusion matrices)
 - [ ] Speaker adaptation fine-tuning
 - [ ] Confidence scoring & uncertainty estimation
 - [ ] Real-time feedback system for speech therapy
 
 ### Research Extensions
-- [ ] Ablation studies (neural vs. symbolic contribution quantification)
+
 - [ ] Cross-dataset evaluation (on non-TORGO dysarthric corpora)
 - [ ] Comparison with baseline ASR systems
 - [ ] Analysis of constraint matrix learned weights

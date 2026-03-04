@@ -1,0 +1,153 @@
+"""
+Symbolic Rule Tracker (ROADMAP §6.2)
+
+Logs which symbolic constraint rules fired during inference, enabling SLPs to
+understand which dysarthric substitution patterns the model identified.
+"""
+
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class SymbolicRuleTracker:
+    """
+    Tracks symbolic rule activations from the SymbolicConstraintLayer.
+
+    A rule is considered "activated" when the argmax of P_final differs from
+    the argmax of P_neural — meaning the symbolic constraint changed the model's
+    top phoneme prediction.
+
+    Usage:
+        tracker = SymbolicRuleTracker()
+        # In SymbolicConstraintLayer._track_activations():
+        tracker.log_rule_activation(rule_id, input_ctx, output_correction, confidence)
+        # After evaluation:
+        explanation = tracker.generate_explanation()
+    """
+
+    def __init__(self, min_confidence: float = 0.5):
+        self.min_confidence = min_confidence
+        self._activations: List[Dict[str, Any]] = []
+        self._total_frames: int = 0
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Logging API
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def log_rule_activation(
+        self,
+        rule_id: str,
+        input_phoneme: str,
+        output_phoneme: str,
+        confidence: float,
+        frame_idx: Optional[int] = None,
+        speaker_id: Optional[str] = None,
+    ) -> None:
+        """
+        Log a single rule activation event.
+
+        Args:
+            rule_id:        Identifier string, e.g. "B->P" or "R->W"
+            input_phoneme:  Neural top-1 phoneme (before symbolic correction)
+            output_phoneme: Final top-1 phoneme (after symbolic correction)
+            confidence:     Constraint blend weight β at this frame
+            frame_idx:      Frame index in the utterance (optional)
+            speaker_id:     Speaker identifier (optional, for stratification)
+        """
+        if confidence >= self.min_confidence:
+            self._activations.append({
+                "rule_id": rule_id,
+                "input": input_phoneme,
+                "output_correction": output_phoneme,
+                "confidence": confidence,
+                "frame_idx": frame_idx,
+                "speaker_id": speaker_id,
+            })
+
+    def log_frame_count(self, n_frames: int) -> None:
+        """Register the total number of frames processed (for activation rate)."""
+        self._total_frames += n_frames
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Analysis API
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def generate_explanation(self) -> Dict[str, Any]:
+        """
+        Synthesise a high-level explanation of rule activation patterns.
+
+        Returns:
+            {
+              total_activations: int,
+              activation_rate: float,            # activations / total_frames
+              high_confidence_corrections: list, # confidence > 0.7
+              rule_frequency: {rule_id: count},
+              top_rules: [(rule_id, count), ...],# Top-10
+              per_speaker_activations: {speaker: {rule_id: count}},
+              avg_confidence: float,
+            }
+        """
+        if not self._activations:
+            return {
+                "total_activations": 0,
+                "activation_rate": 0.0,
+                "high_confidence_corrections": [],
+                "rule_frequency": {},
+                "top_rules": [],
+                "per_speaker_activations": {},
+                "avg_confidence": 0.0,
+            }
+
+        rule_counts = Counter(a["rule_id"] for a in self._activations)
+        high_conf = [a for a in self._activations if a["confidence"] > 0.7]
+        avg_conf = sum(a["confidence"] for a in self._activations) / len(self._activations)
+
+        per_speaker: Dict[str, Counter] = defaultdict(Counter)
+        for a in self._activations:
+            if a.get("speaker_id"):
+                per_speaker[a["speaker_id"]][a["rule_id"]] += 1
+
+        activation_rate = (
+            len(self._activations) / self._total_frames
+            if self._total_frames > 0
+            else 0.0
+        )
+
+        return {
+            "total_activations": len(self._activations),
+            "activation_rate": round(activation_rate, 4),
+            "high_confidence_corrections": high_conf[:50],  # cap for JSON size
+            "rule_frequency": dict(rule_counts),
+            "top_rules": rule_counts.most_common(10),
+            "per_speaker_activations": {
+                spk: dict(cnt) for spk, cnt in per_speaker.items()
+            },
+            "avg_confidence": round(avg_conf, 4),
+        }
+
+    def rule_precision(
+        self,
+        correct_rule_uses: int,
+        total_rule_uses: Optional[int] = None,
+    ) -> float:
+        """
+        Compute rule precision: fraction of rule activations that resulted in
+        a correct phoneme prediction.
+
+        Args:
+            correct_rule_uses: Number of activations where the final prediction
+                               matched the ground-truth phoneme.
+            total_rule_uses:   Total activations (defaults to len(self._activations)).
+
+        Returns:
+            Precision in [0, 1].
+        """
+        total = total_rule_uses or len(self._activations)
+        if total == 0:
+            return 0.0
+        return correct_rule_uses / total
+
+    def clear(self) -> None:
+        """Reset all recorded activations (call between evaluation runs)."""
+        self._activations.clear()
+        self._total_frames = 0
