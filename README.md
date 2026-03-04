@@ -13,19 +13,17 @@ DysarthriaNSR is an end-to-end ASR system designed specifically for dysarthric (
 
 For detailed architecture and research context, see [ROADMAP.md](ROADMAP.md).
 
-## Recent Updates (February 2026)
+## Recent Updates (March 2026)
 
-- **Configuration overhaul**: All hyperparameters moved to dataclasses in [src/utils/config.py](src/utils/config.py) with explicit VRAM-aware defaults (RTX 4060 target)
-  - Mixed precision: `bf16-mixed` (for Ada architecture) or `16-mixed` 
-  - Batch size: 4 with gradient accumulation 8 → effective batch 32
-  - Encoder freezing: First 10/12 layers frozen (unfrozen after 3 warmup epochs)
-  - Max audio: 6.0s covers ~99% of TORGO samples
-- **Dataloader enhancements**: 
-  - Inverse-frequency phoneme weights for class balancing
-  - Articulatory class labels (manner/place/voicing) for auxiliary heads
-  - Weighted random sampling for dysarthric/control balance
-- **Training pipeline**: PyTorch Lightning with MLflow logging; evaluation runs automatically at end of training  
-- **Evaluation**: Full PER/WER with confusion matrices, bootstrap confidence intervals, beam search decoding
+- **`run_pipeline.py` orchestrator**: Single entry point replacing direct `train.py` + `evaluate.py` calls; owns checkpoint resolution, training, and full evaluation lifecycle.
+- **12 confirmed bugs fixed (B1–B12)**: KL direction in `SymbolicKLLoss`, CTC stride in attention-mask downsampling, LOSO run-name mutation, `generate_explanations` missing from `evaluate.py` signature, hardcoded `wer=0.0`, NaN guard in `OrdinalContrastiveLoss`, and more — see `RESEARCH_BRIEF.md` for the full list.
+- **Speaker extraction bug fully resolved (B12)**: `manifest.py` line 233 was extracting position `[0]` (literal `'unknown'`); now correctly uses position `[2]` (TORGO speaker ID). Manifest regenerated on March 4, 2026 — speaker IDs confirmed correct in dataloader batches.
+- **Uncertainty module wired**: `UncertaintyAwareDecoder` (MC Dropout) is now called from `evaluate_model` via `--uncertainty` flag.
+- **Explainability wired**: `SymbolicRuleTracker` connected to `SymbolicConstraintLayer`; `ExplainableOutputFormatter` emits per-utterance phoneme-error JSON.
+- **Publication-quality figures**: `scripts/generate_figures.py` generates the full diagnostic visualization suite (6 plots) from `evaluation_results.json` / `explanations.json`.
+- **Smoke tests**: `scripts/smoke_test.py` — 7 automated end-to-end tests, all passing.
+- **baseline_v3 trained** (post-B12, March 4 2026): first run with correct speaker-stratified splits; 30 epochs, val/per = **0.574** (best epoch 26), 98.9M params / 23.9M trainable (24.2%). Test evaluation pending.
+- **baseline_v2 trained** (pre-B12, March 2026): greedy test PER = 0.215, beam-search PER = 0.243 (width=25); **note**: speaker split was invalid (all `'unknown'`) — results likely inflated due to train/val data leakage. Preserved as reference baseline.
 
 ## Quick Start
 
@@ -54,25 +52,38 @@ python src/data/manifest.py
 # Outputs: data/processed/torgo_neuro_symbolic_manifest.csv (16.5k samples)
 ```
 
-### 4) Train Model
+### 4) Train and Evaluate
 ```bash
-# Single run
-python train.py
+# Full pipeline: train 30 epochs + greedy evaluation
+python run_pipeline.py --run-name my_experiment_v1
 
-# With custom run name (saved to checkpoints/{run_name})
-python train.py --run-name my_experiment_v1
+# Skip training; run beam-search evaluation with explainability + uncertainty
+python run_pipeline.py --run-name my_experiment_v1 --skip-train \
+    --explain --uncertainty --beam-search --beam-width 25
+
+# Smoke test (5 batches, confirms pipeline works)
+python run_pipeline.py --run-name smoke_check --smoke-test
 ```
 
 Training outputs are saved to:
-- **Checkpoints**: `checkpoints/{run_name}/last.ckpt`
+- **Checkpoints**: `checkpoints/{run_name}/epoch=*-val_per=*.ckpt` + `last.ckpt`
 - **Evaluation results**: `results/{run_name}/evaluation_results.json`
-- **MLflow logs**: `mlruns/{exp_name}/` (metrics, hyperparams, artifacts)
+- **Explanations**: `results/{run_name}/explanations.json` (with `--explain`)
+- **MLflow logs**: `mlruns/` (metrics, hyperparams, artifacts)
 
-### 5) Evaluate Model
-Evaluation runs automatically at the end of `train.py`, but you can also:
+### 5) Generate Publication Figures
 ```bash
-# Evaluate a checkpoint explicitly (optional)
-python evaluate.py  # Self-test only; for custom evaluation, use train.py output
+python scripts/generate_figures.py --run-name my_experiment_v1
+# → results/my_experiment_v1/figures/ (6 diagnostic plots)
+
+# Compare multiple ablation runs
+python scripts/generate_figures.py --run-name baseline_v2 \
+    --compare neural_only no_art_heads no_constraint_matrix
+```
+
+### 6) Run Unit Smoke Tests
+```bash
+python scripts/smoke_test.py  # All 7 tests should pass
 ```
 
 ## Key Features
@@ -111,18 +122,31 @@ python evaluate.py  # Self-test only; for custom evaluation, use train.py output
 
 ```
 DysarthriaNSR/
-├── train.py
-├── evaluate.py
+├── run_pipeline.py          ← end-to-end orchestrator (entry point)
+├── train.py                 ← training-only; called by run_pipeline
+├── evaluate.py              ← evaluation-only; called by run_pipeline
 ├── data/
 ├── checkpoints/
 ├── results/
+│   └── {run_name}/
+│       ├── evaluation_results.json
+│       ├── explanations.json
+│       ├── confusion_matrix.png
+│       └── figures/         ← from generate_figures.py
+├── scripts/
+│   ├── generate_figures.py  ← publication-quality diagnostic plots
+│   └── smoke_test.py        ← 7 automated end-to-end tests
 ├── src/
 │   ├── data/
 │   ├── models/
 │   ├── utils/
+│   ├── explainability/
 │   └── visualization/
+├── RESEARCH_BRIEF.md        ← compressed project context (current state)
 └── ROADMAP.md
 ```
+
+> **Orchestrator**: `run_pipeline.py` is the recommended entry point. `train.py` and `evaluate.py` remain callable directly but evaluation is no longer invoked inside `train()`.
 
 ## Architecture (High-Level)
 
@@ -178,7 +202,7 @@ Word Lexicon Lookup (CMU + dysarthric variants)
 
 ## Evaluation
 
-After each training run, `train.py` automatically executes `evaluate_model()` which generates:
+After each `run_pipeline.py` run, `evaluate_model()` generates:
 - **Evaluation results**: `results/{run_name}/evaluation_results.json`
   - PER, WER with bootstrap confidence intervals
   - Per-speaker, per-phoneme breakdowns
@@ -209,22 +233,42 @@ After each training run, `train.py` automatically executes `evaluate_model()` wh
 | Max epochs | 30 | Early stopping on val/per (patience=8) |
 | Loss weights | CTC: 0.8, CE: 0.2, Art: 0.1 | Multi-task balancing |
 
-### Baseline Results (`baseline_v1`)
-- **Dataset**: 16,552 samples (13.68 hours) across 15 TORGO speakers
-- **Train/Val/Test split**: 10 / 2 / 3 speakers (speaker-stratified, no speaker overlap)
-- **Model**: 94.8M params (416K trainable with encoder frozen)
-- **Best epoch**: 17/50 (val/per = 0.503)
+### Baseline Results
+
+#### `baseline_v3` (March 4, 2026) — **Current Reference** — Correct Speaker-Stratified Splits
+- **Dataset**: 16,531 samples, 15 TORGO speakers (manifest regenerated; B12 fully resolved)
+- **Train/Val/Test split**: speaker-stratified; Train 11,654 / Val 1,329 / Test 3,548 (10/2/3 speakers)
+- **Model**: 98.9M params total / 23.9M trainable (24.2%) — HuBERT + SeverityAdapter + LearnableConstraintMatrix
+- **Best epoch**: epoch 26 (val/per = 0.574), trained for 30 epochs
+- **Status**: training complete; test-set evaluation pending
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Test PER** | 0.567 ± 0.365 | 3,553 test samples (3 speakers) |
-| Dysarthric PER | 0.541 | ~3% better than control |
-| Control PER | 0.575 | Expected baseline |
-| **Correct** | 8,853 (72.1%) | |
-| **Substitutions** | 2,833 (23.1%) | Aligned with dysarthric phonology |
-| **Deletions** | 376 (3.1%) | Low deletion rate |
-| **Insertions** | 21,290 (high) | **⚠️ Known issue: CTC blank suppression** |
-| **Constraint weight (β)** | ~0.50 | Learned balance between neural & symbolic |
+| **Best val/per** | 0.574 | Epoch 26/30 |
+| **Test PER** | — | Not yet evaluated (run `--skip-train --beam-search`) |
+| Model size | 98.9M / 23.9M trainable (24.2%) | Slightly larger than v2 |
+| blank_prob_mean (epoch) | ~0.857 | Insertion bias still present |
+
+> **Important**: val/per is significantly higher than baseline_v2 (0.574 vs 0.204). This is expected — baseline_v2 was trained with all-`'unknown'` speakers, making speaker-stratified splits ineffective (train/val sets shared speakers). baseline_v3 represents **the first valid speaker-independent evaluation**.
+
+#### `baseline_v2` (March 2026) — Reference Only (⚠️ Invalid Speaker Split)
+- **Model**: 97.2M params / 22.1M trainable (22.8%)
+- **Best epoch**: epoch 26 (val/per = 0.204)
+- **⚠️ Data leakage**: manifest had `speaker='unknown'` for all samples (B12); speaker-stratified split was not truly speaker-independent
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Greedy test PER** | 0.215 | 2,481 test samples; inflated due to data leakage |
+| **Beam-search PER** (width=25) | 0.243 | Insertion-heavy |
+| Dysarthric PER | 0.377 (M03) | Invalid split caveat applies |
+| Control PER | 0.131 (MC02, MC04) | Invalid split caveat applies |
+| **Insertions** | 4,231 / 3,569 (greedy/beam) | I/D ratio: 11× greedy, 2.5× beam |
+
+#### `baseline_v1` (January 2026) — Superseded
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Test PER | 0.567 ± 0.365 | B3 attention mask stride bug active |
+| Insertions | 21,290 | BlankPriorKL receiving incorrect mask |
 
 ### CTC Insertion Problem & Mitigation
 The high insertion rate (21,290 insertions) indicates the model emits non-blank frames more than CTC expects. Strategies:
@@ -325,14 +369,19 @@ Features:
 
 ## Known Issues and Next Steps
 
-- High insertion rate (21,290 insertions vs. 376 deletions) suggests blank over-suppression.
-- Dysarthric PER lower than control PER suggests length or speaker effects; length-stratified analysis is recommended.
+**Active issues (March 2026)**:
+- Test split = 3 speakers only → wide CIs, severity correlation underpowered (needs full LOSO-CV)
+- Insertion bias persists (`blank_prob_mean` ~0.857 during baseline_v3 training); `BlankPriorKLLoss` partially mitigates
+- `SymbolicRuleTracker` wired but zero activations — logging issue, not affecting model correctness
+- Uncertainty plots require `--uncertainty` flag (MC Dropout not default)
+- baseline_v3 test evaluation not yet run
 
-Planned work:
-
-- Analyze blank probabilities and add insertion regularization.
-- Add ablation scripts (neural-only vs. symbolic-only).
-- Expand speaker-level stratified metrics and statistical testing.
+**Immediate next steps**:
+1. Run baseline_v3 evaluation: `python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25`
+2. Regenerate figures: `python scripts/generate_figures.py --run-name baseline_v3`
+3. Run ablation studies: `--ablation neural_only`, `no_art_heads`, `no_constraint_matrix`
+4. Design LOSO-CV (15-speaker leave-one-out) for statistically valid PER estimates
+5. Investigate insertion bias: increase `lambda_blank_kl`, analyze per-epoch blank emission dynamics
 
 ## References
 

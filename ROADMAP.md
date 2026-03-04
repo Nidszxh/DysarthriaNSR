@@ -1,27 +1,45 @@
-# Implementation Status & Architecture (February 2026)
+# Implementation Status & Architecture (March 2026)
 
 ## Current Status ✅ OPERATIONAL
 
-The complete end-to-end pipeline is **fully implemented** and **production-ready**:
+The complete end-to-end pipeline is **fully implemented** and running:
 - ✅ Data download and extraction
-- ✅ Neuro-symbolic manifest generation
+- ✅ Neuro-symbolic manifest generation (speaker extraction B12 **fully resolved** — manifest regenerated March 4, 2026)
 - ✅ PyTorch Dataset with automatic feature extraction
-- ✅ Multi-task learning (CTC + CE + articulatory heads)
+- ✅ Multi-task learning (CTC + CE + articulatory heads + BlankPriorKL + OrdinalContrastive + SymbolicKL)
 - ✅ PyTorch Lightning training with MLflow integration
-- ✅ Comprehensive evaluation (PER/WER with bootstrap CI)
-- ✅ Beam search decoding
+- ✅ Comprehensive evaluation (PER/WER with bootstrap CI, per-speaker breakdown)
+- ✅ Beam search decoding (width configurable; default 25)
+- ✅ Explainability JSON output (`explanations.json`, per-utterance phoneme error analysis)
+- ✅ MC-Dropout uncertainty estimation (`--uncertainty` flag)
+- ✅ `run_pipeline.py` orchestrator (single CLI entry point)
+- ✅ Publication-quality figure suite (`scripts/generate_figures.py`)
+- ✅ Automated smoke tests (`scripts/smoke_test.py`, 7/7 passing)
+- ✅ 12 confirmed bugs fixed (B1–B12, see `RESEARCH_BRIEF.md`)
 
-**Latest Results: baseline_v1 (January 2026)**
-| Metric | Value |
-|--------|-------|
-| **Test PER** | 0.567 ± 0.365 (3,553 samples) |
-| Dysarthric PER | 0.541 (12 speakers) |
-| Control PER | 0.575 (3 speakers) |
-| Model size | 94.8M params (416K trainable) |
-| Best epoch | 17/50 (val/per = 0.503) |
-| Training time | ~12 hours (RTX 4060) |
+**Current Run: baseline_v3 (March 4, 2026) — First Valid Speaker-Independent Evaluation**
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Best val/per** | 0.574 | Epoch 26/30; correct speaker-stratified splits |
+| **Test PER** | — | Evaluation pending |
+| Model size | 98.9M params / 23.9M trainable (24.2%) | |
+| blank_prob_mean (epoch) | ~0.857 | Insertion bias; BlankPriorKL active |
+| Training time | ~1.5 hours (30 epochs, RTX 4060) | Same hardware |
 
-**Known Issue**: High insertion rate (21,290) indicates CTC blank suppression. See README.md for mitigation strategies.
+> ⚠️ val/per is considerably weaker than baseline_v2 (0.574 vs 0.204). This is expected: baseline_v2 was trained with all-`'unknown'` speakers (B12 unresolved), making the speaker-stratified split ineffective and causing **train/val data leakage**. baseline_v3 is the first run with genuine speaker independence.
+
+**Previous Reference: baseline_v2 (March 2026) — ⚠️ Invalid Speaker Split**
+| Metric | Value | Known Issue |
+|--------|-------|-------------|
+| Greedy test PER | 0.215 | Data leakage: all speakers were `'unknown'`; split was not speaker-independent |
+| Beam-search PER | 0.243 | Insertion-heavy (I/D = 2.5×) |
+| val/per (best) | 0.204 (epoch 26) | Inflated due to leakage |
+
+**Superseded: baseline_v1 (January 2026)**
+| Metric | Value | Known Issue |
+|--------|-------|-------------|
+| Test PER | 0.567 ± 0.365 | B3 attention-mask stride was wrong |
+| Insertions | 21,290 | BlankPriorKL receiving incorrect mask |
 
 ## System Architecture
 
@@ -30,23 +48,44 @@ download.py (HF TORGO → audio files)
   ↓
 data/processed/raw_extraction_map.csv
   ↓
-manifest.py (phonemes + articulatory features)
+src/data/manifest.py (phonemes + articulatory features)
+  speaker = path.name.split('_')[2]  ← TORGO ID (e.g. M01)
   ↓
-data/processed/torgo_neuro_symbolic_manifest.csv
+data/processed/torgo_neuro_symbolic_manifest.csv (16,531 rows)
   ↓
-dataloader.py (TorgoNeuroSymbolicDataset + NeuroSymbolicCollator)
+src/data/dataloader.py (TorgoNeuroSymbolicDataset + NeuroSymbolicCollator)
   ↓
-train.py (DysarthriaASRLightning + NeuroSymbolicASR)
-  ↓ (automatic after training)
-evaluate.py (metrics + diagnostics)
-  ↓
-results/{run_name}/ (JSON results + confusion matrix PNG)
+run_pipeline.py   ←  SINGLE ENTRY POINT
+  ├── run_training()  →  train.py (DysarthriaASRLightning + NeuroSymbolicASR)
+  │     ├── src/models/model.py  (HuBERT + SeverityAdapter + LearnableConstraintMatrix)
+  │     ├── src/models/losses.py (CTC + CE + articulatory + BlankPriorKL + OrdinalContrastive + SymbolicKL)
+  │     └── src/utils/config.py  (all hyperparameters + TORGO_SEVERITY_MAP)
+  └── run_evaluation() →  evaluate.py
+        └── evaluate_model(generate_explanations, compute_uncertainty, beam_search)
+              ↓
+results/{run_name}/
+  evaluation_results.json
+  explanations.json          (--explain flag)
+  confusion_matrix.png
+  per_by_length.png
+  articulatory_confusion.png
+  clinical_gap.png
+  figures/                   (scripts/generate_figures.py)
+    error_distribution.png
+    per_by_speaker.png
+    severity_vs_per.png
+    uncertainty_vs_per.png
+    uncertainty_distribution.png
+    experiment_comparison.png
+```
 
 ## Data Pipeline (✅ Fully Implemented)
 
 ### 1. Download (`src/data/download.py`)
 - **Source**: HuggingFace `abnerh/TORGO-database` (26GB)
-- **Output**: Audio files under `data/raw/audio/` with naming scheme: `{speaker}_{hash}_{original_name}.wav`
+- **Output**: Audio files under `data/raw/audio/` with naming scheme: `unknown_{hash}_{SPEAKER}_{session}_{mic}_{n}.wav`
+  - The prefix `unknown` is a literal string (HF dataset has no `speaker_id` field)
+  - TORGO speaker ID is at position `[2]` of the underscore-split filename (e.g. `unknown_00014db9_FC02_...`)
 - **Normalization**: Resamples to 16 kHz (standardized for HuBERT)
 - **Logging**: `data/processed/raw_extraction_map.csv` maps speaker/filename to hash ID
 
@@ -57,7 +96,7 @@ results/{run_name}/ (JSON results + confusion matrix PNG)
 
 ### 2. Manifest Generation (`src/data/manifest.py`)
 **Inputs**: Local audio + HF metadata  
-**Output**: `data/processed/torgo_neuro_symbolic_manifest.csv` (16,552 samples, ~13.7 hours)
+**Output**: `data/processed/torgo_neuro_symbolic_manifest.csv` (16,531 samples, ~13.7 hours)
 
 **Processing pipeline**:
 1. **Phoneme extraction** (g2p_en):
@@ -75,10 +114,7 @@ results/{run_name}/ (JSON results + confusion matrix PNG)
    - Duration + phoneme rate (slow dysarthric speech detection)
    - Peak amplitude (dysarthric breath support variability)
 
-4. **Validation**:
-   - Remove empty transcripts
-   - Check audio file existence
-   - Deduplicate by speaker+path
+**Bug fix applied and regenerated (March 4, 2026)**: Line 233 previously used `path.name.split('_')[0]` which always returned `'unknown'` (literal filename prefix). Fixed to `split('_')[2]` to return the correct TORGO speaker ID. Manifest was **regenerated on March 4, 2026** — speaker IDs are now correct. Confirmed in dataloader: batches show `['FC02', 'M05', 'M04', 'M01']` etc.
 
 **Dataframe columns**:
 ```

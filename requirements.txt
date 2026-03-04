@@ -19,6 +19,7 @@ nltk>=3.8.0
 # Evaluation metrics
 jiwer>=3.0.0
 editdistance>=0.6.0
+statsmodels>=0.14.0
 
 # Data handling
 pandas>=2.0.0

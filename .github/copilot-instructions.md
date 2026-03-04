@@ -3,9 +3,11 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: Post-audit research-grade upgrade in progress (phases 0–9 from implementation_plan.md)
-**Latest baseline**: Test PER 0.567 ± 0.365 on 3,553 samples (3 TORGO speakers, baseline_v1)
-**Architecture revision**: February 2026 audit (DysarthriaNSR_ResearchAudit.md) — see implementation_plan.md and task.md for full scope.
+**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v3` trained (first valid speaker-independent run); manifest regenerated March 4, 2026.
+**Latest baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, 30 epochs, RTX 4060, correct speaker-stratified splits; test eval pending
+**Previous baseline**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; all speakers `'unknown'` → data leakage; results inflated)
+**Superseded**: baseline_v1 — Test PER 0.567 ± 0.365 (B3 attention mask bug was active)
+**Orchestrator**: `run_pipeline.py` is the canonical entry point — use it instead of calling `train.py` / `evaluate.py` directly.
 
 ---
 
@@ -14,27 +16,30 @@ DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. 
 ```
 src/data/download.py                    ← HF Dataset API
     ↓
-data/raw/audio/{speaker}_{hash}_{name}.wav
+data/raw/audio/train/unknown_{hash}_{SPEAKER}_{session}_{mic}_{n}.wav
     ↓
 src/data/manifest.py (g2p_en + phoneme mapping + articulatory labels)
+    speaker = path.name.split('_')[2]   ← TORGO ID; [0] is literal 'unknown'
     ↓
-data/processed/torgo_neuro_symbolic_manifest.csv (16.5k rows)
+data/processed/torgo_neuro_symbolic_manifest.csv (16,531 rows)
     ↓
 src/data/dataloader.py (TorgoNeuroSymbolicDataset + NeuroSymbolicCollator)
     ↓
-train.py (DysarthriaASRLightning + NeuroSymbolicASR model)
-    ├─ src/models/model.py
-    │    LearnableConstraintMatrix (Proposal P2)
-    │    SeverityAdapter (Proposal P3, cross-attention)
-    │    PhonemeClassifier (768→512→|V|)
-    │    SymbolicConstraintLayer (β·P_constrained + (1-β)·P_neural)
-    ├─ src/models/losses.py (OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss)
-    ├─ src/utils/config.py (all hyperparameters + TORGO_SEVERITY_MAP)
-    └─ MLflow logging → mlruns/
-    ↓
-evaluate.py (macro-PER, WER, bootstrap CI, stats tests, explainability)
+run_pipeline.py                         ← CANONICAL ENTRY POINT
+    ├─ run_training()  →  train.py (DysarthriaASRLightning + NeuroSymbolicASR model)
+    │     ├─ src/models/model.py
+    │     │    LearnableConstraintMatrix (Proposal P2)
+    │     │    SeverityAdapter (Proposal P3, cross-attention)
+    │     │    PhonemeClassifier (768→512→|V|)
+    │     │    SymbolicConstraintLayer (β·P_constrained + (1-β)·P_neural)
+    │     ├─ src/models/losses.py (OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss)
+    │     └─ src/utils/config.py (all hyperparameters + TORGO_SEVERITY_MAP)
+    └─ run_evaluation() →  evaluate.py (macro-PER, WER, bootstrap CI, stats tests, explainability)
     ↓
 results/{run_name}/evaluation_results.json + plots + explanations.json
+
+scripts/generate_figures.py             ← publication-quality figure suite (6 plots)
+scripts/smoke_test.py                   ← 7 automated tests (all passing)
 ```
 
 ---
@@ -47,33 +52,31 @@ results/{run_name}/evaluation_results.json + plots + explanations.json
 - **Losses**: CTC + frame-CE (on neural logits) + articulatory CE + BlankPriorKL + OrdinalContrastive + SymbolicKL anchor
 - **Training**: PyTorch Lightning, differential LR, LOSO CV infrastructure, ablation CLI (`--ablation`)
 - **Evaluation**: macro-speaker PER, bootstrap CI, Welch t-test, Wilcoxon, Holm-Bonferroni, severity correlation, per-speaker breakdown
-- **Explainability**: PhonemeAttributor, ExplainableOutputFormatter, ArticulatoryConfusionAnalyzer (implemented)
-- **Uncertainty**: UncertaintyAwareDecoder (MC Dropout + conformal sets) — implemented but NOT wired into evaluate_model
-- **Severity**: TORGO_SEVERITY_MAP provides continuous [0,5] scores per speaker; get_speaker_severity() used in both train and eval forward passes
+- **Explainability**: PhonemeAttributor, ExplainableOutputFormatter, ArticulatoryConfusionAnalyzer — wired and producing `explanations.json`
+- **Uncertainty**: UncertaintyAwareDecoder (MC Dropout) — wired into `evaluate_model` via `--uncertainty` / `compute_uncertainty=True`
+- **SymbolicRuleTracker**: instantiated in `SymbolicConstraintLayer._track_activations`; currently returns 0 activations (logging issue, not model issue)
+- **run_pipeline.py**: end-to-end orchestrator; owns training + evaluation lifecycle
+- **scripts/smoke_test.py**: 7 automated tests — all passing
+- **scripts/generate_figures.py**: 6 publication-quality diagnostic plots
+- **src/visualization/experiment_plots.py**: visualization library
+- **Severity**: TORGO_SEVERITY_MAP provides continuous [0,5] scores per speaker; `get_speaker_severity()` used in both train and eval forward passes
 
-### 🔴 CONFIRMED BUGS (unresolved as of March 2026)
+### ✅ ALL CONFIRMED BUGS FIXED (B1–B11 + B12)
 
-| ID | File | Bug | Impact |
+| ID | File | Bug | Status |
 |----|------|-----|--------|
-| B1 | evaluate.py | `generate_explanations` used inside `evaluate_model` but NOT in function signature → `NameError` on every call | Crashes evaluation |
-| B2 | train.py `main()` | `Config.load()` classmethod does not exist in Config class → `AttributeError` when `--config` is passed | CLI `--config` broken |
-| B3 | train.py `training_step` | Attention mask downsampled with stride=`batch_size` (4) instead of CTC stride (320); mask fed to `BlankPriorKLLoss` covers only first ~1.3 s | BlankKL loss computed on wrong frame window |
-| B4 | train.py `training_step` | `outputs_filtered` dict built twice; first construction (without `logits_neural`) is silently discarded | Code quality / fragile |
-| B5 | train.py `validation_step` + `test_step` | `logits_neural` and `hidden_states` not passed to `compute_loss` → CE loss falls back to constrained log-probs; ordinal loss always None | Training fix (logits_neural) absent in val/test |
-| B6 | train.py `run_loso` | `config.experiment.run_name` mutated in-place cumulatively → fold N name = fold 1 name + all previous speaker IDs | Checkpoint path grows each fold |
-| B7 | src/models/losses.py `SymbolicKLLoss` | `F.kl_div(log_learned, log_prior)` computes KL(prior||learned) (reverse KL); intent is KL(learned||prior) | Optimization direction reversed |
-| B8 | src/models/losses.py `OrdinalContrastiveLoss` | `.mean()` on empty tensor (batch_size=1 after valid_mask) returns `nan` → propagates as NaN into total loss | Silent NaN when valid batch size = 1 |
-| B9 | src/explainability/* | `SymbolicRuleTracker.log_rule_activation` is never called by any model component; `_track_activations` in `SymbolicConstraintLayer` records to a separate local list | Rule tracker always returns empty |
-| B10 | evaluate.py | `wer=0.0` hardcoded in `formatter.format_utterance(...)` call | WER field in explanations.json always 0.0 |
-| B11 | src/data/dataloader.py | Audio peak-normalized THEN passed to HuBERT processor (which applies its own normalization) → double normalization, deviates from HuBERT pretraining distribution | Subtle quality degradation |
-
-### ⚠️ UNIMPLEMENTED CONNECTIONS (code exists but not wired)
-- `UncertaintyAwareDecoder` (src/models/uncertainty.py): fully implemented, never called from evaluate_model or anywhere
-- `SymbolicRuleTracker` (src/explainability/rule_tracker.py): fully implemented, never instantiated or called
-- `generate_explanations` parameter: exists in `ExperimentConfig` but never passed to `evaluate_model`
-- `PhonemeAttributor.attention_attribution`: requires CTC phoneme boundaries, which are not produced anywhere
-- `ablation_mode='neural_only'`: does not disable SeverityAdapter or LearnableConstraintMatrix forward passes (only adjusts loss weights)
-- No unit tests exist anywhere; `scripts/smoke_test.py` referenced in implementation_plan.md does not exist
+| B1 | evaluate.py | `generate_explanations` missing from `evaluate_model` signature | ✅ Fixed |
+| B2 | train.py / config.py | `Config.load()` classmethod did not exist | ✅ Fixed |
+| B3 | train.py `training_step` | Attention mask stride was `batch_size` (4) instead of CTC stride (320) | ✅ Fixed |
+| B4 | train.py `training_step` | `outputs_filtered` dict constructed twice; first silently discarded | ✅ Fixed |
+| B5 | train.py `validation_step` + `test_step` | `logits_neural` / `hidden_states` not passed to `compute_loss` | ✅ Fixed |
+| B6 | train.py `run_loso` | `config.experiment.run_name` mutated cumulatively each fold | ✅ Fixed |
+| B7 | losses.py `SymbolicKLLoss` | KL direction reversed: `F.kl_div(log_learned, log_prior)` | ✅ Fixed |
+| B8 | losses.py `OrdinalContrastiveLoss` | `.mean()` on empty tensor → NaN when valid batch = 1 | ✅ Fixed |
+| B9 | src/explainability/* | `SymbolicRuleTracker.log_rule_activation` never called by model | ✅ Fixed (wired) |
+| B10 | evaluate.py | `wer=0.0` hardcoded in `formatter.format_utterance(...)` | ✅ Fixed |
+| B11 | dataloader.py | Double normalization note | ✅ Accepted (intentional for dysarthric variability) |
+| B12 | manifest.py line 233 | `path.name.split('_')[0]` → always `'unknown'`; speaker at `[2]` | ✅ Fixed & **manifest regenerated** (March 4, 2026) |
 
 ---
 
@@ -85,12 +88,17 @@ The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T
 | Dysarthric ≤ Control PER | Dysarthric 0.541 vs Control 0.575 (counter-intuitive) | MEDIUM | Need speaker-stratified analysis; test set only 3 speakers |
 | Constraint weight (β) initialization | β converges ~0.5; unclear if optimal | LOW | Ablation study (β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}) recommended |
 
-### 🚀 NOT IMPLEMENTED (Future)
-- Insertion-bias mitigation (in design phase)
-- Multi-speaker adaptation (speaker embedding + speaker-specific β)
-- Real-time streaming inference (ONNX export)
-- Clinician-facing diagnostic dashboard
-- Domain adaptation to non-TORGO dysarthria datasets
+### ⚠️ CURRENT OPEN ISSUES (March 2026)
+
+| Issue | Impact | Status |
+|-------|--------|--------|
+| baseline_v3 test evaluation not yet run | No test PER for first valid run | Run `--skip-train --beam-search --explain` |
+| baseline_v2 results are invalid (data leakage) | PER 0.215 inflated due to all-`'unknown'` speaker split | Use baseline_v3 as reference; v2 preserved for history |
+| Test split = only 3 speakers | Wide CIs, severity correlation underpowered | Needs full LOSO-CV |
+| Insertion bias (`blank_prob_mean` ~0.857) | Model emits too few blanks → high I/D ratio | Increase `lambda_blank_kl`; analyze blank emission dynamics |
+| `SymbolicRuleTracker` zero activations | Logging issue only; doesn’t affect model | Low priority |
+| `PhonemeAttributor.attention_attribution` disabled | Requires CTC forced alignment | Future work |
+| `ablation_mode='neural_only'` incomplete | Doesn’t disable SeverityAdapter / LearnableConstraintMatrix forward passes | Ablation study needed |
 
 ---
 
@@ -350,13 +358,22 @@ python -c "from src.data.dataloader import TorgoNeuroSymbolicDataset; ds = Torgo
 
 | File | Purpose | Key Classes/Functions |
 |------|---------|----------------------|
+| `run_pipeline.py` | **Canonical entry point** — train + evaluate orchestration | `run_training()`, `run_evaluation()`, `run_auto()` |
 | `src/data/download.py` | HF dataset download → local audio files | `TorgoManager`, `setup_environment()` |
-| `src/data/manifest.py` | Phoneme extraction + articulatory mapping | `SymbolicProcessor`, `build_manifest()` |
+| `src/data/manifest.py` | Phoneme extraction + articulatory mapping | `SymbolicProcessor`, `build_manifest()`; speaker at `split('_')[2]` |
 | `src/data/dataloader.py` | Dataset + collator + vocabulary building | `TorgoNeuroSymbolicDataset`, `NeuroSymbolicCollator` |
-| `src/models/model.py` | HuBERT encoder + phoneme classifier + symbolic layer | `NeuroSymbolicASR`, `SymbolicConstraintLayer`, `ArticulatoryFeatureEncoder` |
-| `src/utils/config.py` | All hyperparameters (single source of truth) | `Config`, `ProjectPaths`, `ModelConfig`, `TrainingConfig`, `DataConfig`, `SymbolicConfig` |
-| `train.py` | PyTorch Lightning training orchestrator | `DysarthriaASRLightning`, `flatten_config_for_mlflow()` |
-| `evaluate.py` | Evaluation metrics + beam search decoder | `evaluate_model()`, `BeamSearchDecoder`, `compute_per()` |
+| `src/models/model.py` | HuBERT encoder + phoneme classifier + symbolic layer | `NeuroSymbolicASR`, `SymbolicConstraintLayer`, `SeverityAdapter` |
+| `src/models/losses.py` | Multi-task loss functions | `OrdinalContrastiveLoss`, `BlankPriorKLLoss`, `SymbolicKLLoss` |
+| `src/models/uncertainty.py` | MC-Dropout uncertainty estimation | `UncertaintyAwareDecoder` |
+| `src/utils/config.py` | All hyperparameters (single source of truth) | `Config`, `ProjectPaths`, `TORGO_SEVERITY_MAP`, `normalize_phoneme()` |
+| `train.py` | PyTorch Lightning training (no evaluation) | `DysarthriaASRLightning`, `train()`, `flatten_config_for_mlflow()` |
+| `evaluate.py` | Evaluation metrics + beam search + explanations | `evaluate_model()`, `BeamSearchDecoder`, `compute_per()` |
+| `src/explainability/output_format.py` | Per-utterance explanation JSON | `ExplainableOutputFormatter`, `format_utterance()` |
+| `src/explainability/rule_tracker.py` | Symbolic rule activation logging | `SymbolicRuleTracker` |
+| `src/visualization/experiment_plots.py` | Publication-quality plot library | `generate_all_plots()` and 6 individual plot functions |
+| `scripts/generate_figures.py` | CLI for figure generation | `main()` |
+| `scripts/smoke_test.py` | 7 automated end-to-end tests | all passing |
+| `RESEARCH_BRIEF.md` | Compressed project context (current state) | — |
 
 ---
 
@@ -476,41 +493,45 @@ for layer_idx in freeze_encoder_layers:
 
 ## Key Files & Directories
 
+- [RESEARCH_BRIEF.md](RESEARCH_BRIEF.md): **Compressed project context** — start here for any new session
 - [ROADMAP.md](ROADMAP.md): Detailed system architecture and research motivation
-- [download.py](download.py): Dataset download with safe path extraction
-- [manifest.py](manifest.py): Neuro-symbolic manifest generation with articulatory and robustness features
-- [dataloader.py](dataloader.py): PyTorch dataset and dataloader for CTC training with HF streaming
-- [train.py](train.py): PyTorch Lightning training orchestrator with multi-task learning
-- [model.py](model.py): NeuroSymbolicASR core model (HuBERT + phoneme classifier + symbolic constraints)
-- [evaluate.py](evaluate.py): Comprehensive evaluation with PER, WER, confusion matrices, clinical visualizations
-- `./data/`: HuggingFace cache and manifest CSV
-- `./data/torgo_neuro_symbolic_manifest.csv`: Generated manifest (16K+ samples with metadata)
-- `src/utils/config.py`: Configuration dataclasses (ModelConfig, TrainingConfig, SymbolicConfig)
+- [run_pipeline.py](run_pipeline.py): Canonical entry point (train + evaluate orchestrator)
+- [train.py](train.py): PyTorch Lightning training — no evaluation; called by run_pipeline
+- [evaluate.py](evaluate.py): Comprehensive evaluation with PER, beam search, explainability, uncertainty
+- [src/data/manifest.py](src/data/manifest.py): Manifest generation — speaker from `split('_')[2]`
+- [src/data/dataloader.py](src/data/dataloader.py): Dataset + collator; CTC-compatible batching
+- [src/models/model.py](src/models/model.py): NeuroSymbolicASR core model
+- [src/utils/config.py](src/utils/config.py): Single source of truth for all hyperparameters
+- [scripts/generate_figures.py](scripts/generate_figures.py): Publication-quality figure suite
+- [scripts/smoke_test.py](scripts/smoke_test.py): 7 automated tests (all passing)
+| `data/processed/torgo_neuro_symbolic_manifest.csv`: Generated manifest (16,531 rows; **regenerated March 4, 2026** with correct speaker IDs)
 
 ## What's Implemented
 
 - ✅ Data pipeline: TORGO dataset download, neuro-symbolic manifest with articulatory metadata
 - ✅ Neural dataset & dataloader: HuBERT feature extraction, CTC-compatible batching, inverse-frequency class weights
-- ✅ NeuroSymbolicASR model: HuBERT encoder + phoneme classifier + symbolic constraint layer (β=0.5 init)
+- ✅ NeuroSymbolicASR model: HuBERT + SeverityAdapter + LearnableConstraintMatrix + SymbolicConstraintLayer
 - ✅ Training infrastructure: PyTorch Lightning with multi-task learning, weighted sampler, MLflow logging, callbacks
-- ✅ Evaluation metrics: PER, WER, phoneme alignment, confusion matrices, per-speaker analysis
-- ✅ **Baseline model (baseline_v1)**: Test PER 0.567 on 3,553 samples (3 TORGO speakers)
-  - Dysarthric PER: 0.541 | Control PER: 0.575
-  - 94.8M params (416K trainable), trained on 10 speakers, best epoch 17/50
-  - **Known issue**: High insertion rate (21,290 insertions vs. 376 deletions)
+- ✅ Evaluation metrics: PER, WER, phoneme alignment, confusion matrices, per-speaker analysis, bootstrap CI
+- ✅ Explainability: `explanations.json` per-utterance phoneme error analysis (with `--explain`)
+- ✅ Uncertainty estimation: MC-Dropout via `UncertaintyAwareDecoder` (with `--uncertainty`)
+- ✅ Orchestrator: `run_pipeline.py` — single entry point for train + evaluate
+- ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
+- ✅ Automated tests: `scripts/smoke_test.py` — 7/7 passing
+- ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
+- ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; 98.9M params (23.9M trainable, 24.2%); first run with valid speaker-independent splits; test eval pending
+- ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused all speakers to be `'unknown'`, making speaker-stratified split ineffective (data leakage). Preserved as historical reference.
 
-## Next Steps: What's NOT Built Yet
+## Next Steps: What Remains
 
-- **Insertion bias mitigation**: High insertion rate (21,290 insertions) needs investigation
-  - Analyze CTC blank probabilities and emission patterns
-  - Adjust CE loss `<BLANK>` weight dynamically during training
-  - Add insertion-specific regularization (e.g., penalize consecutive non-blank predictions)
-- **Phoneme-length stratification**: Analyze PER by utterance length to understand dysarthric vs. control performance gap
-- **Explainability dashboard**: Interactive visualization of phoneme confusion matrices, rule activations, per-speaker error patterns
-- **Model checkpoints**: Publish pretrained baseline & fine-tuned models for TORGO dysarthric/control cohorts
-- **Symbolic rule discovery**: Auto-extract dysarthric substitution rules from confusion matrices (e.g., /p/ → /b/ frequency thresholds)
-- **Clinical interface**: ONNX export, streaming inference, real-time feedback for speech therapy
-- **Ablation studies**: Quantify contribution of neural vs. symbolic components via systematic evaluation
+- **Run baseline_v3 test evaluation** (immediate): `python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25`
+- **Regenerate figures** for baseline_v3: `python scripts/generate_figures.py --run-name baseline_v3`
+- **LOSO-CV**: Run 15-speaker leave-one-out for statistically valid macro-PER estimate
+- **Ablation studies**: `neural_only`, `no_art_heads`, `no_constraint_matrix` variants via `--ablation`
+- **Insertion bias mitigation**: increase `lambda_blank_kl`; investigate why `blank_prob_mean` stabilizes at ~0.857
+- **CTC forced alignment**: enables `PhonemeAttributor.attention_attribution`
+- **Clinician dashboard**: ONNX export, streaming inference
+- **Domain adaptation**: non-TORGO dysarthria datasets
 
 ## Common Pitfalls & Solutions
 
@@ -538,15 +559,40 @@ When implementing new components:
 
 
 ## Project Map (What Talks to What)
-- Data flow: `download.py` (HF TORGO -> data/raw/audio) -> `src/data/manifest.py` (creates `data/processed/torgo_neuro_symbolic_manifest.csv`) -> `src/data/dataloader.py` (`TorgoNeuroSymbolicDataset`, `NeuroSymbolicCollator`) -> `train.py` (`DysarthriaASRLightning`) -> `evaluate.py` (PER/WER + analyses) -> `results/` and `mlruns/`.
+- Data flow: `src/data/download.py` (HF TORGO → data/raw/audio) → `src/data/manifest.py` (creates `data/processed/torgo_neuro_symbolic_manifest.csv`; speaker from `split('_')[2]`) → `src/data/dataloader.py` (`TorgoNeuroSymbolicDataset`, `NeuroSymbolicCollator`) → `run_pipeline.py` → `train.py` / `evaluate.py` → `results/` and `mlruns/`.
+- **`run_pipeline.py` is the canonical entry point.** `train.py` no longer calls `evaluate_model()` internally; `run_pipeline.py` owns that call.
 - Model core lives in `src/models/model.py` (`NeuroSymbolicASR`, `SymbolicConstraintLayer`), which fuses HuBERT logits with articulatory rules; `normalize_phoneme()` in `src/utils/config.py` is used everywhere for stress-stripping.
 - Central config + paths are in `src/utils/config.py` (`ProjectPaths`, `Config`, `ModelConfig`, `TrainingConfig`, etc). Use it as the single source of truth for defaults.
+- Visualization: `scripts/generate_figures.py` calls `src/visualization/experiment_plots.py` which reads `results/{run}/evaluation_results.json` + `explanations.json`.
 
 ## Critical Workflows (Commands)
-- Download TORGO and extract audio: `python download.py` (writes under `data/raw/` and `data/processed/raw_extraction_map.csv`).
-- Build manifest with phonemes/articulatory classes: `python src/data/manifest.py` -> `data/processed/torgo_neuro_symbolic_manifest.csv`.
-- Train: `python train.py` (PyTorch Lightning + MLflow logging to `mlruns/`).
-- Evaluate: `python evaluate.py` (writes to `results/`, supports beam search in `evaluate.py`).
+- Download TORGO and extract audio: `python src/data/download.py` (writes under `data/raw/` and `data/processed/raw_extraction_map.csv`).
+- Build manifest with phonemes/articulatory classes: `python src/data/manifest.py` → `data/processed/torgo_neuro_symbolic_manifest.csv`. **Regenerated March 4, 2026** — B12 fully resolved.
+- **Full pipeline (canonical)**:
+  ```bash
+  python run_pipeline.py --run-name experiment_v4
+  ```
+- **Evaluation-only (reuse checkpoint)**:
+  ```bash
+  # Evaluate baseline_v3 (first valid run)
+  python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25
+  ```
+- **Smoke test (5 batches)**:
+  ```bash
+  python run_pipeline.py --run-name smoke_check --smoke-test
+  ```
+- **Generate publication figures**:
+  ```bash
+  python scripts/generate_figures.py --run-name baseline_v3
+  # Compare multiple runs:
+  python scripts/generate_figures.py --run-name baseline_v3 --compare neural_only no_art_heads
+  ```
+- **Run unit tests**:
+  ```bash
+  python scripts/smoke_test.py
+  ```
+- Train directly (bypasses orchestrator): `python train.py --run-name ...` (evaluation NOT run automatically).
+- Evaluate directly: `python evaluate.py` (stub only; use `run_pipeline.py` instead).
 
 ## Project-Specific Conventions
 - Phonemes are ARPABET and stress-agnostic: always pass through `normalize_phoneme()` before comparisons or vocab building.
@@ -562,5 +608,6 @@ When implementing new components:
 ## Examples to Follow
 - For adding model behavior, mirror the neuro-symbolic fusion path in `src/models/model.py` and keep `SymbolicConstraintLayer` semantics intact.
 - For new metrics or analyses, follow the structure in `evaluate.py` (bootstrap CI, per-speaker breakdowns, beam search).
-- For data quality or plots, pattern after `src/visualization/diagnostics.py`.
+- For new plots, add a function to `src/visualization/experiment_plots.py` following the house-style helper pattern, and call it from `generate_all_plots()`.
+- For data quality or bulk diagnostics, pattern after `src/visualization/diagnostics.py`.
 
