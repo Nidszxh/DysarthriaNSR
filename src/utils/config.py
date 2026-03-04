@@ -87,9 +87,11 @@ class ModelConfig:
     hubert_model_id: str = "facebook/hubert-base-ls960"
     freeze_feature_extractor: bool = True
     
-    # 4060 TWEAK: Freezing 10/12 layers provides the best VRAM/Accuracy trade-off
-    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 10)))
-    
+    # Permanently freeze only the bottom 6 layers (robust generic acoustic features).
+    # Layers 6-11 are fine-tuned progressively via the two-stage warmup schedule in
+    # on_train_epoch_start (epoch 3: unfreeze 8-11; epoch 10: unfreeze 6-11).
+    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 6)))
+
     hidden_dim: int = 512
     num_phonemes: int = 44
     classifier_dropout: float = 0.1
@@ -105,6 +107,22 @@ class ModelConfig:
     # Cross-attention severity adapter (Proposal P3)
     use_severity_adapter: bool = True
     severity_adapter_dim: int = 64   # Projection bottleneck for severity embedding
+
+    # Temporal downsampling bottleneck (stride-2 Conv1d before phoneme head).
+    # Halves frame rate (~50 Hz → ~25 Hz), forcing the model to aggregate
+    # local acoustic context before predicting phonemes.  Especially useful
+    # with mostly-frozen HuBERT where elongated dysarthric phonemes otherwise
+    # receive direct per-frame predictions with no context window.
+    use_temporal_downsample: bool = True
+
+    # SpecAugment: time/frequency masking on HuBERT hidden states during training.
+    # Prevents overfitting on the small TORGO dataset; especially effective with
+    # only 16k samples and a partially-frozen encoder.
+    use_spec_augment: bool = True
+    spec_time_mask_prob: float = 0.05   # Fraction of frames to mask per utterance
+    spec_time_mask_length: int = 10     # Max consecutive frames to mask
+    spec_freq_mask_prob: float = 0.05   # Fraction of feature dims to mask
+    spec_freq_mask_length: int = 8      # Max consecutive feature dims to mask
 
 @dataclass
 class TrainingConfig:
@@ -122,8 +140,9 @@ class TrainingConfig:
     
     batch_size: int = 4  # Increased from 1 or 2 to maximize 4060 core utilization
     gradient_accumulation_steps: int = 8  # Effective batch = 32
-    max_epochs: int = 30
+    max_epochs: int = 40
     encoder_warmup_epochs: int = 3
+    encoder_second_unfreeze_epoch: int = 10  # Stage 2: unfreeze layers 6-11 at this epoch
     val_check_interval: float = 0.5
     
     # Regularization & Loss
@@ -135,14 +154,14 @@ class TrainingConfig:
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
     lambda_ce: float = 0.2
-    lambda_articulatory: float = 0.1
+    lambda_articulatory: float = 0.15  # Increased from 0.1 — stronger articulatory supervision
 
     # --- Phase 2: New loss weights (audit Proposals P1, P2, R3) ---
     # Ordinal contrastive severity loss (Proposal P1)
     lambda_ordinal: float = 0.05
     # Blank-prior KL regularisation (fix CTC insertion pathology)
-    lambda_blank_kl: float = 0.05
-    blank_target_prob: float = 0.30   # Target mean blank probability
+    lambda_blank_kl: float = 0.35   # Increased from 0.20 — pushes I/D ratio below 3× target
+    blank_target_prob: float = 0.82   # Slightly below 0.85: allows a bit more phoneme output to reduce deletions while still suppressing insertions
     # Symbolic KL anchor (keeps learnable C near symbolic prior)
     lambda_symbolic_kl: float = 0.05
 
@@ -150,13 +169,14 @@ class TrainingConfig:
     monitor_metric: str = "val/per"
     monitor_mode: str = "min"
     early_stopping_patience: int = 8
+    beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
     save_top_k: int = 2
     
     # HW Acceleration
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    blank_priority_weight: float = 1.5
+    blank_priority_weight: float = 2.5  # Increased from 1.5 — up-weights blank in CE class weights to suppress insertions
 
     # --- Phase 4: Training infrastructure (audit G2, ablations) ---
     # Leave-One-Speaker-Out cross-validation (opt-in, keeps fast single-split default)
@@ -217,7 +237,7 @@ class SymbolicConfig:
     place_weight: float = 0.35
     voice_weight: float = 0.25
     distance_decay_factor: float = 3.0
-    min_rule_confidence: float = 0.5
+    min_rule_confidence: float = 0.1  # C5: lowered from 0.5; β ≈ 0.05–0.2 means most rules scored below 0.5
     severity_threshold_mild: float = 2.0
     severity_threshold_severe: float = 4.0
     track_rule_activations: bool = True

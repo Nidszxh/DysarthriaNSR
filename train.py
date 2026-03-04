@@ -145,21 +145,25 @@ class DysarthriaASRLightning(pl.LightningModule):
         if '<PAD>' in self.phn_to_id:
             ce_weights[self.phn_to_id['<PAD>']] = float(ce_weights[self.phn_to_id['<PAD>']]) * 1.5
 
-        self.ce_loss = nn.NLLLoss(
+        # C1: Use CrossEntropyLoss (accepts raw logits, always non-negative)
+        self.ce_loss = nn.CrossEntropyLoss(
             weight=ce_weights,
-            ignore_index=-100
+            ignore_index=-100,
+            label_smoothing=self.config.training.label_smoothing
         )
 
-        self.art_ce_losses = {}
+        # C6: Use nn.ModuleDict so Lightning registers and device-manages these modules
+        _art_losses = {}
         for key in ["manner", "place", "voice"]:
             weights = self.articulatory_weights.get(key)
             if weights is not None:
                 weights = weights.clone().detach().float()
-            self.art_ce_losses[key] = nn.CrossEntropyLoss(
+            _art_losses[key] = nn.CrossEntropyLoss(
                 weight=weights,
                 ignore_index=-100,
                 label_smoothing=self.config.training.label_smoothing
             )
+        self.art_ce_losses = nn.ModuleDict(_art_losses)
 
         # --- Phase 2: New research-grade loss functions (audit proposals P1, P2, R3) ---
         blank_id = self.phn_to_id.get('<BLANK>', 0)
@@ -177,13 +181,14 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.register_buffer('lambda_articulatory', torch.tensor(self.config.training.lambda_articulatory))
 
     def on_fit_start(self) -> None:
-        """Ensure loss weights reside on the correct device once available."""
-        if hasattr(self, 'ce_loss') and hasattr(self.ce_loss, 'weight') and self.ce_loss.weight is not None:
-            try:
-                self.ce_loss.weight = self.ce_loss.weight.to(self.device)
-            except Exception:
-                pass
-        for loss_fn in self.art_ce_losses.values():
+        """Ensure loss weight tensors reside on the correct device.
+
+        nn.CrossEntropyLoss / nn.NLLLoss store `weight` as a plain tensor
+        attribute (not a buffer), so Lightning's automatic .to(device) call
+        does not move it.  We do it explicitly here once the Trainer has
+        confirmed the target device.
+        """
+        for loss_fn in [self.ce_loss, *self.art_ce_losses.values()]:
             if hasattr(loss_fn, 'weight') and loss_fn.weight is not None:
                 try:
                     loss_fn.weight = loss_fn.weight.to(self.device)
@@ -331,17 +336,22 @@ class DysarthriaASRLightning(pl.LightningModule):
             label_lengths
         )
     
-    def _compute_ce_loss(self, log_probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute NLL loss using constrained log-probabilities."""
-        batch_size, time_steps_logits, num_classes = log_probs.shape
-        
+    def _compute_ce_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute cross-entropy loss on raw neural logits.
+
+        C1 fix: self.ce_loss is now nn.CrossEntropyLoss which expects raw
+        logits (no prior softmax/log_softmax).  Passing raw logits ensures
+        the loss is always ≥ 0.
+        """
+        batch_size, time_steps_logits, num_classes = logits.shape
+
         # Align labels to logits time dimension
         labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
-        
-        # Compute loss
-        logits_flat = log_probs.reshape(-1, num_classes)
+
+        # Compute loss — CrossEntropyLoss handles softmax internally
+        logits_flat = logits.reshape(-1, num_classes)
         labels_flat = labels_aligned.reshape(-1)
-        
+
         return self.ce_loss(logits_flat, labels_flat)
 
     def _compute_articulatory_ce_loss(
@@ -399,16 +409,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Compute lengths
         log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        input_lengths = batch.get('input_lengths')
-        if input_lengths is None:
-            input_lengths = torch.full(
-                (log_probs_constrained.size(0),),
-                log_probs_constrained.size(1),
-                dtype=torch.long,
-                device=log_probs_constrained.device
-            )
+
+        # Prefer exact output_lengths from model (computed via HuBERT CNN formula)
+        # over approximate batch.input_lengths (collator uses // 320 which is off by
+        # 0-2 frames and passes wrong values to CTCLoss).
+        if outputs.get('output_lengths') is not None:
+            input_lengths = outputs['output_lengths'].to(log_probs_constrained.device)
         else:
-            input_lengths = input_lengths.to(log_probs_constrained.device)
+            input_lengths = batch.get('input_lengths')
+            if input_lengths is None:
+                input_lengths = torch.full(
+                    (log_probs_constrained.size(0),),
+                    log_probs_constrained.size(1),
+                    dtype=torch.long,
+                    device=log_probs_constrained.device
+                )
+            else:
+                input_lengths = input_lengths.to(log_probs_constrained.device)
 
         # Guard against off-by-one or padding-induced length mismatch
         input_lengths = torch.clamp(
@@ -462,7 +479,18 @@ class DysarthriaASRLightning(pl.LightningModule):
         if outputs_filtered['hidden_states'] is not None:
             outputs_filtered['hidden_states'] = outputs_filtered['hidden_states'][valid_mask]
 
-        severity  = batch['status'].float() * 5.0
+        # C7: Use per-speaker severity from TORGO_SEVERITY_MAP (continuous [0,5])
+        # instead of the coarse binary status * 5.0 used previously.
+        speakers_batch = batch.get('speakers', [])
+        if speakers_batch and isinstance(speakers_batch[0], str):
+            severity = torch.tensor(
+                [get_speaker_severity(s) for s in speakers_batch],
+                dtype=torch.float32,
+                device=log_probs_constrained.device,
+            )
+        else:
+            severity = batch['status'].float().to(log_probs_constrained.device) * 5.0
+
         attn_mask = batch.get('attention_mask')
         if attn_mask is not None:
             # Downsample attention mask from audio-frame resolution to logit resolution.
@@ -511,12 +539,30 @@ class DysarthriaASRLightning(pl.LightningModule):
         return losses['loss']
 
     def on_train_epoch_start(self) -> None:
-        """Gradually unfreeze HuBERT after warmup epochs."""
-        if (not self.encoder_unfrozen and
-                self.current_epoch >= self.config.training.encoder_warmup_epochs):
-            self.model.unfreeze_after_warmup()
+        """Two-stage progressive HuBERT unfreezing.
+
+        Stage 1 (encoder_warmup_epochs, default 3):
+            Unfreeze top 4 layers (8-11) while the randomly-initialised head stabilises.
+        Stage 2 (encoder_second_unfreeze_epoch, default 10):
+            Apply permanent freeze config (layers 0-5 only), unlocking layers 6-11.
+        """
+        epoch           = self.current_epoch
+        warmup_ep       = self.config.training.encoder_warmup_epochs
+        second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 10)
+
+        if not self.encoder_unfrozen and epoch >= warmup_ep:
+            # Stage 1: unfreeze top 4 layers only
+            self.model.unfreeze_encoder(layers=[8, 9, 10, 11])
             self.encoder_unfrozen = True
-            print(f"🧊 Unfroze HuBERT encoder at epoch {self.current_epoch}")
+            print(f"🔥 Stage 1: Unfroze HuBERT layers 8-11 at epoch {epoch}")
+
+        elif (self.encoder_unfrozen
+              and not getattr(self, '_encoder_deep_unfrozen', False)
+              and epoch >= second_unfreeze):
+            # Stage 2: apply final freeze config (keeps 0-5 frozen, frees 6-11)
+            self.model.unfreeze_after_warmup()
+            self._encoder_deep_unfrozen = True
+            print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
     
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
         """
@@ -534,16 +580,21 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Compute lengths
         log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        input_lengths = batch.get('input_lengths')
-        if input_lengths is None:
-            input_lengths = torch.full(
-                (log_probs_constrained.size(0),),
-                log_probs_constrained.size(1),
-                dtype=torch.long,
-                device=log_probs_constrained.device
-            )
+
+        # Prefer exact output_lengths from model over approximate batch.input_lengths.
+        if outputs.get('output_lengths') is not None:
+            input_lengths = outputs['output_lengths'].to(log_probs_constrained.device)
         else:
-            input_lengths = input_lengths.to(log_probs_constrained.device)
+            input_lengths = batch.get('input_lengths')
+            if input_lengths is None:
+                input_lengths = torch.full(
+                    (log_probs_constrained.size(0),),
+                    log_probs_constrained.size(1),
+                    dtype=torch.long,
+                    device=log_probs_constrained.device
+                )
+            else:
+                input_lengths = input_lengths.to(log_probs_constrained.device)
 
         # Guard against off-by-one or padding-induced length mismatch
         input_lengths = torch.clamp(
@@ -603,10 +654,15 @@ class DysarthriaASRLightning(pl.LightningModule):
         )
 
         # Decode predictions for PER computation
-        predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
+        # Pass output_lengths so padding frames are excluded (prevents insertion inflation
+        # on shorter utterances padded to batch-max length).
+        output_lengths_full = outputs.get('output_lengths')
+        output_lengths_pred = output_lengths_full[valid_mask] if output_lengths_full is not None else None
+        predictions = decode_predictions(
+            log_probs_constrained, self.phn_to_id, self.id_to_phn,
+            output_lengths=output_lengths_pred,
+        )
         references = decode_references(labels, self.id_to_phn)
-        
-        # Compute PER
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
         avg_per = np.mean(per_scores) if per_scores else 0.0
         
@@ -639,6 +695,12 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Log metrics
         self.log('val/loss', avg_loss, prog_bar=True)
         self.log('val/per', avg_per, prog_bar=True)
+        # val_per: slash-free alias used in ModelCheckpoint filename.
+        # PL 2.x expands {key:fmt} → "key=value" in filenames, so a template
+        # like 'epoch={epoch:02d}-val_per={val/per:.3f}' would double-prefix:
+        # epoch=epoch=04-val_per=val/per=0.885. Using a separately-logged
+        # alias avoids the slash and the doubled key.
+        self.log('val_per', avg_per, prog_bar=False, sync_dist=True)
         self.log('val/per_dysarthric', dysarthric_per)
         self.log('val/per_control', control_per)
         
@@ -688,16 +750,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Compute lengths
         log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
         labels = batch['labels']
-        input_lengths = batch.get('input_lengths')
-        if input_lengths is None:
-            input_lengths = torch.full(
-                (log_probs_constrained.size(0),),
-                log_probs_constrained.size(1),
-                dtype=torch.long,
-                device=log_probs_constrained.device
-            )
+
+        # Prefer exact output_lengths from model over approximate batch.input_lengths.
+        if outputs.get('output_lengths') is not None:
+            input_lengths = outputs['output_lengths'].to(log_probs_constrained.device)
         else:
-            input_lengths = input_lengths.to(log_probs_constrained.device)
+            input_lengths = batch.get('input_lengths')
+            if input_lengths is None:
+                input_lengths = torch.full(
+                    (log_probs_constrained.size(0),),
+                    log_probs_constrained.size(1),
+                    dtype=torch.long,
+                    device=log_probs_constrained.device
+                )
+            else:
+                input_lengths = input_lengths.to(log_probs_constrained.device)
+
+        input_lengths = torch.clamp(input_lengths, max=log_probs_constrained.size(1))
 
         label_lengths = batch.get('label_lengths')
         if label_lengths is None:
@@ -751,9 +820,14 @@ class DysarthriaASRLightning(pl.LightningModule):
         )
 
         # Decode and compute PER
-        predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
+        # Pass output_lengths so padding frames are excluded.
+        output_lengths_full_t = outputs.get('output_lengths')
+        output_lengths_pred_t = output_lengths_full_t[valid_mask] if output_lengths_full_t is not None else None
+        predictions = decode_predictions(
+            log_probs_constrained, self.phn_to_id, self.id_to_phn,
+            output_lengths=output_lengths_pred_t,
+        )
         references = decode_references(labels, self.id_to_phn)
-        
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
         avg_per = np.mean(per_scores) if per_scores else 0.0
         
@@ -861,36 +935,33 @@ def create_dataloaders(
     val_idx = df[df['speaker'].isin(val_speakers)].index.tolist()
     test_idx = df[df['speaker'].isin(test_speakers)].index.tolist()
 
-    # Fallback for tiny speaker counts: ensure non-empty splits
+    # C3: Guard against data leakage from sample-level fallback splits.
+    # When the requested ratio produces empty partitions (e.g. only 3 speakers
+    # with a 70/15/15 ratio), enforce a round-robin 1-speaker-per-split
+    # assignment rather than silently mixing speakers across train/test.
     if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+        n_spk = len(speakers)
+        if n_spk < 3:
+            raise ValueError(
+                f"Speaker-stratified splits require at least 3 speakers; "
+                f"found {n_spk}: {list(speakers)}. "
+                "Add more speakers or switch to a different split strategy."
+            )
+        # Round-robin: one speaker per critical split, rest to train
+        test_speakers  = speakers[-1:]
+        val_speakers   = speakers[-2:-1]
+        train_speakers = speakers[:-2]
+
+        train_idx = df[df['speaker'].isin(train_speakers)].index.tolist()
+        val_idx   = df[df['speaker'].isin(val_speakers)].index.tolist()
+        test_idx  = df[df['speaker'].isin(test_speakers)].index.tolist()
+
         print(
-            "⚠️  Speaker-level split produced empty split(s). "
-            "Falling back to sample-level split for this run."
+            f"⚠️  Ratio-based split produced empty partition(s). "
+            f"Using round-robin speaker assignment: "
+            f"train={list(train_speakers)}, val={list(val_speakers)}, "
+            f"test={list(test_speakers)}"
         )
-        total_samples = len(df)
-        rng = np.random.default_rng(config.experiment.seed)
-        shuffled_idx = rng.permutation(total_samples)
-
-        if total_samples <= 2:
-            n_train = max(1, total_samples)
-            n_val = max(0, total_samples - n_train)
-            n_test = 0
-        else:
-            n_train = max(1, int(total_samples * config.data.train_split))
-            n_val = max(1, int(total_samples * config.data.val_split))
-            n_test = total_samples - n_train - n_val
-
-            # Ensure test split is non-empty when possible
-            if n_test == 0:
-                n_test = 1
-                if n_train > n_val:
-                    n_train -= 1
-                else:
-                    n_val -= 1
-
-        train_idx = shuffled_idx[:n_train].tolist()
-        val_idx = shuffled_idx[n_train:n_train + n_val].tolist()
-        test_idx = shuffled_idx[n_train + n_val:n_train + n_val + n_test].tolist()
     
     # Create subset datasets
     train_dataset = Subset(dataset, train_idx)
@@ -905,9 +976,10 @@ def create_dataloaders(
     collator = NeuroSymbolicCollator(dataset.processor)
 
     # Weighted sampling to balance dysarthric vs control speakers
+    # Use 'label' column (0=control, 1=dysarthric) — the manifest required column name.
     train_df = dataset.df.iloc[train_idx]
-    status_counts = train_df['status'].value_counts().to_dict()
-    train_weights = [1.0 / status_counts[dataset.df.iloc[i]['status']] for i in train_idx]
+    status_counts = train_df['label'].value_counts().to_dict()
+    train_weights = [1.0 / status_counts[dataset.df.iloc[i]['label']] for i in train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     
     # Create dataloaders
@@ -1026,7 +1098,7 @@ def train(
     
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(checkpoint_dir),
-        filename='epoch={epoch:02d}-val_per={val/per:.3f}',
+        filename='{epoch:02d}-{val_per:.3f}',
         monitor=config.training.monitor_metric,
         mode=config.training.monitor_mode,
         save_top_k=config.training.save_top_k,
@@ -1131,10 +1203,11 @@ def create_loso_splits(
 
     collator = NeuroSymbolicCollator(dataset.processor)
 
-    # Weighted sampler for train split
+    # Weighted sampler for train split — use 'label' (manifest required column,
+    # 0=control 1=dysarthric) to avoid KeyError when 'status' alias is absent.
     train_df = df.iloc[train_idx]
-    status_counts = train_df['status'].value_counts().to_dict()
-    train_weights = [1.0 / max(status_counts.get(df.iloc[i]['status'], 1), 1) for i in train_idx]
+    status_counts = train_df['label'].value_counts().to_dict()
+    train_weights = [1.0 / max(status_counts.get(df.iloc[i]['label'], 1), 1) for i in train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
 
     def _make_loader(idx, shuffle_sampler=None):
@@ -1202,7 +1275,8 @@ def run_loso(
 
         ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
         ckpt_cb = ModelCheckpoint(
-            dirpath=str(ckpt_dir), monitor='val/per', mode='min',
+            dirpath=str(ckpt_dir), monitor='val_per', mode='min',
+            filename='{epoch:02d}-{val_per:.3f}',
             save_top_k=1, save_last=False,
         )
         trainer = pl.Trainer(

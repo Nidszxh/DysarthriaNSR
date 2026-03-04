@@ -290,8 +290,10 @@ class TorgoNeuroSymbolicDataset(Dataset):
         2. Convert stereo → mono
         3. Resample to target sampling rate
         4. Truncate to max_audio_length (memory optimization)
-        5. Peak normalization (critical for dysarthric speech)
-        
+        5. (No manual normalization — HuBERT processor applies its own
+           mean/variance normalization; double-normalizing deviates from
+           the facebook/hubert-base-ls960 pretraining distribution.)
+
         Args:
             audio_path: Path to audio file
         
@@ -300,7 +302,9 @@ class TorgoNeuroSymbolicDataset(Dataset):
         
         Notes:
             - Returns silence (zeros) on load failure to avoid crashing training
-            - Peak normalization accounts for variable breath support in dysarthria
+            - No manual peak normalization: HuBERT processor applies its own
+              mean/variance normalization; double-normalizing deviates from the
+              facebook/hubert-base-ls960 pretraining distribution.
         """
         # Attempt to load audio
         if Path(audio_path).exists():
@@ -335,11 +339,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
             if waveform.shape[-1] > self.max_audio_samples:
                 waveform = waveform[..., :self.max_audio_samples]
         
-        # Peak normalization (critical for variable dysarthric breath support)
+        # C2: Do NOT peak-normalize here. HuBERT processor applies its own
+        # mean/variance normalization during feature extraction; a manual
+        # peak-normalize beforehand causes double normalization that deviates
+        # from the pretraining distribution of facebook/hubert-base-ls960.
         waveform = waveform.squeeze(0)
-        max_val = waveform.abs().max()
-        if max_val > 0:
-            waveform = waveform / max_val
         
         return waveform
     

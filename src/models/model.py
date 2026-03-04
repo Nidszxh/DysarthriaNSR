@@ -16,6 +16,7 @@ Components:
 """
 
 from collections import defaultdict
+import random
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -491,8 +492,126 @@ class SeverityAdapter(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SpecAugment — time and frequency masking on HuBERT hidden states
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SpecAugmentLayer(nn.Module):
+    """
+    SpecAugment applied to HuBERT hidden states [B, T, D] during training.
+
+    Applies independent random time and frequency masks per batch item.
+    Masked positions are zeroed (zero is close to the mean of layer-normalised
+    representations and is the standard default for hidden-state SpecAugment).
+
+    Applied only when model.training is True; a no-op at eval/inference time.
+
+    Args:
+        time_mask_prob:   Expected fraction of time steps to mask per utterance.
+        time_mask_length: Max consecutive frames per mask (uniform in [1, length]).
+        freq_mask_prob:   Expected fraction of feature dims to mask.
+        freq_mask_length: Max consecutive dims per mask (uniform in [1, length]).
+    """
+
+    def __init__(
+        self,
+        time_mask_prob: float = 0.05,
+        time_mask_length: int = 10,
+        freq_mask_prob: float = 0.05,
+        freq_mask_length: int = 8,
+    ):
+        super().__init__()
+        self.time_mask_prob   = time_mask_prob
+        self.time_mask_length = time_mask_length
+        self.freq_mask_prob   = freq_mask_prob
+        self.freq_mask_length = freq_mask_length
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, D] hidden states
+        Returns:
+            [B, T, D] with random time/freq regions zeroed (training only)
+        """
+        if not self.training:
+            return x
+
+        B, T, D = x.shape
+        x = x.clone()
+
+        # ─ Time masking ──────────────────────────────────────────────────
+        n_time_masks = max(1, int(T * self.time_mask_prob))
+        for _ in range(n_time_masks):
+            t_len = random.randint(1, self.time_mask_length)
+            t0    = random.randint(0, max(0, T - t_len))
+            x[:, t0:t0 + t_len, :] = 0.0
+
+        # ─ Frequency masking ───────────────────────────────────────────────
+        n_freq_masks = max(1, int(D * self.freq_mask_prob))
+        for _ in range(n_freq_masks):
+            f_len = random.randint(1, self.freq_mask_length)
+            f0    = random.randint(0, max(0, D - f_len))
+            x[:, :, f0:f0 + f_len] = 0.0
+
+        return x
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Phoneme Classifier Head (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class TemporalDownsampler(nn.Module):
+    """
+    Stride-2 Conv1d bottleneck inserted between HuBERT hidden states and the
+    phoneme classifier.
+
+    Motivation (dysarthric CTC)
+    ---------------------------
+    With HuBERT mostly frozen the model must map ~50 Hz frame embeddings to
+    phoneme posteriors in one projection step.  Dysarthric speech has elongated,
+    slurred phonemes whose acoustic realisation spans many frames.  A stride-2
+    conv forces the model to aggregate context from 3 neighbouring frames before
+    predicting each phoneme, halving the effective frame rate to ~25 Hz and making
+    CTC alignment substantially more stable.
+
+    Length formula (Conv1d, kernel=3, stride=2, padding=1)
+    ------------------------------------------------------
+        T_out = floor((T_in + 2*padding - kernel) / stride) + 1
+               = floor((T_in - 1) / 2) + 1
+               = ceil(T_in / 2)  =  (T_in + 1) // 2
+
+    Callers must apply the same formula to ``output_lengths``::
+
+        output_lengths = (output_lengths + 1) // 2
+    """
+
+    def __init__(self, hidden_dim: int = 768, dropout: float = 0.1):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+        self.norm    = nn.LayerNorm(hidden_dim)
+        self.act     = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, hidden_dim]  (HuBERT convention: batch-first)
+        Returns:
+            [B, ceil(T/2), hidden_dim]
+        """
+        x = x.transpose(1, 2)   # [B, hidden_dim, T]
+        x = self.conv(x)         # [B, hidden_dim, ceil(T/2)]
+        x = x.transpose(1, 2)   # [B, ceil(T/2), hidden_dim]
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        return x
+
 
 class PhonemeClassifier(nn.Module):
     """
@@ -588,6 +707,26 @@ class NeuroSymbolicASR(nn.Module):
                 adapter_dim=model_config.severity_adapter_dim,
             )
             print("   ✅ SeverityAdapter enabled (cross-attention, continuous severity)")
+
+        # ── SpecAugment (time/freq masking on hidden states, training only) ───
+        self.spec_augment: Optional[SpecAugmentLayer] = None
+        if model_config.use_spec_augment:
+            self.spec_augment = SpecAugmentLayer(
+                time_mask_prob=model_config.spec_time_mask_prob,
+                time_mask_length=model_config.spec_time_mask_length,
+                freq_mask_prob=model_config.spec_freq_mask_prob,
+                freq_mask_length=model_config.spec_freq_mask_length,
+            )
+            print("   ✅ SpecAugment enabled (time/freq masking on HuBERT hidden states)")
+
+        # ── Temporal Downsampler (halves frame rate; stabilises CTC alignment) ─
+        self.temporal_downsampler: Optional[TemporalDownsampler] = None
+        if model_config.use_temporal_downsample:
+            self.temporal_downsampler = TemporalDownsampler(
+                hidden_dim=768,
+                dropout=model_config.classifier_dropout,
+            )
+            print("   ✅ TemporalDownsampler enabled (~50 Hz → ~25 Hz, stride-2 Conv1d)")
 
         # ── Phoneme Classifier ────────────────────────────────────────────────
         self.phoneme_classifier = PhonemeClassifier(model_config)
@@ -701,6 +840,14 @@ class NeuroSymbolicASR(nn.Module):
         if self.severity_adapter is not None and speaker_severity is not None:
             hidden_states = self.severity_adapter(hidden_states, speaker_severity)
 
+        # ── SpecAugment (no-op at eval; masks time/freq regions during training) ──
+        if self.spec_augment is not None:
+            hidden_states = self.spec_augment(hidden_states)
+
+        # ── Temporal Downsampler (stride-2, ~50 Hz → ~25 Hz) ─────────────────
+        if self.temporal_downsampler is not None:
+            hidden_states = self.temporal_downsampler(hidden_states)
+
         # ── Phoneme Classifier ────────────────────────────────────────────────
         logits_neural, shared_features = self.phoneme_classifier(
             hidden_states, return_features=True
@@ -714,18 +861,43 @@ class NeuroSymbolicASR(nn.Module):
         # ── Symbolic Constraint Layer ─────────────────────────────────────────
         symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)
 
+        # ── Valid output-frame lengths (audio-space mask → frame-space) ───────
+        # Used by greedy/beam decoders to skip padding frames that would
+        # otherwise generate spurious phoneme insertions.
+        if attention_mask is not None:
+            audio_lengths = attention_mask.sum(dim=-1)  # [B] valid audio samples
+            output_lengths = self.hubert._get_feat_extract_output_lengths(
+                audio_lengths
+            ).long()
+        else:
+            # If downsampled, hidden_states has already been halved; use its T dim.
+            pre_downsample_T = hidden_states.size(1)
+            output_lengths = torch.full(
+                (hidden_states.size(0),), pre_downsample_T,
+                dtype=torch.long, device=hidden_states.device,
+            )
+
+        # After temporal downsampling the frame count has been halved.
+        # Apply the same formula as Conv1d(kernel=3, stride=2, padding=1):
+        #   T_out = (T_in + 1) // 2  (ceiling division = ceil(T/2))
+        if self.temporal_downsampler is not None:
+            output_lengths = (output_lengths + 1) // 2
+
+        output_lengths = output_lengths.clamp(max=hidden_states.size(1))
+
         result = {
-            'logits_neural':       logits_neural,
-            'logits_constrained':  symbolic_out['log_probs'],
+            'logits_neural':         logits_neural,
+            'logits_constrained':    symbolic_out['log_probs'],
             'log_probs_constrained': symbolic_out['log_probs'],
-            'hidden_states':       hidden_states,
-            'beta':                symbolic_out['beta'],
-            'P_neural':            symbolic_out.get('P_neural'),
-            'P_constrained':       symbolic_out.get('P_constrained'),
-            'rule_shift':          symbolic_out.get('rule_shift'),
-            'logits_manner':       logits_manner,
-            'logits_place':        logits_place,
-            'logits_voice':        logits_voice,
+            'hidden_states':         hidden_states,
+            'beta':                  symbolic_out['beta'],
+            'P_neural':              symbolic_out.get('P_neural'),
+            'P_constrained':         symbolic_out.get('P_constrained'),
+            'rule_shift':            symbolic_out.get('rule_shift'),
+            'logits_manner':         logits_manner,
+            'logits_place':          logits_place,
+            'logits_voice':          logits_voice,
+            'output_lengths':        output_lengths,
         }
 
         if output_attentions and hubert_outputs.attentions is not None:

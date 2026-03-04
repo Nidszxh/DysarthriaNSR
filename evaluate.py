@@ -76,9 +76,10 @@ class BeamSearchDecoder:
     Significantly more accurate than greedy decoding for ambiguous sequences.
     """
     
-    def __init__(self, beam_width: int = 10, blank_id: int = 0):
-        self.beam_width = beam_width
-        self.blank_id = blank_id 
+    def __init__(self, beam_width: int = 10, blank_id: int = 0, length_norm_alpha: float = 0.0):
+        self.beam_width        = beam_width
+        self.blank_id          = blank_id
+        self.length_norm_alpha = length_norm_alpha   # 0.0 = no normalisation; 0.6 = standard
     def decode(
         self,
         log_probs: np.ndarray,
@@ -145,10 +146,16 @@ class BeamSearchDecoder:
                 reverse=True
             )[:self.beam_width])
         
-        # Get best hypothesis
+        # Get best hypothesis — apply length normalisation to avoid favouring
+        # short sequences (score / len^alpha).  alpha=0.0 → no normalisation.
+        def _norm_score(prefix: tuple, p_b: float, p_nb: float) -> float:
+            raw = np.logaddexp(p_b, p_nb)
+            length = max(len(prefix), 1)
+            return raw / (length ** self.length_norm_alpha)
+
         best_prefix, (p_b, p_nb) = max(
             beam.items(),
-            key=lambda x: np.logaddexp(x[1][0], x[1][1])
+            key=lambda x: _norm_score(x[0], x[1][0], x[1][1])
         )
         best_score = np.logaddexp(p_b, p_nb)
         
@@ -165,45 +172,73 @@ class BeamSearchDecoder:
 def greedy_decode(
     logits: torch.Tensor,
     phn_to_id: Dict[str, int],
-    id_to_phn: Dict[int, str]
+    id_to_phn: Dict[int, str],
+    output_lengths: Optional[torch.Tensor] = None,
 ) -> List[List[str]]:
     """
-    Greedy CTC decoding (baseline).
-    
+    Greedy CTC decoding with correct collapse and padding-frame masking.
+
+    CTC collapse rules applied in order per frame:
+      1. Blank token  → reset prev_id; skip frame.
+      2. PAD token    → reset prev_id; skip frame (same semantics as blank).
+      3. Repeat token → skip frame (consecutive duplicate).
+      4. Real token   → emit and update prev_id.
+
     Args:
-        logits: Model logits [batch, time, num_classes]
-        phn_to_id: Phoneme → ID mapping
-        id_to_phn: ID → Phoneme mapping
-    
+        logits:         Model output [batch, time, num_classes].
+                        May be raw logits or log-probs — argmax is identical.
+        phn_to_id:      Phoneme → ID mapping.
+        id_to_phn:      ID → Phoneme mapping.
+        output_lengths: Valid frame count per sample [batch].  When supplied,
+                        frames beyond output_lengths[i] are not decoded,
+                        preventing padding-frame noise from being emitted as
+                        spurious phoneme insertions.
+
     Returns:
-        List of phoneme sequences (one per batch sample)
+        List of phoneme sequences (one per batch sample).
     """
+    blank_id = phn_to_id.get('<BLANK>', 0)
+    pad_id   = phn_to_id.get('<PAD>',   1)
+
     predictions = []
-    pred_ids = torch.argmax(logits, dim=-1)
-    
-    for seq in pred_ids:
-        phonemes = []
-        prev_id = None
-        
+    pred_ids = torch.argmax(logits, dim=-1)  # [B, T]
+
+    for i, seq in enumerate(pred_ids):
+        # Truncate to valid (non-padded) frames only.
+        # Without this, zero-padded audio frames produce random non-blank
+        # predictions that inflate the insertion count dramatically.
+        if output_lengths is not None:
+            valid_len = int(output_lengths[i].item())
+            seq = seq[:valid_len]
+
+        phonemes: List[str] = []
+        prev_id: Optional[int] = None
+
         for phone_id in seq.cpu().numpy():
-            # Skip blanks and padding
-            if phone_id == phn_to_id.get('<BLANK>', 0):
+            phone_id = int(phone_id)
+
+            # Blank: separator in CTC — resets repeat-detector, emits nothing.
+            if phone_id == blank_id:
                 prev_id = None
                 continue
-            if phone_id == phn_to_id.get('<PAD>', 1):
+
+            # PAD: treat identically to blank (resets repeat-detector).
+            if phone_id == pad_id:
+                prev_id = None
                 continue
-            # Skip repetitions (CTC-style)
+
+            # Consecutive duplicate without an intervening blank → collapse.
             if phone_id == prev_id:
                 continue
-            
+
             phoneme = id_to_phn.get(phone_id, '<UNK>')
             phoneme = normalize_phoneme(phoneme)
-            if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
+            if phoneme not in ('<BLANK>', '<PAD>', '<UNK>'):
                 phonemes.append(phoneme)
             prev_id = phone_id
-        
+
         predictions.append(phonemes)
-    
+
     return predictions
 
 
@@ -333,26 +368,44 @@ def decode_predictions(
     phn_to_id: Dict[str, int],
     id_to_phn: Dict[int, str],
     use_beam_search: bool = False,
-    beam_width: int = 10
+    beam_width: int = 10,
+    output_lengths: Optional[torch.Tensor] = None,
 ) -> List[List[str]]:
     """
     Decode model logits into phoneme sequences.
+
+    Args:
+        log_probs:      Model output [batch, time, num_classes].
+        phn_to_id:      Phoneme → ID mapping.
+        id_to_phn:      ID → Phoneme mapping.
+        use_beam_search: If True use CTC beam search; otherwise greedy.
+        beam_width:     Beam width for beam search.
+        output_lengths: Valid frame count per sample [batch] (from model).
+                        Prevents padding-frame noise from becoming insertions.
     """
     if use_beam_search:
+        _alpha = getattr(getattr(config, 'training', None), 'beam_length_norm_alpha', 0.6)
         decoder = BeamSearchDecoder(
             beam_width=beam_width,
-            blank_id=phn_to_id['<BLANK>']
+            blank_id=phn_to_id['<BLANK>'],
+            length_norm_alpha=_alpha,
         )
         predictions = []
         for i in range(log_probs.size(0)):
+            # Truncate to valid frames before handing to beam search.
+            valid_len = (
+                int(output_lengths[i].item())
+                if output_lengths is not None
+                else log_probs.size(1)
+            )
             seq, _ = decoder.decode(
-                log_probs[i].cpu().numpy(),
+                log_probs[i, :valid_len].cpu().numpy(),
                 id_to_phn
             )
             predictions.append(seq)
         return predictions
     else:
-        return greedy_decode(log_probs, phn_to_id, id_to_phn)
+        return greedy_decode(log_probs, phn_to_id, id_to_phn, output_lengths=output_lengths)
 
 
 # ERROR ANALYSIS
@@ -717,7 +770,7 @@ def evaluate_model(
     
     # Initialize decoder
     if use_beam_search:
-        decoder = BeamSearchDecoder(beam_width=beam_width, blank_id=phn_to_id['<BLANK>'])
+        decoder = BeamSearchDecoder(beam_width=beam_width, blank_id=phn_to_id['<BLANK>'], length_norm_alpha=0.6)
         print(f"🔍 Using beam search decoder (width={beam_width})")
     else:
         print("🔍 Using greedy decoder")
@@ -791,22 +844,38 @@ def evaluate_model(
             # Decode predictions
             log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
             logits_neural = outputs.get('logits_neural')
-            
+            # output_lengths: valid CTC frame count per sample (audio-pad mask
+            # converted to frame space by the model).  Guards both greedy and
+            # beam decoders from emitting padding-frame noise as insertions.
+            output_lengths = outputs.get('output_lengths')
+
             if use_beam_search:
                 # Beam search (slower but more accurate)
                 predictions = []
                 for i in range(log_probs_constrained.size(0)):
+                    # Truncate to valid frames to exclude padding noise.
+                    valid_len = (
+                        int(output_lengths[i].item())
+                        if output_lengths is not None
+                        else log_probs_constrained.size(1)
+                    )
                     seq, score = decoder.decode(
-                        log_probs_constrained[i].cpu().numpy(),
+                        log_probs_constrained[i, :valid_len].cpu().numpy(),
                         id_to_phn
                     )
                     predictions.append(seq)
             else:
                 # Greedy decoding (fast)
-                predictions = greedy_decode(log_probs_constrained, phn_to_id, id_to_phn)
+                predictions = greedy_decode(
+                    log_probs_constrained, phn_to_id, id_to_phn,
+                    output_lengths=output_lengths,
+                )
 
             if logits_neural is not None:
-                predictions_neural = greedy_decode(logits_neural, phn_to_id, id_to_phn)
+                predictions_neural = greedy_decode(
+                    logits_neural, phn_to_id, id_to_phn,
+                    output_lengths=output_lengths,
+                )
                 all_predictions_neural.extend(predictions_neural)
             
             references = decode_references(labels, id_to_phn)
@@ -920,15 +989,13 @@ def evaluate_model(
         if len(dysarthric_per) > 1 and len(control_per) > 1 else (0.0, 1.0)
     )
 
-    # Holm-Bonferroni correction over the two p-values
+    # Holm-Bonferroni correction over the two p-values.
+    # C8: statsmodels is a hard dependency (requirements.txt); remove the
+    # silent Bonferroni fallback so a missing install surfaces immediately.
+    from statsmodels.stats.multitest import multipletests
     p_values_raw = [float(p_val_welch), float(p_val_wilcox)]
-    try:
-        from statsmodels.stats.multitest import multipletests
-        _, p_corrected, _, _ = multipletests(p_values_raw, alpha=0.05, method='holm')
-        p_corrected = [float(p) for p in p_corrected]
-    except ImportError:
-        # Fallback if statsmodels not installed: Bonferroni
-        p_corrected = [min(p * len(p_values_raw), 1.0) for p in p_values_raw]
+    _, p_corrected, _, _ = multipletests(p_values_raw, alpha=0.05, method='holm')
+    p_corrected = [float(p) for p in p_corrected]
 
     # Intelligibility correlation: per-speaker PER vs. severity score
     try:
