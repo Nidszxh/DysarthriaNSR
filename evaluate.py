@@ -682,11 +682,14 @@ def evaluate_model(
     results_dir: Path = None,
     symbolic_rules: Optional[Dict] = None,
     use_beam_search: bool = False,
-    beam_width: int = 10
+    beam_width: int = 10,
+    generate_explanations: bool = False,
+    compute_uncertainty: bool = False,
+    uncertainty_n_samples: int = 20,
 ) -> Dict:
     """
     Comprehensive model evaluation with statistical rigor.
-    
+
     Args:
         model: Trained model
         dataloader: Evaluation dataloader
@@ -697,7 +700,11 @@ def evaluate_model(
         symbolic_rules: Optional dysarthria substitution rules (reserved for analysis)
         use_beam_search: Use beam search decoder (default: False = greedy)
         beam_width: Beam width for beam search
-    
+        generate_explanations: Run explainability pipeline and save artifacts (default: False)
+        compute_uncertainty: Enable MC-Dropout uncertainty estimation via
+            UncertaintyAwareDecoder (default: False)
+        uncertainty_n_samples: Number of MC-Dropout forward passes (default: 20)
+
     Returns:
         Dictionary of evaluation metrics with confidence intervals
     """
@@ -722,7 +729,20 @@ def evaluate_model(
     all_speakers = []
     all_phoneme_lengths = []
     articulatory_results = {"manner": [], "place": [], "voice": []}
-    
+
+    # Uncertainty estimation (ROADMAP §9, UncertaintyAwareDecoder)
+    uncertainty_decoder = None
+    all_utterance_uncertainty: list = []
+    if compute_uncertainty:
+        try:
+            from src.models.uncertainty import UncertaintyAwareDecoder
+            uncertainty_decoder = UncertaintyAwareDecoder(
+                model, n_samples=uncertainty_n_samples
+            )
+            print(f"🎲 MC-Dropout uncertainty enabled ({uncertainty_n_samples} samples)")
+        except Exception as exc:
+            print(f"⚠️  UncertaintyAwareDecoder unavailable (non-fatal): {exc}")
+
     print("🔍 Running evaluation...")
     
     with torch.no_grad():
@@ -732,14 +752,42 @@ def evaluate_model(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels']
             
-            # Forward pass
-            severity = batch['status'].to(device)
+            # Forward pass — scale severity to [0, 5] to match training regime (bug fix S3)
+            speakers_batch = batch.get('speakers', [])
+            if speakers_batch and isinstance(speakers_batch[0], str):
+                from src.utils.config import get_speaker_severity
+                severity = torch.tensor(
+                    [get_speaker_severity(s) for s in speakers_batch],
+                    dtype=torch.float32, device=device
+                )
+            else:
+                severity = batch['status'].float().to(device) * 5.0  # 0/1 → 0.0/5.0
+
             outputs = model(
                 input_values=input_values,
                 attention_mask=attention_mask,
-                speaker_severity=severity
+                speaker_severity=severity,
+                output_attentions=generate_explanations,
             )
-            
+
+            # Per-utterance uncertainty (MC-Dropout, optional)
+            if uncertainty_decoder is not None:
+                try:
+                    with torch.enable_grad():
+                        unc_out = uncertainty_decoder.predict_with_uncertainty(
+                            input_values, attention_mask, severity
+                        )
+                    batch_unc = unc_out.get('utterance_uncertainty')
+                    if batch_unc is not None:
+                        if hasattr(batch_unc, 'cpu'):
+                            all_utterance_uncertainty.extend(
+                                batch_unc.cpu().tolist()
+                            )
+                        elif isinstance(batch_unc, (list, tuple)):
+                            all_utterance_uncertainty.extend(list(batch_unc))
+                except Exception:
+                    pass  # Non-fatal; uncertainty simply not recorded for this batch
+
             # Decode predictions
             log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
             logits_neural = outputs.get('logits_neural')
@@ -785,7 +833,21 @@ def evaluate_model(
     
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
-    mean_per, per_ci = compute_per_with_ci(per_scores)
+
+    # ── Macro-average PER over speakers (audit fix S4) ────────────────────────
+    # Group per-scores by speaker, compute per-speaker mean, then macro-average
+    speaker_per_raw = defaultdict(list)
+    speaker_status_map = {}
+    for i, spk in enumerate(all_speakers):
+        speaker_per_raw[spk].append(per_scores[i])
+        speaker_status_map[spk] = int(all_status[i])
+
+    per_by_speaker = {spk: float(np.mean(v)) for spk, v in speaker_per_raw.items()}
+    macro_per_scores = list(per_by_speaker.values())
+    mean_per, per_ci = compute_per_with_ci(macro_per_scores)
+
+    # Also report sample-level mean (for consistency with prior results)
+    sample_mean_per, _ = compute_per_with_ci(per_scores)
 
     neural_per_scores = []
     if all_predictions_neural:
@@ -793,56 +855,44 @@ def evaluate_model(
             compute_per(p, r) for p, r in zip(all_predictions_neural, all_references)
         ]
     mean_per_neural = float(np.mean(neural_per_scores)) if neural_per_scores else None
-    
-    # Stratified by dysarthric status
+
+    # Stratified by dysarthric status (sample-level for clinical reporting)
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
-    control_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
-    
+    control_per    = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
+
     dysarthric_mean, dysarthric_ci = compute_per_with_ci(dysarthric_per)
-    control_mean, control_ci = compute_per_with_ci(control_per)
-    
+    control_mean, control_ci       = compute_per_with_ci(control_per)
+
+    # Speaker-macro stratification
+    dysarthric_spk_per = [v for spk, v in per_by_speaker.items() if speaker_status_map.get(spk) == 1]
+    control_spk_per    = [v for spk, v in per_by_speaker.items() if speaker_status_map.get(spk) == 0]
+
     # Stratified by phoneme length
     stratified_by_length = stratify_by_phoneme_length(
         per_scores, all_phoneme_lengths, all_status
     )
-    
-    # Per-speaker analysis
-    speaker_per = defaultdict(list)
-    for i, speaker in enumerate(all_speakers):
-        speaker_per[speaker].append(per_scores[i])
-    
+
+    # Per-speaker metrics
     speaker_metrics = {}
-    for spk, scores in speaker_per.items():
-        mean, ci = compute_per_with_ci(scores)
+    for spk, scores in speaker_per_raw.items():
+        s_mean, s_ci = compute_per_with_ci(scores)
         speaker_metrics[spk] = {
-            'per': mean,
-            'ci': ci,
+            'per': s_mean,
+            'ci': s_ci,
             'std': float(np.std(scores)),
-            'n_samples': len(scores)
+            'n_samples': len(scores),
+            'status': speaker_status_map.get(spk, -1),
         }
-    
+
     # Phoneme-level error analysis
     print("📊 Analyzing phoneme-level errors...")
     error_analysis = analyze_phoneme_errors(all_predictions, all_references)
-    
+
     # Generate visualizations
     print("📈 Generating visualizations...")
-    
-    plot_confusion_matrix(
-        error_analysis['confusion_matrix'],
-        results_dir / 'confusion_matrix.png'
-    )
-    
-    plot_per_by_length(
-        stratified_by_length,
-        results_dir / 'per_by_length.png'
-    )
-
-    plot_clinical_gap(
-        dysarthric_mean,
-        control_mean,
-        results_dir / 'clinical_gap.png'
-    )
+    plot_confusion_matrix(error_analysis['confusion_matrix'], results_dir / 'confusion_matrix.png')
+    plot_per_by_length(stratified_by_length, results_dir / 'per_by_length.png')
+    plot_clinical_gap(dysarthric_mean, control_mean, results_dir / 'clinical_gap.png')
 
     rule_stats = None
     if hasattr(model, 'get_rule_statistics'):
@@ -857,42 +907,133 @@ def evaluate_model(
                 ]
         plot_rule_impact(rule_stats, results_dir / 'rule_impact.png')
 
-    t_stat, p_val = stats.ttest_ind(dysarthric_per, control_per, equal_var=False) if dysarthric_per and control_per else (0.0, 1.0)
-    
+    # ── Statistical tests (audit Phase 6 / ROADMAP §8) ───────────────────────
+    # Welch t-test dysarthric vs. control (sample-level)
+    t_stat, p_val_welch = (
+        stats.ttest_ind(dysarthric_per, control_per, equal_var=False)
+        if dysarthric_per and control_per else (0.0, 1.0)
+    )
+
+    # Wilcoxon rank-sum test (more robust for non-normal small samples)
+    wilcox_stat, p_val_wilcox = (
+        stats.mannwhitneyu(dysarthric_per, control_per, alternative='two-sided')
+        if len(dysarthric_per) > 1 and len(control_per) > 1 else (0.0, 1.0)
+    )
+
+    # Holm-Bonferroni correction over the two p-values
+    p_values_raw = [float(p_val_welch), float(p_val_wilcox)]
+    try:
+        from statsmodels.stats.multitest import multipletests
+        _, p_corrected, _, _ = multipletests(p_values_raw, alpha=0.05, method='holm')
+        p_corrected = [float(p) for p in p_corrected]
+    except ImportError:
+        # Fallback if statsmodels not installed: Bonferroni
+        p_corrected = [min(p * len(p_values_raw), 1.0) for p in p_values_raw]
+
+    # Intelligibility correlation: per-speaker PER vs. severity score
+    try:
+        from src.utils.config import get_speaker_severity
+        sev_scores = [get_speaker_severity(spk) for spk in per_by_speaker]
+        per_scores_spk = [per_by_speaker[spk] for spk in per_by_speaker]
+        if len(sev_scores) > 2:
+            pearson_r, pearson_p = stats.pearsonr(sev_scores, per_scores_spk)
+            spearman_r, spearman_p = stats.spearmanr(sev_scores, per_scores_spk)
+        else:
+            pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
+    except Exception:
+        pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
+
+    # ── Explainability module (ROADMAP §6, audit Phase 5) ─────────────────────
+    if generate_explanations:
+        try:
+            from src.explainability import (
+                PhonemeAttributor, ExplainableOutputFormatter,
+                ArticulatoryConfusionAnalyzer,
+            )
+            attributor = PhonemeAttributor()
+            formatter  = ExplainableOutputFormatter()
+            art_analyzer = ArticulatoryConfusionAnalyzer()
+
+            for i, (pred_seq, ref_seq) in enumerate(zip(all_predictions, all_references)):
+                errors = attributor.alignment_attribution(pred_seq, ref_seq)
+
+                # Accumulate articulatory confusions
+                subs = [
+                    (e['expected_phoneme'], e['predicted_phoneme'])
+                    for e in errors if e['type'] == 'substitution'
+                    and e['expected_phoneme'] and e['predicted_phoneme']
+                ]
+                art_analyzer.accumulate_from_errors(subs)
+
+                utt_per = compute_per(pred_seq, ref_seq)
+                spk_id = all_speakers[i] if i < len(all_speakers) else None
+                sev_val = float(get_speaker_severity(spk_id)) if spk_id else None
+
+                explanation = formatter.format_utterance(
+                    utterance_id=f"utt_{i:04d}",
+                    ground_truth=' '.join(ref_seq),
+                    prediction=' '.join(pred_seq),
+                    errors=errors,
+                    symbolic_rules_summary=rule_stats or {},
+                    wer=utt_per,  # Bug B10 fix: was hardcoded 0.0; PER is the available proxy
+                    per=utt_per,
+                    speaker_id=spk_id,
+                    severity=sev_val,
+                )
+                formatter.add(explanation)
+
+            formatter.save_explanations(results_dir)
+            art_analyzer.plot_feature_confusion(results_dir / 'articulatory_confusion.png')
+            print("✅ Explainability artifacts generated")
+        except Exception as exc:
+            print(f"⚠️  Explainability module failed (non-fatal): {exc}")
+
     # Compile results
     results = {
+        'avg_per': float(mean_per),  # macro-avg (primary metric)
         'overall': {
-            'per': mean_per,
-            'ci': per_ci,
-            'std': float(np.std(per_scores)),
-            'n_samples': len(per_scores)
+            'per_macro_speaker': mean_per,
+            'per_sample_mean':   float(sample_mean_per),
+            'ci':                per_ci,
+            'std':               float(np.std(per_scores)),
+            'n_samples':         len(per_scores),
+            'n_speakers':        len(per_by_speaker),
         },
         'symbolic_impact': {
-            'per_neural': mean_per_neural,
+            'per_neural':     mean_per_neural,
             'per_constrained': mean_per,
-            'delta_per': (mean_per_neural - mean_per) if mean_per_neural is not None else None
+            'delta_per':      (mean_per_neural - mean_per) if mean_per_neural is not None else None,
         },
         'articulatory_accuracy': {
             key: float(np.mean(vals)) if vals else 0.0
             for key, vals in articulatory_results.items()
         },
         'stats': {
-            't_statistic': float(t_stat),
-            'p_value': float(p_val),
-            'significant': bool(p_val < 0.05)
+            'welch_t':        float(t_stat),
+            'welch_p':        float(p_val_welch),
+            'wilcox_u':       float(wilcox_stat),
+            'wilcox_p':       float(p_val_wilcox),
+            'p_holm_corrected': p_corrected,
+            'significant':    bool(p_corrected[0] < 0.05 or p_corrected[1] < 0.05),
+            'pearson_r_sev_per':   float(pearson_r),
+            'pearson_p_sev_per':   float(pearson_p),
+            'spearman_r_sev_per':  float(spearman_r),
+            'spearman_p_sev_per':  float(spearman_p),
         },
         'rule_impact': rule_stats,
         'stratified': {
             'dysarthric': {
-                'per': dysarthric_mean,
-                'ci': dysarthric_ci,
-                'n': len(dysarthric_per)
+                'per_sample':   dysarthric_mean,
+                'per_speaker':  float(np.mean(dysarthric_spk_per)) if dysarthric_spk_per else 0.0,
+                'ci':  dysarthric_ci,
+                'n':   len(dysarthric_per),
             },
             'control': {
-                'per': control_mean,
+                'per_sample':  control_mean,
+                'per_speaker': float(np.mean(control_spk_per)) if control_spk_per else 0.0,
                 'ci': control_ci,
-                'n': len(control_per)
-            }
+                'n':  len(control_per),
+            },
         },
         'by_length': stratified_by_length,
         'per_speaker': speaker_metrics,
@@ -902,31 +1043,47 @@ def evaluate_model(
                 (list(pair), count)
                 for pair, count in error_analysis['common_confusions']
             ],
-            'deletion_phonemes': error_analysis['deletion_phonemes'],
-            'insertion_phonemes': error_analysis['insertion_phonemes']
-        }
+            'deletion_phonemes':  error_analysis['deletion_phonemes'],
+            'insertion_phonemes': error_analysis['insertion_phonemes'],
+        },
+        'uncertainty': {
+            'computed': compute_uncertainty and len(all_utterance_uncertainty) > 0,
+            'n_samples': uncertainty_n_samples if compute_uncertainty else None,
+            'mean_utterance_entropy': (
+                float(np.mean(all_utterance_uncertainty))
+                if all_utterance_uncertainty else None
+            ),
+            'per_utterance': all_utterance_uncertainty if all_utterance_uncertainty else [],
+        },
     }
-    
+
     # Save results to JSON
     with open(results_dir / 'evaluation_results.json', 'w') as f:
         json.dump(results, f, indent=2)
-    
+
     print(f"\n✅ Results saved to {results_dir}")
-    
+
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "="*65)
     print("📊 EVALUATION SUMMARY")
-    print("="*60)
-    print(f"Overall PER:      {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
-    print(f"Dysarthric PER:   {dysarthric_mean:.3f} (95% CI: [{dysarthric_ci[0]:.3f}, {dysarthric_ci[1]:.3f}]) (n={len(dysarthric_per)})")
-    print(f"Control PER:      {control_mean:.3f} (95% CI: [{control_ci[0]:.3f}, {control_ci[1]:.3f}]) (n={len(control_per)})")
+    print("="*65)
+    print(f"Overall PER  (macro-speaker): {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
+    print(f"Overall PER  (sample-mean):   {sample_mean_per:.3f}")
+    print(f"Dysarthric   (sample-mean):   {dysarthric_mean:.3f} (n={len(dysarthric_per)})")
+    print(f"Control      (sample-mean):   {control_mean:.3f} (n={len(control_per)})")
+    print(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f})")
+    print(f"Wilcoxon p (dys vs ctrl):     {p_val_wilcox:.4f} (Holm-corr: {p_corrected[1]:.4f})")
     print(f"\nError Breakdown:")
     print(f"  Correct:        {error_analysis['error_counts']['correct']}")
     print(f"  Substitutions:  {error_analysis['error_counts']['substitutions']}")
     print(f"  Deletions:      {error_analysis['error_counts']['deletions']}")
     print(f"  Insertions:     {error_analysis['error_counts']['insertions']}")
-    print("="*60)
-    
+    ins = error_analysis['error_counts']['insertions']
+    dels = error_analysis['error_counts']['deletions']
+    ratio_str = f"{ins/max(dels,1):.1f}×" if dels > 0 else "N/A"
+    print(f"  I/D ratio:      {ratio_str}  (target: <3×)")
+    print("="*65)
+
     return results
 
 

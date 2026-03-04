@@ -230,7 +230,10 @@ def main():
 
         hf_path = bundle.get("hf_path", "")
         session_id = Path(hf_path).parent.name if hf_path else "unknown"
-        speaker_id = meta.get("speaker_id", path.name.split('_')[0])
+        # Local filenames are written as unknown_{hash}_{SPEAKER}_{session}_{mic}_{n}.wav
+        # because the HuggingFace dataset has no speaker_id field.  The actual TORGO
+        # speaker ID (e.g. "FC02") is therefore at split position [2], not [0].
+        speaker_id = meta.get("speaker_id", path.name.split('_')[2])
 
         rows.append({
             "sample_id": f"{speaker_id}_{session_id}_{Path(hf_path).name}" if hf_path else path.name,

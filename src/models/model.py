@@ -1,14 +1,18 @@
 """
 Neuro-Symbolic ASR Model for Dysarthric Speech Recognition
 
-Combines HuBERT encoder (self-supervised neural representations) with symbolic
-phoneme constraints for robust and explainable dysarthric speech recognition.
+Architecture upgrades (February 2026 research audit):
+  - LearnableConstraintMatrix: End-to-end learnable C with KL-anchor to symbolic prior
+  - SeverityAdapter: Cross-attention adapter conditioning on continuous severity score
+  - output_attentions forwarding: Route HuBERT attention maps for explainability
 
-Architecture:
-    1. HuBERT Encoder: Pretrained SSL model (95M params, 12 transformer layers)
-    2. Phoneme Classifier: 768→512→num_phonemes projection
-    3. Symbolic Constraint Layer: Articulatory-based phoneme similarity matrix
-    4. Constraint Aggregation: Learnable neural-symbolic fusion (β parameter)
+Components:
+    1. ArticulatoryFeatureEncoder  — Encodes phonemes into articulatory feature vectors
+    2. LearnableConstraintMatrix   — Parameterized constraint matrix (Proposal P2)
+    3. SymbolicConstraintLayer     — Fusion layer: P_final = β·(P_n@C) + (1-β)·P_n
+    4. SeverityAdapter             — Cross-attention severity conditioning (Proposal P3)
+    5. PhonemeClassifier           — 768→512→|V| phoneme prediction head
+    6. NeuroSymbolicASR            — Full model combining all components
 """
 
 from collections import defaultdict
@@ -23,452 +27,491 @@ from transformers import HubertModel
 try:
     from src.utils.config import ModelConfig, SymbolicConfig, normalize_phoneme
 except ImportError:
-    # Handle imports when called from different locations
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from utils.config import ModelConfig, SymbolicConfig, normalize_phoneme
 
+try:
+    from src.explainability.rule_tracker import SymbolicRuleTracker
+except ImportError:
+    SymbolicRuleTracker = None  # type: ignore
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Articulatory Feature Encoder  (unchanged — forms the symbolic prior)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ArticulatoryFeatureEncoder:
     """
     Encodes phonemes into articulatory feature vectors for symbolic reasoning.
-    
+
     Features based on phonetic theory:
     - Manner of articulation: How airflow is obstructed (stop, fricative, nasal, etc.)
-    - Place of articulation: Where obstruction occurs (bilabial, alveolar, velar, etc.)
-    - Voicing: Vocal fold vibration (voiced vs voiceless)
-    
-    These features are preserved in dysarthric substitutions more than random phoneme
-    changes, enabling principled constraint matrices.
+    - Place of articulation:  Where obstruction occurs (bilabial, alveolar, velar, etc.)
+    - Voicing:                Vocal fold vibration (voiced vs voiceless)
     """
-    
+
     PHONEME_FEATURES = {
         # STOPS
-        'P': {'manner': 'stop', 'place': 'bilabial', 'voice': 'voiceless'},
-        'B': {'manner': 'stop', 'place': 'bilabial', 'voice': 'voiced'},
-        'T': {'manner': 'stop', 'place': 'alveolar', 'voice': 'voiceless'},
-        'D': {'manner': 'stop', 'place': 'alveolar', 'voice': 'voiced'},
-        'K': {'manner': 'stop', 'place': 'velar', 'voice': 'voiceless'},
-        'G': {'manner': 'stop', 'place': 'velar', 'voice': 'voiced'},
-        
+        'P':  {'manner': 'stop', 'place': 'bilabial',      'voice': 'voiceless'},
+        'B':  {'manner': 'stop', 'place': 'bilabial',      'voice': 'voiced'},
+        'T':  {'manner': 'stop', 'place': 'alveolar',      'voice': 'voiceless'},
+        'D':  {'manner': 'stop', 'place': 'alveolar',      'voice': 'voiced'},
+        'K':  {'manner': 'stop', 'place': 'velar',         'voice': 'voiceless'},
+        'G':  {'manner': 'stop', 'place': 'velar',         'voice': 'voiced'},
         # FRICATIVES
-        'F': {'manner': 'fricative', 'place': 'labiodental', 'voice': 'voiceless'},
-        'V': {'manner': 'fricative', 'place': 'labiodental', 'voice': 'voiced'},
-        'TH': {'manner': 'fricative', 'place': 'dental', 'voice': 'voiceless'},
-        'DH': {'manner': 'fricative', 'place': 'dental', 'voice': 'voiced'},
-        'S': {'manner': 'fricative', 'place': 'alveolar', 'voice': 'voiceless'},
-        'Z': {'manner': 'fricative', 'place': 'alveolar', 'voice': 'voiced'},
+        'F':  {'manner': 'fricative', 'place': 'labiodental',  'voice': 'voiceless'},
+        'V':  {'manner': 'fricative', 'place': 'labiodental',  'voice': 'voiced'},
+        'TH': {'manner': 'fricative', 'place': 'dental',       'voice': 'voiceless'},
+        'DH': {'manner': 'fricative', 'place': 'dental',       'voice': 'voiced'},
+        'S':  {'manner': 'fricative', 'place': 'alveolar',     'voice': 'voiceless'},
+        'Z':  {'manner': 'fricative', 'place': 'alveolar',     'voice': 'voiced'},
         'SH': {'manner': 'fricative', 'place': 'postalveolar', 'voice': 'voiceless'},
         'ZH': {'manner': 'fricative', 'place': 'postalveolar', 'voice': 'voiced'},
-        'HH': {'manner': 'fricative', 'place': 'glottal', 'voice': 'voiceless'},
-        
+        'HH': {'manner': 'fricative', 'place': 'glottal',      'voice': 'voiceless'},
         # AFFRICATES
         'CH': {'manner': 'affricate', 'place': 'postalveolar', 'voice': 'voiceless'},
         'JH': {'manner': 'affricate', 'place': 'postalveolar', 'voice': 'voiced'},
-        
         # NASALS
-        'M': {'manner': 'nasal', 'place': 'bilabial', 'voice': 'voiced'},
-        'N': {'manner': 'nasal', 'place': 'alveolar', 'voice': 'voiced'},
-        'NG': {'manner': 'nasal', 'place': 'velar', 'voice': 'voiced'},
-        
+        'M':  {'manner': 'nasal', 'place': 'bilabial', 'voice': 'voiced'},
+        'N':  {'manner': 'nasal', 'place': 'alveolar', 'voice': 'voiced'},
+        'NG': {'manner': 'nasal', 'place': 'velar',    'voice': 'voiced'},
         # LIQUIDS
-        'L': {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
-        'R': {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
-        
+        'L':  {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
+        'R':  {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
         # GLIDES
-        'W': {'manner': 'glide', 'place': 'labio-velar', 'voice': 'voiced'},
-        'Y': {'manner': 'glide', 'place': 'palatal', 'voice': 'voiced'},
-        
-        # VOWELS (Monophthongs)
-        'IY': {'manner': 'vowel', 'place': 'front', 'voice': 'voiced', 'height': 'high'},
-        'IH': {'manner': 'vowel', 'place': 'front', 'voice': 'voiced', 'height': 'high'},
-        'EH': {'manner': 'vowel', 'place': 'front', 'voice': 'voiced', 'height': 'mid'},
-        'EY': {'manner': 'vowel', 'place': 'front', 'voice': 'voiced', 'height': 'mid'},
-        'AE': {'manner': 'vowel', 'place': 'front', 'voice': 'voiced', 'height': 'low'},
-        'AA': {'manner': 'vowel', 'place': 'back', 'voice': 'voiced', 'height': 'low'},
-        'AO': {'manner': 'vowel', 'place': 'back', 'voice': 'voiced', 'height': 'mid'},
-        'OW': {'manner': 'vowel', 'place': 'back', 'voice': 'voiced', 'height': 'mid'},
-        'UH': {'manner': 'vowel', 'place': 'back', 'voice': 'voiced', 'height': 'high'},
-        'UW': {'manner': 'vowel', 'place': 'back', 'voice': 'voiced', 'height': 'high'},
+        'W':  {'manner': 'glide', 'place': 'labio-velar', 'voice': 'voiced'},
+        'Y':  {'manner': 'glide', 'place': 'palatal',     'voice': 'voiced'},
+        # VOWELS
+        'IY': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'high'},
+        'IH': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'high'},
+        'EH': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'mid'},
+        'EY': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'mid'},
+        'AE': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'low'},
+        'AA': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'low'},
+        'AO': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'mid'},
+        'OW': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'mid'},
+        'UH': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'high'},
+        'UW': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'high'},
         'AH': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
         'ER': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
         'AX': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
-        
         # DIPHTHONGS
         'AY': {'manner': 'diphthong', 'place': 'front', 'voice': 'voiced'},
-        'AW': {'manner': 'diphthong', 'place': 'back', 'voice': 'voiced'},
-        'OY': {'manner': 'diphthong', 'place': 'back', 'voice': 'voiced'},
+        'AW': {'manner': 'diphthong', 'place': 'back',  'voice': 'voiced'},
+        'OY': {'manner': 'diphthong', 'place': 'back',  'voice': 'voiced'},
     }
-    
+
     @classmethod
     def compute_distance(
-        cls, 
-        ph1: str, 
-        ph2: str, 
+        cls,
+        ph1: str,
+        ph2: str,
         weights: Dict[str, float],
-        decay_factor: float = 3.0
+        decay_factor: float = 3.0,
     ) -> float:
         """
         Compute articulatory similarity between two phonemes.
-        
-        Uses weighted Euclidean distance in articulatory feature space,
-        then converts to similarity via exponential decay.
-        
-        Args:
-            ph1: First phoneme symbol (stress-normalized)
-            ph2: Second phoneme symbol (stress-normalized)
-            weights: Feature weights dict with 'manner', 'place', 'voice' keys
-            decay_factor: Exponential decay rate (higher = sharper falloff)
-        
-        Returns:
-            Similarity score in [0, 1], where:
-                - 1.0 = identical phonemes
-                - 0.5 = same manner, different place/voice
-                - <0.1 = articulatorily dissimilar
-        
-        Formula:
-            distance = sqrt(Σ w_i * (f1_i ≠ f2_i)^2)
-            similarity = exp(-decay_factor * distance)
+
+        distance   = sqrt(Σ w_i * (f1_i ≠ f2_i)^2)
+        similarity = exp(-decay_factor * distance)
+
+        Returns similarity in [0, 1].
         """
         if ph1 not in cls.PHONEME_FEATURES or ph2 not in cls.PHONEME_FEATURES:
-            # Unknown phonemes should not contribute strong similarity.
             return 0.0
-        
+
         f1, f2 = cls.PHONEME_FEATURES[ph1], cls.PHONEME_FEATURES[ph2]
-        
-        # Categorical distance (0 if same, 1 if different)
         manner_dist = 0.0 if f1['manner'] == f2['manner'] else 1.0
-        place_dist = 0.0 if f1['place'] == f2['place'] else 1.0
-        voice_dist = 0.0 if f1['voice'] == f2['voice'] else 1.0
-        
-        # Weighted Euclidean distance
+        place_dist  = 0.0 if f1['place']  == f2['place']  else 1.0
+        voice_dist  = 0.0 if f1['voice']  == f2['voice']  else 1.0
+
         total_dist = np.sqrt(
             weights['manner'] ** 2 * manner_dist +
-            weights['place'] ** 2 * place_dist +
-            weights['voice'] ** 2 * voice_dist
+            weights['place']  ** 2 * place_dist  +
+            weights['voice']  ** 2 * voice_dist
         )
-        
-        # Convert distance to similarity (exponential decay)
-        similarity = np.exp(-decay_factor * total_dist)
-        return float(similarity)
+        return float(np.exp(-decay_factor * total_dist))
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Learnable Constraint Matrix (Proposal P2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LearnableConstraintMatrix(nn.Module):
+    """
+    End-to-end Learnable Phoneme Constraint Matrix (Audit Proposal P2).
+
+    Initialised from the articulatory symbolic prior C_static, then updated
+    jointly with the rest of the model. A KL-anchor loss (SymbolicKLLoss) keeps
+    the learned matrix near the prior, preventing arbitrary drift.
+
+    Row i of C represents the distribution over target phonemes given source
+    phoneme i — analogous to a soft confusion matrix that the model can refine.
+
+    The matrix is kept row-stochastic via softmax parameterisation:
+        C[i] = softmax(logit_C[i])
+
+    Args:
+        num_phonemes: Vocabulary size |V|
+        init_matrix:  Static prior C [|V|, |V|], row-normalised probabilities
+    """
+
+    def __init__(self, num_phonemes: int, init_matrix: torch.Tensor):
+        super().__init__()
+        # Initialise as log of prior (+ ε for numerical safety)
+        log_init = init_matrix.clamp(1e-8).log()
+        self.logit_C = nn.Parameter(log_init)
+
+    @property
+    def C(self) -> torch.Tensor:
+        """Row-stochastic constraint matrix [|V|, |V|]."""
+        return F.softmax(self.logit_C, dim=-1)
+
+    def forward(self, P_neural: torch.Tensor) -> torch.Tensor:
+        """
+        Apply constraint: P_constrained = P_neural @ C
+
+        Args:
+            P_neural: [B, T, |V|] probabilities
+
+        Returns:
+            [B, T, |V|] constrained probabilities (row-normalised)
+        """
+        P_c = torch.matmul(P_neural, self.C)
+        return P_c / P_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Symbolic Constraint Layer  (refactored to use LearnableConstraintMatrix)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SymbolicConstraintLayer(nn.Module):
     """
-    Neuro-symbolic layer applying dysarthric phoneme confusion rules.
-    
-    This layer fuses neural predictions with symbolic knowledge via a
-    constraint matrix C that encodes:
-    1. Explicit dysarthric substitution rules (from clinical literature)
-    2. Articulatory similarity (for phoneme pairs without explicit rules)
-    
-    The fusion is controlled by learnable weight β:
-        P_final = β * P_constrained + (1-β) * P_neural
-    where β adapts based on speaker severity.
-    
-    Attributes:
-        constraint_matrix: [num_phonemes, num_phonemes] similarity matrix
-        beta: Learnable fusion weight (initialized to config value)
-        rule_activations: List tracking which rules fired (if tracking enabled)
+    Neuro-symbolic fusion layer applying dysarthric phoneme confusion rules.
+
+    Fusion formula:
+        P_final = β · P_constrained + (1-β) · P_neural
+    where β adapts to speaker severity (continuous [0, 5]) and is learnable.
+
+    Supports both:
+      - Static constraint matrix (original behaviour)
+      - Learnable constraint matrix (Proposal P2)
     """
-    
+
     def __init__(
-        self, 
+        self,
         num_phonemes: int,
         phn_to_id: Dict[str, int],
         id_to_phn: Dict[int, str],
         symbolic_config: SymbolicConfig,
-        constraint_weight: float = 0.3,
-        learnable: bool = True
+        constraint_weight: float = 0.05,
+        learnable: bool = True,
+        use_learnable_matrix: bool = True,
     ):
         super().__init__()
         self.num_phonemes = num_phonemes
         self.phn_to_id = phn_to_id
         self.id_to_phn = id_to_phn
         self.config = symbolic_config
-        
+        self.use_learnable_matrix = use_learnable_matrix
+
         # Learnable fusion weight β
         if learnable:
             self.beta = nn.Parameter(torch.tensor(constraint_weight))
         else:
             self.register_buffer('beta', torch.tensor(constraint_weight))
-        
-        # Build constraint matrix C[i,j] = similarity/substitution probability
-        self.register_buffer('constraint_matrix', self._build_constraint_matrix())
-        
+
+        # Build static prior matrix (always stored as reference)
+        static_C = self._build_static_matrix()
+        self.register_buffer('static_constraint_matrix', static_C)
+
+        # Learnable wrapper (Proposal P2) or static buffer
+        if use_learnable_matrix:
+            self.learnable_matrix = LearnableConstraintMatrix(num_phonemes, static_C)
+        else:
+            self.learnable_matrix = None
+
         # Rule activation tracking (for explainability)
         self.rule_activations = [] if symbolic_config.track_rule_activations else None
-    
-    def _build_constraint_matrix(self) -> torch.Tensor:
-        """
-        Build symbolic constraint matrix C.
-        
-        Matrix construction:
-            C[i, i] = 1.0 (identity - correct phoneme)
-            C[i, j] = substitution_rules[(i,j)] if rule exists
-            C[i, j] = articulatory_distance(i,j) otherwise
-        
-        Returns:
-            Constraint matrix of shape [num_phonemes, num_phonemes]
-        """
+
+        # SymbolicRuleTracker: structured logging API used by explainability module
+        # (ROADMAP §6.2 — log_rule_activation called from _track_activations)
+        self.rule_tracker = None
+        if symbolic_config.track_rule_activations and SymbolicRuleTracker is not None:
+            self.rule_tracker = SymbolicRuleTracker(
+                min_confidence=symbolic_config.min_rule_confidence
+            )
+
+    def _build_static_matrix(self) -> torch.Tensor:
+        """Build the symbolic prior constraint matrix from articulatory knowledge."""
         C = torch.eye(self.num_phonemes)
         special_tokens = {'<BLANK>', '<PAD>', '<UNK>'}
-        
-        # Articulatory distance weights
         weights = {
             'manner': self.config.manner_weight,
-            'place': self.config.place_weight,
-            'voice': self.config.voice_weight
+            'place':  self.config.place_weight,
+            'voice':  self.config.voice_weight,
         }
-        
+
         for i in range(self.num_phonemes):
             for j in range(self.num_phonemes):
                 if i == j:
                     continue
-                
-                ph_i = self.id_to_phn.get(i, '<UNK>')
-                ph_j = self.id_to_phn.get(j, '<UNK>')
-                
-                # Normalize to stress-agnostic form
-                ph_i_clean = normalize_phoneme(ph_i)
-                ph_j_clean = normalize_phoneme(ph_j)
+                ph_i = normalize_phoneme(self.id_to_phn.get(i, '<UNK>'))
+                ph_j = normalize_phoneme(self.id_to_phn.get(j, '<UNK>'))
 
-                # Keep special tokens isolated (no cross-token leakage)
-                if ph_i_clean in special_tokens or ph_j_clean in special_tokens:
-                    C[i, j] = 1.0 if i == j else 0.0
+                if ph_i in special_tokens or ph_j in special_tokens:
+                    C[i, j] = 0.0
                     continue
-                
-                # Check for explicit substitution rule
-                if (ph_i_clean, ph_j_clean) in self.config.substitution_rules:
-                    C[i, j] = self.config.substitution_rules[(ph_i_clean, ph_j_clean)]
-                else:
-                    # Use articulatory similarity
-                    similarity = ArticulatoryFeatureEncoder.compute_distance(
-                        ph_i_clean, 
-                        ph_j_clean, 
-                        weights,
-                        decay_factor=self.config.distance_decay_factor
-                    )
-                    C[i, j] = similarity
-        
-        # Row-normalize to keep a valid distribution per source phoneme
-        row_sums = C.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        C = C / row_sums
 
-        return C
-    
+                if (ph_i, ph_j) in self.config.substitution_rules:
+                    C[i, j] = self.config.substitution_rules[(ph_i, ph_j)]
+                else:
+                    C[i, j] = ArticulatoryFeatureEncoder.compute_distance(
+                        ph_i, ph_j, weights,
+                        decay_factor=self.config.distance_decay_factor,
+                    )
+
+        row_sums = C.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return C / row_sums
+
     def forward(
-        self, 
+        self,
         logits: torch.Tensor,
-        speaker_severity: Optional[torch.Tensor] = None
+        speaker_severity: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Apply symbolic constraints to neural phoneme predictions.
-        
+
         Args:
-            logits: Neural logits [batch, time, num_phonemes]
-            speaker_severity: Speaker severity scores (0-5) [batch] (optional)
-        
+            logits:          Neural logits [B, T, |V|]
+            speaker_severity: Continuous severity [B] in [0, 5]
+
         Returns:
-            Dictionary containing:
-                - logits: Constrained logits [batch, time, num_phonemes]
-                - beta: Current constraint weight (scalar or [batch, 1, 1])
-                - P_neural: Neural predictions (probabilities)
-                - P_constrained: Constrained predictions (probabilities)
-                - rule_activations: List of activated rules (if tracking enabled)
-        
-        Forward Pass Logic:
-            1. Convert logits to probabilities: P_neural = softmax(logits)
-            2. Apply constraints: P_constrained = C @ P_neural
-            3. Adaptive fusion: P_final = β(severity) * P_c + (1-β) * P_n
-            4. Convert back to logits for loss computation
+            Dict with log_probs, beta, P_neural, P_constrained, rule_shift
         """
-        # Neural predictions
-        P_neural = F.softmax(logits, dim=-1)  # [batch, time, num_phonemes]
-        
-        # Apply symbolic constraints via matrix multiplication
-        # P_constrained[b,t,j] = Σ_i P_neural[b,t,i] * C[i,j]
-        P_constrained = torch.matmul(P_neural, self.constraint_matrix)
-        P_constrained = P_constrained / P_constrained.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        
-        # Adaptive fusion based on speaker severity (if provided)
+        P_neural = F.softmax(logits, dim=-1)
+
+        # Apply constraint matrix (learnable or static)
+        if self.use_learnable_matrix and self.learnable_matrix is not None:
+            P_constrained = self.learnable_matrix(P_neural)
+        else:
+            P_constrained = torch.matmul(P_neural, self.static_constraint_matrix)
+            P_constrained = P_constrained / P_constrained.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        # Adaptive β based on severity
         if speaker_severity is not None:
             beta_adaptive = self._compute_adaptive_beta(speaker_severity)
         else:
             beta_adaptive = self.beta
-        
+
         # Weighted fusion
         P_final = beta_adaptive * P_constrained + (1 - beta_adaptive) * P_neural
         P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        
-        # Track rule activations (for explainability)
+
+        # Track rule activations (inference only)
         shift_metric = None
-        if self.rule_activations is not None:
-            shift_metric = self._track_activations(P_neural, P_final, beta_adaptive)
-        
-        # Convert back to logits for loss computation
-        log_probs_constrained = torch.log(P_final + 1e-12)
-        
+        if self.rule_activations is not None and not self.training:
+            beta_scalar = (
+                float(beta_adaptive.mean().item())
+                if isinstance(beta_adaptive, torch.Tensor)
+                else float(beta_adaptive)
+            )
+            shift_metric = self._track_activations(P_neural, P_final, beta_value=beta_scalar)
+
+        log_probs = torch.log(P_final + 1e-12)
+
         return {
-            'log_probs': log_probs_constrained,
-            'beta': beta_adaptive.mean() if speaker_severity is not None else self.beta,
+            'log_probs': log_probs,
+            'beta': beta_adaptive.mean() if isinstance(beta_adaptive, torch.Tensor) and beta_adaptive.numel() > 1 else self.beta,
             'P_neural': P_neural,
             'P_constrained': P_constrained,
             'rule_shift': shift_metric,
         }
-    
-    def _compute_adaptive_beta(
-        self, 
-        speaker_severity: torch.Tensor
-    ) -> torch.Tensor:
+
+    def _compute_adaptive_beta(self, speaker_severity: torch.Tensor) -> torch.Tensor:
         """
-        Compute adaptive constraint weight based on speaker severity.
-        
-        Hypothesis: Higher dysarthria severity benefits more from symbolic
-        constraints (articulatory patterns preserved even in severe impairment).
-        
-        Formula:
-            β_adaptive = β_base + 0.1 * (severity / 5.0)
-            Clamped to [0.0, 0.8] to prevent over-reliance on rules
+        β_adaptive = clamp(β_base + slope * severity/5.0, 0.0, 0.8)
+        Higher severity → heavier reliance on symbolic constraints.
         """
-        # Normalize severity to [0, 1]
-        severity_normalized = speaker_severity.float() / 5.0
-        
-        # Adaptive adjustment: higher severity → higher β
-        beta_adaptive = self.beta + 0.1 * severity_normalized
-        
-        # Clamp to prevent extreme values
-        beta_adaptive = torch.clamp(beta_adaptive, 0.0, 0.8)
-        
-        return beta_adaptive.view(-1, 1, 1)  # [batch, 1, 1] for broadcasting
-    
+        sev_norm = speaker_severity.float() / 5.0
+        beta_adaptive = self.beta + self.config.severity_beta_slope * sev_norm
+        return torch.clamp(beta_adaptive, 0.0, 0.8).view(-1, 1, 1)
+
     def _track_activations(
         self,
         P_neural: torch.Tensor,
         P_final: torch.Tensor,
-        beta: torch.Tensor
+        beta_value: float = 0.5,
     ) -> Optional[torch.Tensor]:
-        """
-        Track which symbolic rules were activated during forward pass.
-        
-        A rule is "activated" when the constrained prediction differs
-        significantly from the neural prediction.
-        
-        Args:
-            P_neural: Neural probabilities [batch, time, num_phonemes]
-            P_final: Final probabilities [batch, time, num_phonemes]
-            beta: Fusion weight [batch, 1, 1] or scalar
-        
-        Stores:
-            rule_activations: List of dicts with:
-                - shift: Mean probability shift per frame
-                - neural_pred: Neural top-1 phoneme (subset)
-                - final_pred: Final top-1 phoneme (subset)
-                - top_influence: Top constraint target from C[neural_pred]
-        """
-        if self.rule_activations is None or self.training:
+        """Track probability shifts and log to SymbolicRuleTracker for explainability."""
+        if self.rule_activations is None:
             return None
 
         shift = (P_final - P_neural).abs().sum(dim=-1).mean().detach()
 
         if len(self.rule_activations) < 10000:
-            self.rule_activations.append({'shift': float(shift.item())})
+            neural_preds = torch.argmax(P_neural, dim=-1)
+            final_preds = torch.argmax(P_final, dim=-1)
+            changed = (neural_preds != final_preds)
 
-        neural_preds = torch.argmax(P_neural, dim=-1)
-        final_preds = torch.argmax(P_final, dim=-1)
-        changed = neural_preds != final_preds
-        if changed.any() and len(self.rule_activations) < 10000:
-            indices = torch.nonzero(changed, as_tuple=False)
-            max_samples = 100
-            for b, t in indices[:max_samples].tolist():
-                neural_id = int(neural_preds[b, t].item())
-                final_id = int(final_preds[b, t].item())
-                top_j = int(torch.argmax(self.constraint_matrix[neural_id]).item())
-                self.rule_activations.append({
-                    'neural_pred': self.id_to_phn.get(neural_id, '<UNK>'),
-                    'final_pred': self.id_to_phn.get(final_id, '<UNK>'),
-                    'top_influence': self.id_to_phn.get(top_j, '<UNK>')
-                })
+            if changed.any():
+                indices = torch.nonzero(changed, as_tuple=False)
+                for b, t in indices[:100].tolist():
+                    n_id = int(neural_preds[b, t].item())
+                    f_id = int(final_preds[b, t].item())
+                    n_phn = self.id_to_phn.get(n_id, '<UNK>')
+                    f_phn = self.id_to_phn.get(f_id, '<UNK>')
+                    rule_id = f"{n_phn}->{f_phn}"
+
+                    # Log to SymbolicRuleTracker (ROADMAP §6.2)
+                    if self.rule_tracker is not None:
+                        self.rule_tracker.log_rule_activation(
+                            rule_id=rule_id,
+                            input_phoneme=n_phn,
+                            output_phoneme=f_phn,
+                            confidence=beta_value,
+                        )
+
+                    self.rule_activations.append({
+                        'neural_pred': n_phn,
+                        'final_pred':  f_phn,
+                        'shift': float(shift.item()),
+                    })
 
         return shift
-    
-    def get_rule_statistics(self) -> Dict[str, any]:
+
+    def get_rule_statistics(self) -> Dict:
+        """Return rule activation statistics from the SymbolicRuleTracker.
+
+        Prefers the structured SymbolicRuleTracker output; falls back to the
+        legacy list-based statistics when the tracker is unavailable.
         """
-        Get statistics about rule activations for analysis.
-        
-        Returns:
-            Dictionary with:
-                - total_activations: Total number of rule firings
-                - unique_rules: Set of unique (neural→final) substitutions
-                - top_rules: Most frequent substitution patterns
-                - avg_beta: Average β value when rules fired
-        """
-        if self.rule_activations is None or len(self.rule_activations) == 0:
-            return {
-                'total_activations': 0,
-                'unique_rules': set(),
-                'top_rules': [],
-                'avg_beta': 0.0
-            }
-        
-        shifts = [entry.get('shift') for entry in self.rule_activations if 'shift' in entry]
+        # Prefer structured tracker output (ROADMAP §6.2)
+        if self.rule_tracker is not None:
+            return self.rule_tracker.generate_explanation()
 
-        substitutions = defaultdict(int)
-        for activation in self.rule_activations:
-            if 'neural_pred' in activation and 'final_pred' in activation:
-                key = (activation['neural_pred'], activation['final_pred'])
-                substitutions[key] += 1
+        # Legacy fallback: use self.rule_activations list
+        if not self.rule_activations:
+            return {'total_activations': 0, 'unique_rules': set(), 'top_rules': [], 'avg_shift': 0.0}
 
-        top_rules = sorted(substitutions.items(), key=lambda x: x[1], reverse=True)[:10]
-
+        from collections import Counter
+        subs = Counter(
+            (a['neural_pred'], a['final_pred'])
+            for a in self.rule_activations
+            if 'neural_pred' in a
+        )
+        shifts = [a.get('shift', 0.0) for a in self.rule_activations if 'shift' in a]
         return {
             'total_activations': len(self.rule_activations),
-            'unique_rules': set(substitutions.keys()),
-            'top_rules': top_rules,
-            'avg_beta': 0.0,
-            'avg_shift': float(np.mean(shifts)) if shifts else 0.0
+            'unique_rules': set(subs.keys()),
+            'top_rules': subs.most_common(10),
+            'avg_shift': float(np.mean(shifts)) if shifts else 0.0,
         }
-    
+
     def clear_activations(self) -> None:
-        """Clear rule activation history (call between epochs)."""
         if self.rule_activations is not None:
             self.rule_activations = []
+        if self.rule_tracker is not None:
+            self.rule_tracker.clear()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Severity Adapter (Proposal P3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SeverityAdapter(nn.Module):
+    """
+    Cross-Attention Severity Adapter (Audit Proposal P3).
+
+    Injects a continuous severity signal into HuBERT hidden states via
+    cross-attention, replacing the coarse scalar β adjustment.
+
+    Architecture:
+        1. Project severity scalar → context vector:  Linear(1,64) → SiLU → Linear(64,768)
+        2. Cross-attention: Q = hidden_states, K = V = severity_context [B, 1, 768]
+        3. Residual + LayerNorm
+
+    This allows the model to selectively amplify or suppress dysarthria-relevant
+    features in a severity-conditioned, spatially-aware manner.
+
+    Args:
+        hidden_dim:    HuBERT hidden dimension (default 768)
+        adapter_dim:   Bottleneck dimension for severity projection (default 64)
+        n_heads:       Number of attention heads (default 8)
+        dropout:       Attention dropout probability
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 768,
+        adapter_dim: int = 64,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        # Severity → context vector
+        self.severity_proj = nn.Sequential(
+            nn.Linear(1, adapter_dim),
+            nn.SiLU(),
+            nn.Linear(adapter_dim, hidden_dim),
+        )
+        # Cross-attention: hidden states attend to severity context
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        severity: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, T, 768] HuBERT encoder output
+            severity:      [B] continuous severity in [0, 5]
+
+        Returns:
+            Adapted hidden states [B, T, 768]
+        """
+        # [B, 1, 768] severity context
+        sev_ctx = self.severity_proj(severity.float().view(-1, 1, 1))
+
+        # Cross-attention: hidden_states as query, severity_ctx as key/value
+        attn_out, _ = self.cross_attn(hidden_states, sev_ctx, sev_ctx)
+        attn_out = self.dropout(attn_out)
+
+        return self.layer_norm(hidden_states + attn_out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phoneme Classifier Head (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class PhonemeClassifier(nn.Module):
     """
-    Phoneme prediction head for frame-level classification.
-    
-    Architecture: 768 → 512 → num_phonemes
-        - Projection layer reduces HuBERT dimension
-        - LayerNorm for training stability
-        - GELU activation (smooth, non-saturating)
-        - Dropout for regularization
-        - Linear classifier to phoneme vocabulary
+    Phoneme prediction head: 768 → LayerNorm → GELU → Dropout → 512 → |V|
     """
-    
+
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.config = config
-        
-        # Multi-layer classifier
-        self.projection = nn.Linear(768, config.hidden_dim)  # HuBERT hidden = 768
-        self.layer_norm = nn.LayerNorm(config.hidden_dim)
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(config.classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_dim, config.num_phonemes)
-    
-    def forward(self, hidden_states: torch.Tensor, return_features: bool = False):
-        """
-        Forward pass through phoneme classifier.
-        
-        Args:
-            hidden_states: HuBERT hidden states [batch, time, 768]
-        
-        Returns:
-            Phoneme logits [batch, time, num_phonemes]
-        """
+        self.projection  = nn.Linear(768, config.hidden_dim)
+        self.layer_norm  = nn.LayerNorm(config.hidden_dim)
+        self.activation  = nn.GELU()
+        self.dropout     = nn.Dropout(config.classifier_dropout)
+        self.classifier  = nn.Linear(config.hidden_dim, config.num_phonemes)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        return_features: bool = False,
+    ):
         x = self.projection(hidden_states)
         x = self.layer_norm(x)
         x = self.activation(x)
@@ -479,30 +522,32 @@ class PhonemeClassifier(nn.Module):
         return logits
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Full NeuroSymbolicASR Model
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class NeuroSymbolicASR(nn.Module):
     """
-    Complete Neuro-Symbolic ASR model combining:
-    1. HuBERT encoder (self-supervised neural representations)
-    2. Phoneme classifier (neural prediction head)
-    3. Symbolic constraint layer (symbolic reasoning)
-    
-    This architecture enables:
-    - Robust phoneme recognition via SSL pretraining
-    - Explainable predictions via articulatory constraints
-    - Adaptive fusion based on dysarthria severity
-    
-    Training Strategy:
-    - Freeze encoder initially (warmup epochs)
-    - Unfreeze upper layers progressively
-    - Multi-task learning: CTC + frame-level CE
-    
+    Complete Neuro-Symbolic ASR model (February 2026 research audit revision).
+
+    Forward flow:
+        Waveform
+          → HuBERT encoder  [B, T, 768]
+          → SeverityAdapter (optional, Proposal P3)  [B, T, 768]
+          → PhonemeClassifier  [B, T, |V|]   (logits_neural)
+          → SymbolicConstraintLayer  [B, T, |V|]  (log_probs_constrained)
+          → Loss computation (CTC + CE + Art + Ordinal + BlankKL + SymbolicKL)
+
     Args:
-        model_config: Neural architecture configuration
+        model_config:   Architecture configuration
         symbolic_config: Symbolic reasoning configuration
-        phn_to_id: Phoneme → ID mapping
-        id_to_phn: ID → Phoneme reverse mapping
+        phn_to_id:      Phoneme → ID mapping
+        id_to_phn:      ID → Phoneme reverse mapping
+        manner_to_id:   Manner class vocabulary (for auxiliary head)
+        place_to_id:    Place class vocabulary
+        voice_to_id:    Voice class vocabulary
     """
-    
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -511,253 +556,247 @@ class NeuroSymbolicASR(nn.Module):
         id_to_phn: Dict[int, str],
         manner_to_id: Optional[Dict[str, int]] = None,
         place_to_id: Optional[Dict[str, int]] = None,
-        voice_to_id: Optional[Dict[str, int]] = None
+        voice_to_id: Optional[Dict[str, int]] = None,
     ):
         super().__init__()
         self.model_config = model_config
         self.symbolic_config = symbolic_config
-        
-        # Update num_phonemes from vocabulary
         model_config.num_phonemes = len(phn_to_id)
-        
-        # HuBERT Encoder
+
+        # ── HuBERT Encoder ────────────────────────────────────────────────────
         print(f"🧠 Loading HuBERT: {model_config.hubert_model_id}")
-        self.hubert = HubertModel.from_pretrained(model_config.hubert_model_id)
-        
-        # Enable gradient checkpointing (reduces activation memory by ~40%)
+        self.hubert = HubertModel.from_pretrained(
+            model_config.hubert_model_id,
+            attn_implementation="eager",  # SDPA does not support output_attentions=True
+        )
+
         try:
             self.hubert.gradient_checkpointing_enable()
             print("   ✅ Gradient checkpointing enabled")
         except Exception:
-            # Fallback for older transformers versions
             if hasattr(self.hubert, "config"):
                 setattr(self.hubert.config, "gradient_checkpointing", True)
                 print("   ✅ Gradient checkpointing enabled (legacy mode)")
-        
-        # Configure frozen layers
+
         self._configure_frozen_layers()
-        
-        # Phoneme Classifier Head
+
+        # ── Severity Adapter (Proposal P3) ───────────────────────────────────
+        self.severity_adapter: Optional[SeverityAdapter] = None
+        if model_config.use_severity_adapter:
+            self.severity_adapter = SeverityAdapter(
+                hidden_dim=768,
+                adapter_dim=model_config.severity_adapter_dim,
+            )
+            print("   ✅ SeverityAdapter enabled (cross-attention, continuous severity)")
+
+        # ── Phoneme Classifier ────────────────────────────────────────────────
         self.phoneme_classifier = PhonemeClassifier(model_config)
 
-        self.manner_head = None
-        self.place_head = None
-        self.voice_head = None
+        # ── Articulatory Auxiliary Heads ──────────────────────────────────────
+        self.manner_head = self.place_head = self.voice_head = None
         if manner_to_id and place_to_id and voice_to_id:
             self.manner_head = nn.Linear(model_config.hidden_dim, len(manner_to_id))
-            self.place_head = nn.Linear(model_config.hidden_dim, len(place_to_id))
-            self.voice_head = nn.Linear(model_config.hidden_dim, len(voice_to_id))
-        
-        # Symbolic Constraint Layer
+            self.place_head  = nn.Linear(model_config.hidden_dim, len(place_to_id))
+            self.voice_head  = nn.Linear(model_config.hidden_dim, len(voice_to_id))
+            print("   ✅ Articulatory auxiliary heads enabled (manner/place/voice)")
+
+        # ── Symbolic Constraint Layer ─────────────────────────────────────────
         self.symbolic_layer = SymbolicConstraintLayer(
             num_phonemes=model_config.num_phonemes,
             phn_to_id=phn_to_id,
             id_to_phn=id_to_phn,
             symbolic_config=symbolic_config,
             constraint_weight=model_config.constraint_weight_init,
-            learnable=model_config.constraint_learnable
+            learnable=model_config.constraint_learnable,
+            use_learnable_matrix=model_config.use_learnable_constraint,
         )
-        
-        trainable_params = self.count_parameters()
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"✅ Model initialized:")
-        print(f"   Total parameters: {total_params:,}")
-        print(f"   Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-    
+        if model_config.use_learnable_constraint:
+            print("   ✅ LearnableConstraintMatrix enabled (Proposal P2)")
+
+        # Summary
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"✅ NeuroSymbolicASR ready: {total:,} total / {trainable:,} trainable params "
+              f"({trainable / total * 100:.1f}%)")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Layer freezing
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _configure_frozen_layers(self) -> None:
-        """
-        Configure which HuBERT layers to freeze.
-        
-        Freezing Strategy:
-        - Feature extractor (CNN): Always frozen (low-level acoustics)
-        - Encoder layers 0-7: Frozen initially (generic phonetics)
-        - Encoder layers 8-11: Trainable (dysarthria-specific adaptation)
-        
-        Rationale:
-            Lower layers learn universal acoustic features (formants, VOT, etc.)
-            that are shared across typical and dysarthric speech. Upper layers
-            need to adapt to dysarthric substitution patterns.
-        """
-        # Freeze feature extractor (CNN layers)
         if self.model_config.freeze_feature_extractor:
             for param in self.hubert.feature_extractor.parameters():
                 param.requires_grad = False
-            print(f"   🧊 Froze feature extractor (CNN layers)")
-        
-        # Freeze specific encoder layers
-        for layer_idx in self.model_config.freeze_encoder_layers:
-            for param in self.hubert.encoder.layers[layer_idx].parameters():
+            print("   🧊 Froze feature extractor (CNN)")
+
+        for idx in self.model_config.freeze_encoder_layers:
+            for param in self.hubert.encoder.layers[idx].parameters():
                 param.requires_grad = False
-        
         if self.model_config.freeze_encoder_layers:
             print(f"   🧊 Froze encoder layers {self.model_config.freeze_encoder_layers}")
-    
-    def count_parameters(self) -> int:
-        
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-    def forward(
-        self,
-        input_values: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        speaker_severity: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass through neuro-symbolic architecture.
-        
-        Forward Flow:
-            Waveform → HuBERT → Phoneme Classifier → Symbolic Constraints → Logits
-        """
-        # HuBERT encoding
-        hubert_outputs = self.hubert(
-            input_values,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )
-        
-        # Extract hidden states from last layer
-        hidden_states = hubert_outputs.last_hidden_state  # [batch, time, 768]
-        
-        # Phoneme prediction (neural)
-        logits_neural, shared_features = self.phoneme_classifier(hidden_states, return_features=True)
 
-        logits_manner = None
-        logits_place = None
-        logits_voice = None
-        if self.manner_head is not None:
-            logits_manner = self.manner_head(shared_features)
-            logits_place = self.place_head(shared_features)
-            logits_voice = self.voice_head(shared_features)
-        
-        # Apply symbolic constraints
-        symbolic_outputs = self.symbolic_layer(
-            logits_neural,
-            speaker_severity=speaker_severity
-        )
-        
-        return {
-            'logits_neural': logits_neural,
-            'logits_constrained': symbolic_outputs['log_probs'],
-            'log_probs_constrained': symbolic_outputs['log_probs'],
-            'hidden_states': hidden_states,
-            'beta': symbolic_outputs['beta'],
-            'P_neural': symbolic_outputs.get('P_neural'),
-            'P_constrained': symbolic_outputs.get('P_constrained'),
-            'rule_shift': symbolic_outputs.get('rule_shift'),
-            'logits_manner': logits_manner,
-            'logits_place': logits_place,
-            'logits_voice': logits_voice,
-        }
-    
+    def _unfreeze_all_hubert(self) -> None:
+        for param in self.hubert.parameters():
+            param.requires_grad = True
+
     def freeze_encoder(self) -> None:
-        """Freeze entire HuBERT encoder for warmup training."""
         for param in self.hubert.parameters():
             param.requires_grad = False
         print("🧊 Froze entire HuBERT encoder")
-    
+
     def unfreeze_encoder(self, layers: Optional[List[int]] = None) -> None:
-        """
-        Unfreeze specific encoder layers for progressive fine-tuning.
-        
-        Args:
-            layers: List of layer indices to unfreeze, or None for all layers
-        """
         if layers is None:
-            # Unfreeze all encoder layers
             for param in self.hubert.encoder.parameters():
                 param.requires_grad = True
             print("🔥 Unfroze all encoder layers")
         else:
-            # Unfreeze specific layers
-            for layer_idx in layers:
-                for param in self.hubert.encoder.layers[layer_idx].parameters():
+            for idx in layers:
+                for param in self.hubert.encoder.layers[idx].parameters():
                     param.requires_grad = True
             print(f"🔥 Unfroze encoder layers {layers}")
-    
-    def _unfreeze_all_hubert(self) -> None:
-        """Helper to unfreeze the full HuBERT stack before reapplying freezes."""
-        for param in self.hubert.parameters():
-            param.requires_grad = True
-    
+
     def unfreeze_after_warmup(self) -> None:
-        """
-        Unfreeze encoder after warmup while keeping configured frozen layers.
-        
-        This implements progressive unfreezing:
-        1. Unfreeze all HuBERT layers
-        2. Re-apply configured freezes (feature extractor + specified layers)
-        
-        Effect: Unfreezes upper encoder layers while keeping lower layers frozen.
-        """
+        """Progressive unfreezing: re-enables upper layers after warmup epochs."""
         self._unfreeze_all_hubert()
         self._configure_frozen_layers()
         print("🔥 Unfroze HuBERT encoder (keeping configured frozen layers)")
-    
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Forward pass
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        input_values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        speaker_severity: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Full neuro-symbolic forward pass.
+
+        Args:
+            input_values:     Raw waveform [B, T_audio]
+            attention_mask:   Valid-frame mask [B, T_audio]
+            speaker_severity: Continuous severity [B] in [0, 5]
+            output_attentions: If True, return HuBERT attention weights for
+                               explainability (ROADMAP §6.1 Method 2)
+
+        Returns:
+            Dict with logits_neural, logits_constrained, log_probs_constrained,
+            hidden_states, beta, P_neural, P_constrained, rule_shift,
+            logits_manner/place/voice, attention_weights (if requested)
+        """
+        # ── HuBERT encoding ───────────────────────────────────────────────────
+        hubert_outputs = self.hubert(
+            input_values,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
+        hidden_states = hubert_outputs.last_hidden_state  # [B, T, 768]
+
+        # ── Severity Adapter (Proposal P3) ────────────────────────────────────
+        if self.severity_adapter is not None and speaker_severity is not None:
+            hidden_states = self.severity_adapter(hidden_states, speaker_severity)
+
+        # ── Phoneme Classifier ────────────────────────────────────────────────
+        logits_neural, shared_features = self.phoneme_classifier(
+            hidden_states, return_features=True
+        )
+
+        # ── Articulatory Auxiliary Heads ──────────────────────────────────────
+        logits_manner = self.manner_head(shared_features) if self.manner_head else None
+        logits_place  = self.place_head(shared_features)  if self.place_head  else None
+        logits_voice  = self.voice_head(shared_features)  if self.voice_head  else None
+
+        # ── Symbolic Constraint Layer ─────────────────────────────────────────
+        symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)
+
+        result = {
+            'logits_neural':       logits_neural,
+            'logits_constrained':  symbolic_out['log_probs'],
+            'log_probs_constrained': symbolic_out['log_probs'],
+            'hidden_states':       hidden_states,
+            'beta':                symbolic_out['beta'],
+            'P_neural':            symbolic_out.get('P_neural'),
+            'P_constrained':       symbolic_out.get('P_constrained'),
+            'rule_shift':          symbolic_out.get('rule_shift'),
+            'logits_manner':       logits_manner,
+            'logits_place':        logits_place,
+            'logits_voice':        logits_voice,
+        }
+
+        if output_attentions and hubert_outputs.attentions is not None:
+            result['attention_weights'] = hubert_outputs.attentions
+
+        return result
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_constraint_matrix(self) -> torch.Tensor:
+        """Return the current constraint matrix (learned or static)."""
+        if self.symbolic_layer.use_learnable_matrix and self.symbolic_layer.learnable_matrix is not None:
+            return self.symbolic_layer.learnable_matrix.C.detach()
+        return self.symbolic_layer.static_constraint_matrix
+
     def get_rule_statistics(self) -> Dict:
-        """Get symbolic layer rule activation statistics."""
         return self.symbolic_layer.get_rule_statistics()
-    
+
     def clear_rule_activations(self) -> None:
-        """Clear symbolic layer rule activation history."""
         self.symbolic_layer.clear_activations()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module self-test
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def main() -> None:
-    """Test model module."""
+    """Quick forward-pass smoke test."""
+    import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from utils.config import get_default_config
-    
+
     config = get_default_config()
-    
-    # Mock vocabulary
-    phn_to_id = {'<BLANK>': 0, '<PAD>': 1, '<UNK>': 2, 'P': 3, 'B': 4, 'T': 5, 'D': 6}
+    phn_to_id = {'<BLANK>': 0, '<PAD>': 1, '<UNK>': 2, 'P': 3, 'B': 4, 'T': 5}
     id_to_phn = {v: k for k, v in phn_to_id.items()}
-    
-    print("\nTesting NeuroSymbolicASR Model")
-    
+
     model = NeuroSymbolicASR(
         model_config=config.model,
         symbolic_config=config.symbolic,
         phn_to_id=phn_to_id,
-        id_to_phn=id_to_phn
+        id_to_phn=id_to_phn,
     )
-    
-    # Test forward pass
-    batch_size, seq_len = 2, 16000
-    dummy_input = torch.randn(batch_size, seq_len)
-    dummy_mask = torch.ones(batch_size, seq_len)
-    dummy_severity = torch.tensor([0.0, 5.0])  # Control vs severe
-    
-    print("\nRunning forward pass...")
+
+    batch_size = 2
+    dummy_input    = torch.randn(batch_size, 16000)
+    dummy_mask     = torch.ones(batch_size, 16000)
+    dummy_severity = torch.tensor([0.0, 4.9])  # Control vs severe
+
+    print("\n🔎 Running forward pass …")
     with torch.no_grad():
-        outputs = model(
-            dummy_input, 
-            attention_mask=dummy_mask,
-            speaker_severity=dummy_severity
-        )
-    
-    print(f"\n✅ Forward pass successful!")
-    print(f"   Logits (neural) shape: {outputs['logits_neural'].shape}")
-    print(f"   Logits (constrained) shape: {outputs['logits_constrained'].shape}")
-    print(f"   Hidden states shape: {outputs['hidden_states'].shape}")
-    
-    beta_val = outputs['beta']
-    if isinstance(beta_val, torch.Tensor):
-        if beta_val.numel() > 1:
-            print(f"   Beta (per sample): {beta_val.squeeze().tolist()}")
-        else:
-            print(f"   Beta: {beta_val.item():.3f}")
+        out = model(dummy_input, attention_mask=dummy_mask,
+                    speaker_severity=dummy_severity, output_attentions=True)
+
+    print(f"   ✅ logits_neural:     {out['logits_neural'].shape}")
+    print(f"   ✅ logits_constrained:{out['logits_constrained'].shape}")
+    print(f"   ✅ hidden_states:     {out['hidden_states'].shape}")
+    att = out.get('attention_weights')
+    if att and att[0] is not None:
+        print(f"   ✅ attention_weights: {len(att)} layers × {att[0].shape}")
+    beta_val = out['beta']
+    if isinstance(beta_val, torch.Tensor) and beta_val.numel() > 1:
+        print(f"   ✅ beta (per sample): {beta_val.squeeze().tolist()}")
     else:
-        print(f"   Beta: {beta_val:.3f}")
-    
-    # Test rule statistics
-    print("\nRule activation statistics:")
-    stats = model.get_rule_statistics()
-    print(f"   Total activations: {stats['total_activations']}")
-    print(f"   Unique rules: {len(stats['unique_rules'])}")
-    print(f"   Average beta: {stats['avg_beta']:.3f}")
+        print(f"   ✅ beta: {float(beta_val):.3f}")
+
 
 if __name__ == "__main__":
     main()

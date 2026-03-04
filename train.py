@@ -24,10 +24,11 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 project_root = Path(__file__).resolve().parent
 sys.path.insert(2, str(project_root / "src"))
 
-from src.utils.config import Config, get_default_config, get_project_root
+from src.utils.config import Config, get_default_config, get_project_root, get_speaker_severity
 from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
 import os
 from src.models.model import NeuroSymbolicASR
+from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss
 
 # Import evaluate functions from root level
 from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
@@ -159,8 +160,18 @@ class DysarthriaASRLightning(pl.LightningModule):
                 ignore_index=-100,
                 label_smoothing=self.config.training.label_smoothing
             )
-        
-        # Register loss weights as buffers
+
+        # --- Phase 2: New research-grade loss functions (audit proposals P1, P2, R3) ---
+        blank_id = self.phn_to_id.get('<BLANK>', 0)
+        self.ordinal_loss = OrdinalContrastiveLoss(margin_per_level=0.3)
+        self.blank_kl_loss = BlankPriorKLLoss(
+            blank_id=blank_id,
+            target_prob=self.config.training.blank_target_prob,
+        )
+        # SymbolicKLLoss is initialised lazily on first use (needs static matrix from model)
+        self._symbolic_kl_loss: Optional[SymbolicKLLoss] = None
+
+        # Register core loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
         self.register_buffer('lambda_ce', torch.tensor(self.config.training.lambda_ce))
         self.register_buffer('lambda_articulatory', torch.tensor(self.config.training.lambda_articulatory))
@@ -182,20 +193,28 @@ class DysarthriaASRLightning(pl.LightningModule):
     def forward(self, batch: Dict) -> Dict:
         """
         Forward pass through model.
-        
-        Args:
-            batch: Batch dictionary
-            
-        Returns:
-            Model outputs
+
+        Converts binary speaker status (0/1) to continuous severity [0, 5] using the
+        TORGO_SEVERITY_MAP for known speakers, falling back to status*5.0 for others.
         """
-        # Use 'status' from the batch (0 for control, 1 for dysarthric)
-        # Scale to 0-5 severity range for adaptive beta computation
-        severity = batch['status'].float() * 5.0
+        speakers = batch.get('speakers', [])
+        status   = batch['status']
+
+        # Use per-speaker severity scores when speaker IDs are available
+        if speakers and isinstance(speakers[0], str):
+            severity = torch.tensor(
+                [get_speaker_severity(s) for s in speakers],
+                dtype=torch.float32,
+                device=status.device,
+            )
+        else:
+            # Fallback: binary mapping 0→0.0, 1→5.0
+            severity = status.float() * 5.0
+
         return self.model(
             input_values=batch['input_values'],
             attention_mask=batch['attention_mask'],
-            speaker_severity=severity
+            speaker_severity=severity,
         )
     
     def compute_loss(
@@ -204,32 +223,30 @@ class DysarthriaASRLightning(pl.LightningModule):
         labels: torch.Tensor,
         input_lengths: torch.Tensor,
         label_lengths: torch.Tensor,
-        articulatory_labels: Optional[Dict[str, torch.Tensor]] = None
+        articulatory_labels: Optional[Dict[str, torch.Tensor]] = None,
+        severity: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute multi-task loss (simplified to CTC + CE).
-        
-        Args:
-            outputs: Model outputs
-            labels: Ground truth phoneme labels
-            input_lengths: Lengths of input sequences
-            label_lengths: Lengths of label sequences
-            
-        Returns:
-            Dictionary with individual and total losses
+        Multi-task loss: CTC + frame-CE + articulatory + ordinal contrastive +
+        blank-prior KL + symbolic KL anchor.
         """
+        ablation = self.config.training.ablation_mode
+
         log_probs_constrained = outputs['logits_constrained']
-        
-        # 1. CTC Loss (primary alignment loss)
+
+        # 1. CTC Loss (primary alignment loss — always)
         loss_ctc = self._compute_ctc_loss(
             log_probs_constrained, labels, input_lengths, label_lengths
         )
-        
-        # 2. Cross-Entropy Loss (auxiliary frame-level supervision)
-        loss_ce = self._compute_ce_loss(log_probs_constrained, labels)
-        
+
+        # 2. Frame-level CE applied to NEURAL logits (not constrained log-probs)
+        #    Fixes the original misaligned-label gradient pathology (audit S2)
+        loss_ce = self._compute_ce_loss(outputs.get('logits_neural', log_probs_constrained), labels)
+
+        # 3. Articulatory auxiliary heads
         loss_art = None
-        if articulatory_labels and outputs.get('logits_manner') is not None:
+        if ablation not in ("neural_only", "no_art_heads") and articulatory_labels and outputs.get('logits_manner') is not None:
             art_losses = []
             for key in ["manner", "place", "voice"]:
                 logits = outputs.get(f"logits_{key}")
@@ -240,16 +257,55 @@ class DysarthriaASRLightning(pl.LightningModule):
             if art_losses:
                 loss_art = torch.stack(art_losses).mean()
 
-        # Total weighted loss
-        total_loss = self.lambda_ctc * loss_ctc + self.lambda_ce * loss_ce
+        # 4. Blank-prior KL (insertion fix)
+        loss_blank_kl = self.blank_kl_loss(log_probs_constrained, attention_mask)
+
+        # 5. Ordinal contrastive severity loss (Proposal P1)
+        loss_ordinal = None
+        hidden = outputs.get('hidden_states')
+        if hidden is not None and severity is not None and ablation != 'symbolic_only':
+            loss_ordinal = self.ordinal_loss(hidden, severity, attention_mask)
+
+        # 6. Symbolic KL anchor (Proposal P2 — learnable constraint matrix)
+        loss_symbolic_kl = None
+        if self.config.model.use_learnable_constraint and ablation not in ('neural_only', 'symbolic_only'):
+            sl = self.model.symbolic_layer
+            if sl.learnable_matrix is not None:
+                if self._symbolic_kl_loss is None:
+                    static_C = sl.static_constraint_matrix
+                    self._symbolic_kl_loss = SymbolicKLLoss(static_C).to(self.device)
+                loss_symbolic_kl = self._symbolic_kl_loss(sl.learnable_matrix.logit_C)
+
+        # ── Ablation-mode weighting ──────────────────────────────────────────
+        lambda_ctc  = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ctc)
+        lambda_ce   = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ce)
+        lambda_art  = float(self.lambda_articulatory)
+        lambda_ord  = self.config.training.lambda_ordinal
+        lambda_bkl  = self.config.training.lambda_blank_kl
+        lambda_skl  = self.config.training.lambda_symbolic_kl
+
+        total_loss = lambda_ctc * loss_ctc + lambda_ce * loss_ce
         if loss_art is not None:
-            total_loss = total_loss + self.lambda_articulatory * loss_art
-        
+            total_loss = total_loss + lambda_art * loss_art
+        total_loss = total_loss + lambda_bkl * loss_blank_kl
+        if loss_ordinal is not None:
+            total_loss = total_loss + lambda_ord * loss_ordinal
+        if loss_symbolic_kl is not None:
+            total_loss = total_loss + lambda_skl * loss_symbolic_kl
+
+        # Monitor blank probability for insertion tracking (no gradient)
+        with torch.no_grad():
+            blank_prob_mean = self.blank_kl_loss.mean_blank_prob(log_probs_constrained, attention_mask)
+
         return {
-            'loss': total_loss,
-            'loss_ctc': loss_ctc,
-            'loss_ce': loss_ce,
-            'loss_art': loss_art
+            'loss':            total_loss,
+            'loss_ctc':        loss_ctc,
+            'loss_ce':         loss_ce,
+            'loss_art':        loss_art,
+            'loss_blank_kl':   loss_blank_kl,
+            'loss_ordinal':    loss_ordinal,
+            'loss_symbolic_kl': loss_symbolic_kl,
+            'blank_prob_mean': blank_prob_mean,
         }
     
     def _compute_ctc_loss(
@@ -360,12 +416,6 @@ class DysarthriaASRLightning(pl.LightningModule):
             max=log_probs_constrained.size(1)
         )
 
-        # Guard against off-by-one or padding-induced length mismatch
-        input_lengths = torch.clamp(
-            input_lengths,
-            max=log_probs_constrained.size(1)
-        )
-
         label_lengths = batch.get('label_lengths')
         if label_lengths is None:
             label_lengths = (labels != -100).sum(dim=1)
@@ -387,39 +437,77 @@ class DysarthriaASRLightning(pl.LightningModule):
         logits_place = outputs.get('logits_place')
         logits_voice = outputs.get('logits_voice')
 
-        outputs_filtered = {
-            'logits_constrained': log_probs_constrained[valid_mask],
-            'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
-            'logits_place': logits_place[valid_mask] if logits_place is not None else None,
-            'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
-        }
+        # Build filtered outputs dict once (Bug B4: previous code built it twice;
+        # the first construction lacked logits_neural and was silently discarded).
         labels_filtered = labels[valid_mask]
         input_lengths_filtered = input_lengths[valid_mask]
         label_lengths_filtered = label_lengths[valid_mask]
-        
+
         # Compute losses
         art_labels = batch.get('articulatory_labels')
         if art_labels is not None:
             art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
+
+        outputs_filtered = {
+            'logits_constrained': log_probs_constrained[valid_mask],
+            'logits_neural':      outputs.get('logits_neural',  log_probs_constrained)[valid_mask],
+            'hidden_states':      outputs.get('hidden_states',  None),
+            'logits_manner': (outputs.get('logits_manner')[valid_mask]
+                              if outputs.get('logits_manner') is not None else None),
+            'logits_place':  (outputs.get('logits_place')[valid_mask]
+                              if outputs.get('logits_place') is not None else None),
+            'logits_voice':  (outputs.get('logits_voice')[valid_mask]
+                              if outputs.get('logits_voice') is not None else None),
+        }
+        if outputs_filtered['hidden_states'] is not None:
+            outputs_filtered['hidden_states'] = outputs_filtered['hidden_states'][valid_mask]
+
+        severity  = batch['status'].float() * 5.0
+        attn_mask = batch.get('attention_mask')
+        if attn_mask is not None:
+            # Downsample attention mask from audio-frame resolution to logit resolution.
+            # Stride must match the HuBERT CNN feature extractor stride (320 samples),
+            # NOT batch_size.  Using batch_size=4 was Bug B3 — it caused the mask to
+            # cover only the first ~1.3 s of each utterance.
+            T_log = log_probs_constrained.size(1)
+            ctc_stride = 320  # matches NeuroSymbolicCollator.ctc_stride
+            attn_mask_ds = (
+                attn_mask[:, ::ctc_stride].to(log_probs_constrained.device)
+                if attn_mask.size(1) > T_log
+                else attn_mask.to(log_probs_constrained.device)
+            )
+            attn_mask_ds = attn_mask_ds[:, :T_log]
+        else:
+            attn_mask_ds = None
 
         losses = self.compute_loss(
             outputs_filtered,
             labels_filtered,
             input_lengths_filtered,
             label_lengths_filtered,
-            articulatory_labels=art_labels
+            articulatory_labels=art_labels,
+            severity=severity[valid_mask],
+            attention_mask=attn_mask_ds[valid_mask] if attn_mask_ds is not None else None,
         )
-        
+
         # Log metrics
-        self.log('train/loss', losses['loss'], on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/loss_ctc', losses['loss_ctc'], on_step=False, on_epoch=True)
-        self.log('train/loss_ce', losses['loss_ce'], on_step=False, on_epoch=True)
+        self.log('train/loss',         losses['loss'],       on_step=True,  on_epoch=True, prog_bar=True)
+        self.log('train/loss_ctc',     losses['loss_ctc'],   on_step=False, on_epoch=True)
+        self.log('train/loss_ce',      losses['loss_ce'],    on_step=False, on_epoch=True)
+        self.log('train/loss_blank_kl',losses['loss_blank_kl'], on_step=False, on_epoch=True)
+        self.log('train/blank_prob_mean', losses['blank_prob_mean'], on_step=True, on_epoch=True, prog_bar=True)
         if losses.get('loss_art') is not None:
-            self.log('train/loss_art', losses['loss_art'], on_step=False, on_epoch=True)
-        # Log average beta to monitor neuro-symbolic weight activation
-        beta_val = outputs['beta'].mean() if isinstance(outputs['beta'], torch.Tensor) else outputs['beta']
+            self.log('train/loss_art',      losses['loss_art'],       on_step=False, on_epoch=True)
+        if losses.get('loss_ordinal') is not None:
+            self.log('train/loss_ordinal',  losses['loss_ordinal'],   on_step=False, on_epoch=True)
+        if losses.get('loss_symbolic_kl') is not None:
+            self.log('train/loss_sym_kl',   losses['loss_symbolic_kl'], on_step=False, on_epoch=True)
+        # Monitor β
+        beta_val = outputs['beta']
+        if isinstance(beta_val, torch.Tensor):
+            beta_val = beta_val.mean()
         self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
-        
+
         return losses['loss']
 
     def on_train_epoch_start(self) -> None:
@@ -487,9 +575,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         if art_labels is not None:
             art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
 
+        # Bug B5: logits_neural and hidden_states were missing from this dict;
+        # CE loss fell back silently to constrained log-probs in val/test.
+        logits_neural_v = outputs.get('logits_neural')
+        hidden_states_v = outputs.get('hidden_states')
         losses = self.compute_loss(
             {
                 'logits_constrained': log_probs_constrained,
+                'logits_neural': (
+                    logits_neural_v[valid_mask]
+                    if logits_neural_v is not None
+                    else log_probs_constrained
+                ),
+                'hidden_states': (
+                    hidden_states_v[valid_mask]
+                    if hidden_states_v is not None
+                    else None
+                ),
                 'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
                 'logits_place': logits_place[valid_mask] if logits_place is not None else None,
                 'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
@@ -499,7 +601,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             label_lengths,
             articulatory_labels=art_labels
         )
-        
+
         # Decode predictions for PER computation
         predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
         references = decode_references(labels, self.id_to_phn)
@@ -621,9 +723,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         if art_labels is not None:
             art_labels = {key: value[valid_mask] for key, value in art_labels.items()}
 
+        # Bug B5 (test_step mirror): add logits_neural and hidden_states so CE loss
+        # is computed on neural logits, not constrained log-probs.
+        logits_neural_t = outputs.get('logits_neural')
+        hidden_states_t = outputs.get('hidden_states')
         losses = self.compute_loss(
             {
                 'logits_constrained': log_probs_constrained,
+                'logits_neural': (
+                    logits_neural_t[valid_mask]
+                    if logits_neural_t is not None
+                    else log_probs_constrained
+                ),
+                'hidden_states': (
+                    hidden_states_t[valid_mask]
+                    if hidden_states_t is not None
+                    else None
+                ),
                 'logits_manner': logits_manner[valid_mask] if logits_manner is not None else None,
                 'logits_place': logits_place[valid_mask] if logits_place is not None else None,
                 'logits_voice': logits_voice[valid_mask] if logits_voice is not None else None
@@ -633,7 +749,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             label_lengths,
             articulatory_labels=art_labels
         )
-        
+
         # Decode and compute PER
         predictions = decode_predictions(log_probs_constrained, self.phn_to_id, self.id_to_phn)
         references = decode_references(labels, self.id_to_phn)
@@ -649,35 +765,62 @@ class DysarthriaASRLightning(pl.LightningModule):
     
     def configure_optimizers(self):
         """
-        Configure optimizer and learning rate scheduler.
-        
-        Returns:
-            Dictionary with optimizer and scheduler configuration
+        Configure optimizer with differential learning rates (audit S4):
+          - HuBERT encoder:               lr × 0.1  (slow fine-tuning)
+          - PhonemeClassifier + Adapter:  lr × 1.0
+          - SymbolicConstraintLayer:      lr × 0.5  (keeps C near prior)
         """
+        lr = self.config.training.learning_rate
+
+        def params_of(*modules):
+            for m in modules:
+                if m is not None:
+                    yield from m.parameters()
+
+        param_groups = [
+            # HuBERT encoder — slower LR to avoid catastrophic forgetting
+            {
+                'params': list(self.model.hubert.parameters()),
+                'lr': lr * 0.1,
+                'name': 'hubert_encoder',
+            },
+            # Classification head + severity adapter
+            {
+                'params': list(params_of(
+                    self.model.phoneme_classifier,
+                    self.model.severity_adapter,
+                    self.model.manner_head,
+                    self.model.place_head,
+                    self.model.voice_head,
+                )),
+                'lr': lr * 1.0,
+                'name': 'classifier_heads',
+            },
+            # Symbolic layer (learnable C + β)
+            {
+                'params': list(self.model.symbolic_layer.parameters()),
+                'lr': lr * 0.5,
+                'name': 'symbolic_layer',
+            },
+        ]
+
         optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.config.training.learning_rate,
-            weight_decay=self.config.training.weight_decay
+            param_groups,
+            weight_decay=self.config.training.weight_decay,
         )
-        
-        # Learning rate scheduler with warmup
+
         total_steps = self.trainer.estimated_stepping_batches
-        
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=self.config.training.learning_rate,
+            max_lr=[lr * 0.1, lr * 1.0, lr * 0.5],
             total_steps=total_steps,
             pct_start=self.config.training.warmup_ratio,
-            anneal_strategy='cos'
+            anneal_strategy='cos',
         )
-        
+
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'step',
-                'frequency': 1
-            }
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1},
         }
 
 
@@ -800,13 +943,18 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.Trainer]:
+def train(
+    config: Optional[Config] = None,
+    limit_train_batches: Optional[int] = None,
+) -> Tuple[DysarthriaASRLightning, pl.Trainer]:
     """
     Main training function.
-    
+
     Args:
         config: Configuration object, uses default if None
-        
+        limit_train_batches: If set, cap batches per epoch (smoke/dev mode).
+            Passed directly to ``pl.Trainer(limit_train_batches=...)``.
+
     Returns:
         Tuple of (trained_model, trainer)
     """
@@ -847,8 +995,8 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         max_audio_length=config.data.max_audio_length
     )
     
-    # Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(config, dataset)
+    # Create dataloaders (test split unused here; evaluation is the caller's responsibility)
+    train_loader, val_loader, _ = create_dataloaders(config, dataset)
     
     # Initialize model
     print("🧠 Initializing neuro-symbolic model...")
@@ -895,7 +1043,7 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
     lr_monitor = LearningRateMonitor(logging_interval='step')
     
     # Create trainer
-    trainer = pl.Trainer(
+    trainer_kwargs: Dict = dict(
         max_epochs=config.training.max_epochs,
         accelerator='gpu' if config.device == 'cuda' else 'cpu',
         devices=1,
@@ -906,22 +1054,32 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         logger=mlflow_logger,
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         deterministic=False,  # Handled manually above
-        log_every_n_steps=config.experiment.log_every_n_steps
+        log_every_n_steps=config.experiment.log_every_n_steps,
     )
+    if limit_train_batches is not None:
+        trainer_kwargs['limit_train_batches'] = limit_train_batches
+    trainer = pl.Trainer(**trainer_kwargs)
     
     # Train
     print("🚀 Starting training...")
     trainer.fit(lightning_model, train_loader, val_loader)
-    
-    # Test on best checkpoint
-    print("📈 Evaluating on test set...")
+
+    # Resolve checkpoint: prefer best scored ckpt, fall back to last.ckpt
     best_model_path = checkpoint_callback.best_model_path
-    print(f"✅ Best checkpoint: {best_model_path}")
-    
-    trainer.test(lightning_model, test_loader, ckpt_path='best')
-    
-    # Load best checkpoint for comprehensive evaluation
-    print("🔄 Loading best model for detailed evaluation...")
+    if not best_model_path:
+        last_ckpt = checkpoint_dir / "last.ckpt"
+        if last_ckpt.exists():
+            best_model_path = str(last_ckpt)
+            print(f"⚠️  No best checkpoint saved; using last.ckpt: {best_model_path}")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {checkpoint_dir} after training."
+            )
+    else:
+        print(f"✅ Best checkpoint: {best_model_path}")
+
+    # Load best checkpoint and return
+    print("🔄 Loading best model from checkpoint...")
     best_model = DysarthriaASRLightning.load_from_checkpoint(
         best_model_path,
         model=model,
@@ -930,50 +1088,208 @@ def train(config: Optional[Config] = None) -> Tuple[DysarthriaASRLightning, pl.T
         id_to_phn=dataset.id_to_phn,
         strict=False
     )
-    
-    # Run comprehensive evaluation with visualizations
-    print("📊 Generating clinical diagnostic plots...")
-    results_dir = get_project_root() / "results" / config.experiment.run_name
-    results_dir.mkdir(parents=True, exist_ok=True)
-    
-    evaluate_model(
-        model=best_model.model,
-        dataloader=test_loader,
-        device=config.device,
-        phn_to_id=dataset.phn_to_id,
-        id_to_phn=dataset.id_to_phn,
-        results_dir=results_dir,
-        symbolic_rules=config.symbolic.substitution_rules  # Enable rule hit-rate graph
-    )
-    
-    print("✅ Training and evaluation complete!")
-    print(f"\n📁 Directory Structure:")
+
+    print("✅ Training complete!")
     print(f"  Checkpoints: {checkpoint_dir}")
-    print(f"  Results:     {results_dir}")
-    
+
     return best_model, trainer
+
+
+
+def create_loso_splits(
+    config: Config,
+    dataset: TorgoNeuroSymbolicDataset,
+    held_out_speaker: str,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Create dataloaders for a single LOSO fold.
+
+    The held-out speaker is used exclusively for testing. The remaining speakers
+    are split 85/15 into train/val by speaker.
+
+    Args:
+        config:             Training configuration
+        dataset:            Full TorgoNeuroSymbolicDataset
+        held_out_speaker:   Speaker ID to hold out for this fold
+
+    Returns:
+        (train_loader, val_loader, test_loader)
+    """
+    df = dataset.df
+    all_speakers = [s for s in df['speaker'].unique() if s != held_out_speaker]
+
+    np.random.seed(config.experiment.seed)
+    np.random.shuffle(all_speakers)
+
+    n_val = max(1, int(len(all_speakers) * 0.15))
+    val_speakers  = all_speakers[:n_val]
+    train_speakers = all_speakers[n_val:]
+
+    train_idx = df[df['speaker'].isin(train_speakers)].index.tolist()
+    val_idx   = df[df['speaker'].isin(val_speakers)].index.tolist()
+    test_idx  = df[df['speaker'] == held_out_speaker].index.tolist()
+
+    collator = NeuroSymbolicCollator(dataset.processor)
+
+    # Weighted sampler for train split
+    train_df = df.iloc[train_idx]
+    status_counts = train_df['status'].value_counts().to_dict()
+    train_weights = [1.0 / max(status_counts.get(df.iloc[i]['status'], 1), 1) for i in train_idx]
+    sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
+
+    def _make_loader(idx, shuffle_sampler=None):
+        return DataLoader(
+            Subset(dataset, idx),
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            sampler=shuffle_sampler,
+            collate_fn=collator,
+            num_workers=config.training.num_workers,
+            pin_memory=config.training.pin_memory,
+        )
+
+    return (
+        _make_loader(train_idx, shuffle_sampler=sampler),
+        _make_loader(val_idx),
+        _make_loader(test_idx),
+    )
+
+
+def run_loso(
+    config: Config,
+    dataset: TorgoNeuroSymbolicDataset,
+) -> Dict:
+    """
+    Run Leave-One-Speaker-Out cross-validation.
+
+    Trains one model per speaker fold, aggregates macro-average PER and
+    95% bootstrap CIs across folds.
+
+    Returns:
+        Dict with per_per_fold, macro_avg_per, per_95ci, fold_speakers
+    """
+    speakers = list(dataset.df['speaker'].unique())
+    print(f"\n🔁 LOSO: {len(speakers)} folds ({speakers})")
+
+    # Snapshot the base run name before the loop so that fold names are derived
+    # from the original name rather than accumulating across folds (Bug B6).
+    base_run_name = config.experiment.run_name
+
+    per_per_fold = []
+    for i, spk in enumerate(speakers):
+        print(f"\n── Fold {i+1}/{len(speakers)}: held-out speaker = {spk} ──")
+        fold_run_name = f"{base_run_name}_loso_{spk}"
+        config.experiment.run_name = fold_run_name
+
+        train_loader, val_loader, test_loader = create_loso_splits(config, dataset, spk)
+
+        # Initialise a fresh model for each fold
+        model = NeuroSymbolicASR(
+            model_config=config.model,
+            symbolic_config=config.symbolic,
+            phn_to_id=dataset.phn_to_id,
+            id_to_phn=dataset.id_to_phn,
+            manner_to_id=dataset.manner_to_id,
+            place_to_id=dataset.place_to_id,
+            voice_to_id=dataset.voice_to_id,
+        )
+        lm = DysarthriaASRLightning(
+            model=model, config=config,
+            phn_to_id=dataset.phn_to_id, id_to_phn=dataset.id_to_phn,
+            class_weights=dataset.get_loss_weights(),
+            articulatory_weights=dataset.get_articulatory_loss_weights(),
+        )
+
+        ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
+        ckpt_cb = ModelCheckpoint(
+            dirpath=str(ckpt_dir), monitor='val/per', mode='min',
+            save_top_k=1, save_last=False,
+        )
+        trainer = pl.Trainer(
+            max_epochs=config.training.max_epochs,
+            accelerator='gpu' if config.device == 'cuda' else 'cpu',
+            devices=1,
+            precision=config.training.precision,
+            accumulate_grad_batches=config.training.gradient_accumulation_steps,
+            gradient_clip_val=config.training.gradient_clip_val,
+            callbacks=[ckpt_cb, EarlyStopping(monitor='val/per', patience=5, mode='min')],
+            logger=False,
+            enable_progress_bar=True,
+            log_every_n_steps=50,
+        )
+        trainer.fit(lm, train_loader, val_loader)
+
+        # Evaluate on held-out speaker
+        results_dir = get_project_root() / "results" / fold_run_name
+        results_dir.mkdir(parents=True, exist_ok=True)
+        eval_results = evaluate_model(
+            model=lm.model, dataloader=test_loader,
+            device=config.device,
+            phn_to_id=dataset.phn_to_id, id_to_phn=dataset.id_to_phn,
+            results_dir=results_dir,
+        )
+        fold_per = eval_results.get('avg_per', float('nan'))
+        per_per_fold.append(fold_per)
+        print(f"   Fold PER ({spk}): {fold_per:.4f}")
+
+    # Bootstrap 95% CI over fold PERs
+    per_arr = np.array(per_per_fold)
+    macro_per = float(np.nanmean(per_arr))
+    rng = np.random.default_rng(42)
+    boot = np.array([rng.choice(per_arr, size=len(per_arr), replace=True).mean()
+                     for _ in range(2000)])
+    ci_lo, ci_hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+
+    print(f"\n✅ LOSO Complete: macro-avg PER = {macro_per:.4f} "
+          f"[95% CI: {ci_lo:.4f} – {ci_hi:.4f}]")
+
+    return {
+        'per_per_fold': per_per_fold,
+        'fold_speakers': speakers,
+        'macro_avg_per': macro_per,
+        'per_95ci': (ci_lo, ci_hi),
+    }
 
 
 def main() -> None:
     """Main entry point for training script."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Train Neuro-Symbolic Dysarthria ASR")
-    parser.add_argument('--config', type=str, help='Path to config YAML file')
-    parser.add_argument('--run-name', type=str, help='MLflow run name')
+    parser.add_argument('--config',              type=str, help='Path to config YAML file')
+    parser.add_argument('--run-name',            type=str, help='MLflow run name')
+    parser.add_argument('--ablation',            type=str, default='full',
+                        choices=['full', 'neural_only', 'symbolic_only', 'no_art_heads'],
+                        help='Ablation mode (default: full)')
+    parser.add_argument('--loso',                action='store_true',
+                        help='Run Leave-One-Speaker-Out cross-validation')
+    parser.add_argument('--max_epochs',          type=int, help='Override max_epochs')
+    parser.add_argument('--limit_train_batches', type=int,
+                        help='Limit batches per epoch (smoke test)')
     args = parser.parse_args()
-    
+
     # Load or create config
-    if args.config:
-        config = Config.load(Path(args.config))
-    else:
-        config = get_default_config()
-    
+    config = Config.load(Path(args.config)) if args.config else get_default_config()
+
     if args.run_name:
         config.experiment.run_name = args.run_name
-    
-    # Train
-    train(config)
+    config.training.ablation_mode = args.ablation
+    config.training.use_loso = args.loso
+    if args.max_epochs:
+        config.training.max_epochs = args.max_epochs
+
+    if args.loso:
+        # LOSO mode: load full dataset then run CV
+        pl.seed_everything(config.experiment.seed, workers=True)
+        dataset = TorgoNeuroSymbolicDataset(
+            manifest_path=str(config.data.manifest_path),
+            processor_id=config.model.hubert_model_id,
+            sampling_rate=config.data.sampling_rate,
+            max_audio_length=config.data.max_audio_length,
+        )
+        run_loso(config, dataset)
+    else:
+        train(config, limit_train_batches=args.limit_train_batches)
 
 
 if __name__ == "__main__":
