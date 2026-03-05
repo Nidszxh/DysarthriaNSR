@@ -22,8 +22,9 @@ For detailed architecture and research context, see [ROADMAP.md](ROADMAP.md).
 - **Explainability wired**: `SymbolicRuleTracker` connected to `SymbolicConstraintLayer`; `ExplainableOutputFormatter` emits per-utterance phoneme-error JSON.
 - **Publication-quality figures**: `scripts/generate_figures.py` generates the full diagnostic visualization suite (6 plots) from `evaluation_results.json` / `explanations.json`.
 - **Smoke tests**: `scripts/smoke_test.py` — 7 automated end-to-end tests, all passing.
-- **baseline_v3 trained** (post-B12, March 4 2026): first run with correct speaker-stratified splits; 30 epochs, val/per = **0.574** (best epoch 26), 98.9M params / 23.9M trainable (24.2%). Test evaluation pending.
-- **baseline_v2 trained** (pre-B12, March 2026): greedy test PER = 0.215, beam-search PER = 0.243 (width=25); **note**: speaker split was invalid (all `'unknown'`) — results likely inflated due to train/val data leakage. Preserved as reference baseline.
+- **baseline_v4 trained and evaluated** (March 5, 2026): batch=8, 40 epochs, staged progressive unfreezing (layers 8-11 at epoch 1, layers 6-11 at epoch 6), 66.4M trainable params (67.1%). Best val/per = **0.504** (epoch 28). Beam-search test PER = **0.4748**, WER = 0.664. Insertion bias resolved (I/D = 0.87×). First full end-to-end valid evaluation.
+- **baseline_v3 trained** (post-B12, March 4 2026): first run with correct speaker-stratified splits; 30 epochs, val/per = 0.574 (epoch 26), 23.9M trainable (24.2%). Test evaluation was not run separately.
+- **baseline_v2 trained** (pre-B12, March 2026): greedy test PER = 0.215, beam-search PER = 0.243 (width=25); speaker split was invalid (all `'unknown'`) — results inflated due to data leakage. Preserved as historical reference.
 
 ## Quick Start
 
@@ -89,8 +90,8 @@ python scripts/smoke_test.py  # All 7 tests should pass
 ## Key Features
 
 ### Neural Architecture
-- **HuBERT encoder** (758M base): 12-layer transformer with gradient checkpointing
-- **Selective layer freezing**: First 10 layers frozen (unfrozen after warmup) for VRAM efficiency
+- **HuBERT encoder** (base): 12-layer transformer with gradient checkpointing
+- **Staged progressive unfreezing**: entire encoder frozen at epoch 0; layers 8-11 unfrozen at epoch 1; layers 6-11 at epoch 6 (layers 0-3 remain frozen) for VRAM efficiency
 - **Phoneme classifier**: 768→512→vocab projection with dropout regularization
 - **Symbolic constraint layer**: Learnable neural-symbolic fusion with severity-adaptive weighting
 
@@ -221,122 +222,55 @@ After each `run_pipeline.py` run, `evaluate_model()` generates:
 - **ExperimentConfig**: MLflow tracking and logging behavior
 - **SymbolicConfig**: Dysarthric substitution rules and articulatory weights
 
-### Key Defaults (RTX 4060 optimized)
+### Key Defaults (RTX 4060 optimized — baseline_v4 configuration)
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Learning rate | 3e-5 | OneCycleLR with 5% warmup (250 steps) |
-| Batch size | 4 | Effective 32 with gradient accumulation |
-| Gradient accumulation | 8 | 8GB VRAM constraint |
+| Learning rate | 3e-5 | OneCycleLR with 5% warmup |
+| Batch size | 8 | Effective 64 with gradient accumulation |
 | Max audio length | 6.0s | Covers ~99% of TORGO utterances |
-| Precision | bf16-mixed (Ada) or 16-mixed | Mixed precision for speed & stability |
-| Frozen layers | 0–9 (of 12) | Unfrozen after 3 warmup epochs |
-| Max epochs | 30 | Early stopping on val/per (patience=8) |
+| Precision | bf16-mixed | Mixed precision for speed & stability |
+| Frozen layers | 0–11 → 4–11 (ep1) → 0–5 (ep6) | Staged progressive unfreezing |
+| Max epochs | 40 | Early stopping on val/per (patience=8) |
 | Loss weights | CTC: 0.8, CE: 0.2, Art: 0.1 | Multi-task balancing |
 
 ### Baseline Results
 
-#### `baseline_v3` (March 4, 2026) — **Current Reference** — Correct Speaker-Stratified Splits
-- **Dataset**: 16,531 samples, 15 TORGO speakers (manifest regenerated; B12 fully resolved)
+#### `baseline_v4` (March 5, 2026) — **Current Reference**
+- **Dataset**: 16,531 samples, 15 TORGO speakers (manifest with correct speaker IDs)
 - **Train/Val/Test split**: speaker-stratified; Train 11,654 / Val 1,329 / Test 3,548 (10/2/3 speakers)
-- **Model**: 98.9M params total / 23.9M trainable (24.2%) — HuBERT + SeverityAdapter + LearnableConstraintMatrix
-- **Best epoch**: epoch 26 (val/per = 0.574), trained for 30 epochs
-- **Status**: training complete; test-set evaluation pending
+- **Model**: 98.9M params total / 66.4M trainable (67.1%) — staged progressive unfreezing, 40 epochs
+- **Best checkpoint**: epoch 28 (val/per = 0.504)
+- **Evaluation**: beam-search (width=25) + `--explain` + `--uncertainty` (20 MC samples)
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Best val/per** | 0.574 | Epoch 26/30 |
-| **Test PER** | — | Not yet evaluated (run `--skip-train --beam-search`) |
-| Model size | 98.9M / 23.9M trainable (24.2%) | Slightly larger than v2 |
-| blank_prob_mean (epoch) | ~0.857 | Insertion bias still present |
+| **Beam-search test PER** (macro-speaker) | 0.4748 | 3,548 test samples, 3 speakers |
+| **WER** | 0.664 | |
+| 95% CI | [0.448, 0.503] | Bootstrap 1000 resamples |
+| Dysarthric PER | 0.448 | M03 (n=810) |
+| Control PER | 0.488 | MC02 (0.503), MC04 (0.474), n=2,738 |
+| Substitutions / Deletions / Insertions | 13,868 / 4,292 / 3,734 | **I/D = 0.87×** — insertion bias resolved |
+| Articulatory accuracy | manner 78.6%, place 79.1%, voice 92.4% | |
+| Model size | 98.9M / 66.4M trainable (67.1%) | |
+| Uncertainty (MC Dropout) | entropy mean 0.414, confidence mean 0.889 | 20 samples |
 
-> **Important**: val/per is significantly higher than baseline_v2 (0.574 vs 0.204). This is expected — baseline_v2 was trained with all-`'unknown'` speakers, making speaker-stratified splits ineffective (train/val sets shared speakers). baseline_v3 represents **the first valid speaker-independent evaluation**.
+#### `baseline_v3` (March 4, 2026) — Previous Valid Run
+- **Model**: 98.9M params / 23.9M trainable (24.2%), 30 epochs
+- **Best val/per**: 0.574 (epoch 26); no separate test evaluation run
 
-#### `baseline_v2` (March 2026) — Reference Only (⚠️ Invalid Speaker Split)
-- **Model**: 97.2M params / 22.1M trainable (22.8%)
-- **Best epoch**: epoch 26 (val/per = 0.204)
-- **⚠️ Data leakage**: manifest had `speaker='unknown'` for all samples (B12); speaker-stratified split was not truly speaker-independent
+#### `baseline_v2` (March 2026) — Historical Reference (⚠️ Invalid Speaker Split)
+- **⚠️ Data leakage**: manifest had `speaker='unknown'` for all samples (B12 unresolved at train time); speaker-stratified split was ineffective
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Greedy test PER** | 0.215 | 2,481 test samples; inflated due to data leakage |
-| **Beam-search PER** (width=25) | 0.243 | Insertion-heavy |
-| Dysarthric PER | 0.377 (M03) | Invalid split caveat applies |
-| Control PER | 0.131 (MC02, MC04) | Invalid split caveat applies |
-| **Insertions** | 4,231 / 3,569 (greedy/beam) | I/D ratio: 11× greedy, 2.5× beam |
+| Greedy test PER | 0.215 | Inflated; split was not speaker-independent |
+| Beam-search PER (width=25) | 0.243 | |
 
 #### `baseline_v1` (January 2026) — Superseded
 | Metric | Value | Notes |
 |--------|-------|-------|
 | Test PER | 0.567 ± 0.365 | B3 attention mask stride bug active |
 | Insertions | 21,290 | BlankPriorKL receiving incorrect mask |
-
-### CTC Insertion Problem & Mitigation
-The high insertion rate (21,290 insertions) indicates the model emits non-blank frames more than CTC expects. Strategies:
-1. **Blank prior regularization**: Increase blank class weight in frame-level CE
-2. **Blank posterior targeting**: Add KL penalty to force mean blank probability ~0.3
-3. **Length-penalized decoding**: Apply insertion cost during inference
-4. **Symbolic constraint boosting**: Increase β on silence frames
-
-## Diagnostics & Next Steps
-
-### Identified Issues
-
-#### 1. CTC Insertion Bias (High Priority)
-The baseline exhibits **21,290 insertions** vs. 376 deletions, suggesting blank tokens are under-represented.
-
-**Investigation plan**:
-- Analyze blank posterior statistics (histogram, mean per speaker)
-- Compare blank probability distributions: dysarthric vs. control
-- Check per-frame entropy to detect overconfident non-blank emissions
-- Verify `-100` label padding is working correctly
-
-**Mitigation strategies**:
-- Increase `blank_priority_weight` in TrainingConfig (currently 1.5)
-- Add KL regularizer: force mean(P_blank) → 0.3 target
-- Apply length penalties during CTC beam search
-- Reduce CE loss weight if it suppresses blank gradients
-
-#### 2. Dysarthric vs. Control Performance Gap
-Dysarthric PER (0.541) is slightly better than control (0.575), which is surprising.
-
-**Investigation plan**:
-- Stratify by phoneme count (0–5, 6–10, 11–20, 21+ phonemes)
-- Check speaker-level variance; may be speaker effects, not dysarthria
-- Analyze speaker-specific error rates with paired statistical tests
-
-#### 3. Symbolic Constraint Weight Evolution
-β converges ~0.5, suggesting balanced use of constraints.
-
-**Analysis**:
-- Monitor β per speaker: does it adapt to severity?
-- Compare β=0.3 (neural-heavy) vs. β=0.7 (symbolic-heavy) ablations
-- Validate substitution rules match ground-truth confusion frequencies
-
-### Recommended Experiments
-
-1. **Ablation studies**:
-   - Neural-only (freeze symbolic constraints, β=1.0)
-   - Symbolic-only (β=0.0, rely on constraint matrix)
-   - No auxiliary heads (articulatory CE removed)
-   - Varying β sweeps (0.3, 0.5, 0.7, 0.9)
-
-2. **Data stratification**:
-   - Length-stratified PER analysis
-   - Speaker-level confidence intervals
-   - Per-phoneme error rates
-
-3. **Insertion mitigation**:
-   - Test blank weight scaling (1.5 → 2.0 → 3.0)
-   - Blank prior KL regularization
-   - Beam search with insertion penalty (Kaldi-style)
-
-4. **Symbolic rule discovery**:
-   - Extract top-K confusion pairs from baseline confusion matrix
-   - Compare to PHONEME_DETAILS in manifest.py
-   - Validate clinical phonology literature alignment
-
-- Export HuBERT + classifier + symbolic layer to ONNX with dynamic axes.
-- Validate parity on a small batch, then run ONNX Runtime CPU inference.
 
 ## Dataset: TORGO
 
@@ -370,18 +304,16 @@ Features:
 ## Known Issues and Next Steps
 
 **Active issues (March 2026)**:
-- Test split = 3 speakers only → wide CIs, severity correlation underpowered (needs full LOSO-CV)
-- Insertion bias persists (`blank_prob_mean` ~0.857 during baseline_v3 training); `BlankPriorKLLoss` partially mitigates
-- `SymbolicRuleTracker` wired but zero activations — logging issue, not affecting model correctness
-- Uncertainty plots require `--uncertainty` flag (MC Dropout not default)
-- baseline_v3 test evaluation not yet run
+- Test split = 3 speakers only → severity correlation not statistically significant (Pearson p=0.347, n=3); needs full LOSO-CV
+- Symbolic constraint layer reduces performance: neural-only PER = 0.305 vs constrained PER = 0.475 (Δ = −0.170) — ablation study needed
+- `SymbolicRuleTracker` wired but low activation confidence (0.131 avg) — most rule activations are deletions to `<BLANK>`
+- Uncertainty plots require `--uncertainty` flag (MC Dropout not default); 20 samples used in baseline_v4
 
 **Immediate next steps**:
-1. Run baseline_v3 evaluation: `python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25`
-2. Regenerate figures: `python scripts/generate_figures.py --run-name baseline_v3`
-3. Run ablation studies: `--ablation neural_only`, `no_art_heads`, `no_constraint_matrix`
-4. Design LOSO-CV (15-speaker leave-one-out) for statistically valid PER estimates
-5. Investigate insertion bias: increase `lambda_blank_kl`, analyze per-epoch blank emission dynamics
+1. Run neural-only ablation to verify symbolic constraint harm: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only`
+2. Regenerate figures for baseline_v4: `python scripts/generate_figures.py --run-name baseline_v4`
+3. Run additional ablations: `--ablation no_art_heads`, `no_constraint_matrix`
+4. Design LOSO-CV (15-speaker leave-one-out) for statistically valid PER and severity correlation estimates
 
 ## References
 

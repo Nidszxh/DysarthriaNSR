@@ -17,18 +17,31 @@ The complete end-to-end pipeline is **fully implemented** and running:
 - ✅ Automated smoke tests (`scripts/smoke_test.py`, 7/7 passing)
 - ✅ 12 confirmed bugs fixed (B1–B12, see `RESEARCH_BRIEF.md`)
 
-**Current Run: baseline_v3 (March 4, 2026) — First Valid Speaker-Independent Evaluation**
+**Current Run: baseline_v4 (March 5, 2026) — First Complete Valid Evaluation**
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Best val/per** | 0.574 | Epoch 26/30; correct speaker-stratified splits |
-| **Test PER** | — | Evaluation pending |
-| Model size | 98.9M params / 23.9M trainable (24.2%) | |
-| blank_prob_mean (epoch) | ~0.857 | Insertion bias; BlankPriorKL active |
-| Training time | ~1.5 hours (30 epochs, RTX 4060) | Same hardware |
+| **Beam-search test PER** (macro-speaker) | 0.4748 | 3,548 samples, 3 speakers, width=25 |
+| **WER** | 0.664 | |
+| 95% CI | [0.448, 0.503] | Bootstrap |
+| Dysarthric PER | 0.448 | M03 (n=810) |
+| Control PER (avg) | 0.488 | MC02=0.503, MC04=0.474 (n=2,738) |
+| Substitutions / Deletions / Insertions | 13,868 / 4,292 / 3,734 | **I/D = 0.87×** — insertion bias resolved |
+| Articulatory accuracy | manner 78.6%, place 79.1%, voice 92.4% | Large improvement over v2 |
+| Model size | 98.9M params / 66.4M trainable (67.1%) | Staged progressive unfreezing |
+| Best val/per | 0.504 (epoch 28/40) | |
+| Uncertainty | entropy 0.414, confidence 0.889 | MC Dropout, 20 samples |
+| Welch t / Wilcoxon p | 0.0029 / 0.0028 | Significant dys vs. ctrl |
 
-> ⚠️ val/per is considerably weaker than baseline_v2 (0.574 vs 0.204). This is expected: baseline_v2 was trained with all-`'unknown'` speakers (B12 unresolved), making the speaker-stratified split ineffective and causing **train/val data leakage**. baseline_v3 is the first run with genuine speaker independence.
+> ⚠️ **Critical finding — Symbolic Constraint Layer hurts performance**: `per_neural = 0.305` vs `per_constrained = 0.475` (delta = −0.170). The symbolic constraint integration is increasing PER by ~57% relative. This strongly motivates the neural-only ablation to establish a clean baseline before re-evaluating the symbolic component design.
 
-**Previous Reference: baseline_v2 (March 2026) — ⚠️ Invalid Speaker Split**
+**Previous Run: baseline_v3 (March 4, 2026) — First Valid Splits, No Test Eval**
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Best val/per | 0.574 | Epoch 26/30; correct speaker-stratified splits |
+| Test PER | — | Not separately evaluated; superseded by v4 |
+| Model size | 98.9M / 23.9M trainable (24.2%) | Conservative unfreezing strategy |
+
+**Reference: baseline_v2 (March 2026) — ⚠️ Invalid Speaker Split**
 | Metric | Value | Known Issue |
 |--------|-------|-------------|
 | Greedy test PER | 0.215 | Data leakage: all speakers were `'unknown'`; split was not speaker-independent |
@@ -588,89 +601,60 @@ Where:
 
 ## Known Issues & Mitigation Strategies
 
-### Issue 1: High CTC Insertion Rate ⚠️ (High Priority)
+### Issue 0: Symbolic Constraint Layer Harms Performance ⚠️ (Critical Priority — New in baseline_v4)
 
-**Symptom**: Baseline test set shows 21,290 insertions vs. 376 deletions (56× ratio imbalance)
-- Suggests model over-predicts non-blank phonemes
-- Blank frames are under-weighted in loss or backprop
+**Symptom**: `per_neural = 0.305` vs `per_constrained = 0.475` (delta = −0.170, i.e. +57% relative degradation from constraints)
+- The `SymbolicConstraintLayer` blending is making predictions worse, not better
+- Neural-only decoding yields significantly lower PER than the full neuro-symbolic model
 
-**Root cause hypothesis**:
-1. CTC loss doesn't distinguish insertions from substitutions; only cares about alignment cost
-2. Frame-level CE loss may not adequately penalize non-blank emissions on silence frames
-3. `blank_priority_weight = 1.5` insufficient to force model to predict blanks
-
-**Diagnostic steps**:
-```python
-# 1. Analyze blank posterior statistics
-blank_probs = model_outputs[:, :, BLANK_ID]  # Extract blank probabilities
-histogram(blank_probs, bins=50)  # Distribution analysis
-print(f"Mean blank prob: {blank_probs.mean():.3f}")
-print(f"Median blank prob: {np.median(blank_probs):.3f}")
-
-# 2. Compare dysarthric vs. control
-blank_dysarthric = blank_probs[status==1].mean()
-blank_control = blank_probs[status==0].mean()
-print(f"Blank prob (dysarthric): {blank_dysarthric:.3f}")
-print(f"Blank prob (control): {blank_control:.3f}")
-
-# 3. Compute per-frame entropy
-entropy = -np.sum(probs * np.log(probs), axis=-1)
-print(f"Mean entropy: {entropy.mean():.3f}")  # High entropy = uncertain; low = overconfident
-```
-
-**Mitigation options** (in order of effort):
-
-| Strategy | Configuration change | Expected impact |
-|----------|----------------------|-----------------|
-| Increase blank weight | `blank_priority_weight: 2.0–3.0` | Directly weighs blank class higher; may suppress non-blanks too much |
-| Blank prior KL | Add `KL(P_blank_mean, target=0.3)` regularizer | Soft constraint; allows model some flexibility |
-| Insertion-aware decoder | Beam search with insertion cost: `-log(P[i])` | Post-hoc correction; doesn't fix root cause |
-| Length penalty | Decoding: reward shorter sequences | Greedy approximation; may hurt other metrics |
-| Lower CE weight | `lambda_ce: 0.2 → 0.1` | May reduce gradient signal; risky |
-
-**Recommended first experiment**:
-```python
-# Modify TrainingConfig
-blank_priority_weight: 2.5  # Currently 1.5
-monitor_metric: val/insertions  # Monitor insertions instead of PER
-```
-
-### Issue 2: Dysarthric vs. Control PER Inversion ⚠️ (Medium Priority)
-
-**Observation**: Dysarthric PER (0.541) < Control PER (0.575)
-- Counter-intuitive: dysarthric speech should be harder
-- Likely confounded by speaker effects (test set only 3 speakers)
-
-**Root cause hypothesis**:
-1. Test set may have different speaker-severity distribution than general population
-2. Control speakers in test set have more phonetic variety (higher error opportunity)
-3. Model overfitted to training dysarthric features
+**Root cause hypotheses** (TBD — ablation required):
+1. **Learnable constraint matrix badly initialized** — `LearnableConstraintMatrix` may be spreading probability mass across wrong phonemes during early training
+2. **Severity-adaptive β misuse** — status-to-severity scaling (0 or 5.0) may be forcing extreme constraint weight for dysarthric speakers
+3. **Symbolic rules mismatched to CTC outputs** — hard-coded substitution probabilities not calibrated to data-driven confusion patterns
+4. **Frame-level constraint application** — applying phoneme-level rules to CTC frame logits (which include blank) may corrupt blank probabilities
 
 **Diagnostic steps**:
 ```python
-# 1. Stratify by phoneme count
-per_by_length = {}
-for bins in [(0, 5), (6, 10), (11, 20), (21, 50)]:
-    mask = (phoneme_counts >= bins[0]) & (phoneme_counts < bins[1])
-    per_by_length[f"{bins[0]}-{bins[1]}"] = per[mask].mean()
+# Compare neural vs constrained logits on same batch
+with torch.no_grad():
+    out = model(batch, return_intermediate=True)
+    per_neural = compute_per(out['logits_neural'], labels)
+    per_constrained = compute_per(out['logits'], labels)
+    print(f"Neural PER: {per_neural:.3f} | Constrained PER: {per_constrained:.3f}")
+    print(f"Beta values: {out['beta'].mean():.3f} ± {out['beta'].std():.3f}")
 
-# 2. Per-speaker variance
-for speaker in speakers:
-    mask = test_speakers == speaker
-    per_speaker = per[mask].mean()
-    dysarthria_status = manifest[manifest.speaker == speaker]['status'].iloc[0]
-    print(f"{speaker}: PER={per_speaker:.3f}, status={dysarthria_status}")
-
-# 3. Statistical testing
-from scipy.stats import ttest_ind
-t_stat, p_val = ttest_ind(per[test_status==1], per[test_status==0])
-print(f"t-test: t={t_stat:.3f}, p={p_val:.3f}")
+# Inspect constraint matrix
+cm = model.constraint_layer.constraint_matrix
+print(f"Constraint matrix diagonal mean: {cm.diag().mean():.3f}")  # High = identity-like = good
+print(f"Constraint matrix off-diagonal max: {(cm - cm.diag().diag()).max():.3f}")
 ```
 
-**Next steps**:
-- Collect more test speakers (dysarthric-only cohort) for unconfounded evaluation
-- Publish results separately for dysarthric & control subgroups
-- Consider severity-stratified splits (mild vs. moderate vs. severe dysarthria)
+**Recommended immediate experiments** (in priority order):
+1. `--ablation neural_only` — disable constraint layer entirely; establishes clean baseline
+2. Fix β at low value (0.05) and disable learning — check if tiny blending hurts
+3. Inspect LearnableConstraintMatrix weight evolution across epochs
+4. Compare confusion-matrix-derived rules against hard-coded PHONEME_DETAILS rules
+
+---
+
+### Issue 1: CTC Insertion Bias ✅ (Resolved in baseline_v4)
+
+**Symptom (historical)**: baseline_v1 showed 21,290 insertions vs. 376 deletions (56× ratio). baseline_v2 was 11× greedy / 2.5× beam. **baseline_v4: I/D = 0.87× (3,734 insertions vs. 4,292 deletions)** — deletions now exceed insertions.
+
+**What resolved it**: Staged progressive unfreezing (more encoder layers trainable during early epochs), larger batch size (8 vs 4), and 40 training epochs allowed the CTC alignment to learn properly.
+
+**Remaining concern**: `blank_prob_mean` still ~0.80–0.86 per epoch. The substitution/deletion dominance (13,868 subs + 4,292 del vs 3,734 ins) suggests the model is now over-deleting/substituting. This may be related to Issue 0 (symbolic constraints shifting probability mass).
+
+---
+
+### Issue 2: Dysarthric vs. Control PER Direction ⚠️ (Medium Priority)
+
+**Observation in baseline_v4**: Dysarthric PER (M03: 0.448) < Control PER (MC02: 0.503, MC04: 0.474 → avg ~0.488)
+- Same pattern as previous runs: dysarthric speaker scores lower PER than control speakers
+- Difference is small (~4 pp) and test set has only 3 speakers (n not sufficient for reliable inference)
+- Pearson r severity↔PER = −0.855, p = 0.347 (not significant with n=3)
+
+**Most likely explanation**: Speaker identity effects dominate severity signal with only 3 test speakers. M03 may simply have more acoustically consistent speech in the test subset than MC02/MC04.
 
 ### Issue 3: Constraint Weight (β) Initialization ⚠️ (Low Priority)
 
@@ -698,15 +682,15 @@ for beta in variants:
 
 ### Short-term (1–2 months)
 
-#### 1. Insertion bias mitigation
-- **Task**: Reduce 21K insertions to <10K while maintaining PER
-- **Approach**: Blank weight scaling + KL regularizer
-- **Success metric**: Test PER ≤0.52 with insertions <15K
+#### 1. Symbolic constraint ablation — Critical (Issue 0)
+- **Task**: Establish neural-only PER baseline; diagnose constraint layer harm
+- **Approach**: Run `--ablation neural_only`; inspect beta evolution; audit `LearnableConstraintMatrix` init
+- **Success metric**: Understand delta between `per_neural` (0.305) and full model (0.475)
 
-#### 2. Length-stratified analysis  
-- **Task**: Understand dysarthric vs. control gap
-- **Approach**: Publish per-length breakdowns; speaker-level CI
-- **Output**: Diagnostic report (2-3 pages)
+#### 2. Length-stratified analysis
+- **Task**: Understand dysarthric vs. control PER direction
+- **Approach**: Publish per-length breakdowns; full LOSO-CV for speaker-level CI
+- **Output**: Diagnostic report
 
 #### 3. Symbolic rule ablation
 - **Task**: Quantify neural vs. symbolic contribution

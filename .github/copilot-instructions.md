@@ -3,9 +3,10 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v3` trained (first valid speaker-independent run); manifest regenerated March 4, 2026.
-**Latest baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, 30 epochs, RTX 4060, correct speaker-stratified splits; test eval pending
-**Previous baseline**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; all speakers `'unknown'` → data leakage; results inflated)
+**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v4` trained and fully evaluated (March 5, 2026).
+**Latest baseline**: baseline_v4 (March 5, 2026) — beam-search test PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×). **Critical finding**: symbolic constraints hurt (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170).
+**Previous baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
+**Reference only**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; data leakage; results inflated)
 **Superseded**: baseline_v1 — Test PER 0.567 ± 0.365 (B3 attention mask bug was active)
 **Orchestrator**: `run_pipeline.py` is the canonical entry point — use it instead of calling `train.py` / `evaluate.py` directly.
 
@@ -92,13 +93,12 @@ The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| baseline_v3 test evaluation not yet run | No test PER for first valid run | Run `--skip-train --beam-search --explain` |
-| baseline_v2 results are invalid (data leakage) | PER 0.215 inflated due to all-`'unknown'` speaker split | Use baseline_v3 as reference; v2 preserved for history |
-| Test split = only 3 speakers | Wide CIs, severity correlation underpowered | Needs full LOSO-CV |
-| Insertion bias (`blank_prob_mean` ~0.857) | Model emits too few blanks → high I/D ratio | Increase `lambda_blank_kl`; analyze blank emission dynamics |
-| `SymbolicRuleTracker` zero activations | Logging issue only; doesn’t affect model | Low priority |
+| **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative) | Run `--ablation neural_only` immediately; inspect `LearnableConstraintMatrix` initialization |
+| Test split = only 3 speakers | Severity correlation p=0.347 (n.s.); dys vs ctrl gap may be speaker artifact | Needs full LOSO-CV |
+| Substitution/Deletion dominance | 13,868 subs + 4,292 del vs 3,734 ins in v4 | Insertion bias resolved but substitution bias high |
+| `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are deletions to `<BLANK>` | Rules not matching phoneme confusion patterns |
 | `PhonemeAttributor.attention_attribution` disabled | Requires CTC forced alignment | Future work |
-| `ablation_mode='neural_only'` incomplete | Doesn’t disable SeverityAdapter / LearnableConstraintMatrix forward passes | Ablation study needed |
+| `ablation_mode='neural_only'` incomplete | Doesn't disable SeverityAdapter / LearnableConstraintMatrix forward passes | Fix before ablation run |
 
 ---
 
@@ -519,16 +519,18 @@ for layer_idx in freeze_encoder_layers:
 - ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
 - ✅ Automated tests: `scripts/smoke_test.py` — 7/7 passing
 - ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
-- ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; 98.9M params (23.9M trainable, 24.2%); first run with valid speaker-independent splits; test eval pending
-- ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused all speakers to be `'unknown'`, making speaker-stratified split ineffective (data leakage). Preserved as historical reference.
+- ✅ **Baseline model (baseline_v4)**: beam PER 0.4748, val/per 0.504 (epoch 28/40); 98.9M params (66.4M trainable, 67.1%); staged unfreezing; insertion bias resolved (I/D=0.87×); articulatory accuracy manner 78.6% / place 79.1% / voice 92.4%
+- ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; first run with valid speaker-independent splits
+- ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused data leakage. Preserved as historical reference.
 
 ## Next Steps: What Remains
 
-- **Run baseline_v3 test evaluation** (immediate): `python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25`
-- **Regenerate figures** for baseline_v3: `python scripts/generate_figures.py --run-name baseline_v3`
-- **LOSO-CV**: Run 15-speaker leave-one-out for statistically valid macro-PER estimate
-- **Ablation studies**: `neural_only`, `no_art_heads`, `no_constraint_matrix` variants via `--ablation`
-- **Insertion bias mitigation**: increase `lambda_blank_kl`; investigate why `blank_prob_mean` stabilizes at ~0.857
+- **Neural-only ablation** (CRITICAL — immediate): `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — diagnose symbolic constraint harm (`per_neural=0.305` vs `per_constrained=0.475`)
+- **Fix `ablation_mode='neural_only'`**: Ensure it disables SeverityAdapter / LearnableConstraintMatrix forward passes before running ablation
+- **Regenerate figures** for baseline_v4: `python scripts/generate_figures.py --run-name baseline_v4`
+- **Additional ablations**: `no_art_heads`, `no_constraint_matrix` via `--ablation`
+- **LOSO-CV**: Run 15-speaker leave-one-out for statistically valid macro-PER and severity correlation
+- **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules
 - **CTC forced alignment**: enables `PhonemeAttributor.attention_attribution`
 - **Clinician dashboard**: ONNX export, streaming inference
 - **Domain adaptation**: non-TORGO dysarthria datasets
@@ -570,12 +572,16 @@ When implementing new components:
 - Build manifest with phonemes/articulatory classes: `python src/data/manifest.py` → `data/processed/torgo_neuro_symbolic_manifest.csv`. **Regenerated March 4, 2026** — B12 fully resolved.
 - **Full pipeline (canonical)**:
   ```bash
-  python run_pipeline.py --run-name experiment_v4
+  python run_pipeline.py --run-name experiment_v5
   ```
 - **Evaluation-only (reuse checkpoint)**:
   ```bash
-  # Evaluate baseline_v3 (first valid run)
-  python run_pipeline.py --run-name baseline_v3 --skip-train --explain --uncertainty --beam-search --beam-width 25
+  # Evaluate baseline_v4 with beam search, explainability, uncertainty
+  python run_pipeline.py --run-name baseline_v4 --skip-train --explain --uncertainty --beam-search --beam-width 25
+  ```
+- **Neural-only ablation (critical — run next)**:
+  ```bash
+  python run_pipeline.py --run-name ablation_neural_only --ablation neural_only
   ```
 - **Smoke test (5 batches)**:
   ```bash
@@ -583,9 +589,9 @@ When implementing new components:
   ```
 - **Generate publication figures**:
   ```bash
-  python scripts/generate_figures.py --run-name baseline_v3
+  python scripts/generate_figures.py --run-name baseline_v4
   # Compare multiple runs:
-  python scripts/generate_figures.py --run-name baseline_v3 --compare neural_only no_art_heads
+  python scripts/generate_figures.py --run-name baseline_v4 --compare ablation_neural_only no_art_heads
   ```
 - **Run unit tests**:
   ```bash
