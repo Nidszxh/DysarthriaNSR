@@ -57,7 +57,7 @@ from train import (
     run_loso,
     train,
 )
-from evaluate import evaluate_model
+from evaluate import evaluate_model, BigramLMScorer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -250,6 +250,8 @@ def run_evaluation(
     generate_explanations: bool,
     compute_uncertainty: bool,
     uncertainty_n_samples: int,
+    lm_scorer: Optional["BigramLMScorer"] = None,
+    lm_weight: float = 0.0,
 ) -> Dict:
     """
     Execute the evaluation stage via ``evaluate_model()``.
@@ -274,6 +276,10 @@ def run_evaluation(
         Enable explainability pipeline (phoneme attributor, formatter, etc.).
     compute_uncertainty, uncertainty_n_samples:
         Enable MC-Dropout uncertainty estimation.
+    lm_scorer:
+        Optional BigramLMScorer built from training phoneme sequences.
+    lm_weight:
+        Bigram LM shallow-fusion weight λ (0.0 = disabled).
 
     Returns
     -------
@@ -299,6 +305,8 @@ def run_evaluation(
         generate_explanations=generate_explanations,
         compute_uncertainty=compute_uncertainty,
         uncertainty_n_samples=uncertainty_n_samples,
+        lm_scorer=lm_scorer,
+        lm_weight=lm_weight,
     )
 
     log.info(
@@ -361,6 +369,11 @@ def run_auto(args: argparse.Namespace) -> None:
         limit_train_batches = 5
         log.info("Smoke mode: max_epochs=1, limit_train_batches=5")
 
+    # Q4: anomaly detection for NaN/Inf gradient debugging
+    if getattr(args, "detect_anomaly", False):
+        torch.autograd.set_detect_anomaly(True)
+        log.warning("Anomaly detection ENABLED — training will be significantly slower.")
+
     # Resolve device (override config.device if explicitly supplied)
     device: str = args.device if args.device else config.device
     config.device = device
@@ -374,6 +387,10 @@ def run_auto(args: argparse.Namespace) -> None:
     log.info("device         : %s", device)
     log.info("checkpoints/   : %s", ckpt_dir)
     log.info("results/       : %s", results_dir)
+
+    # D4: Save config snapshot to results dir for reproducibility
+    results_dir.mkdir(parents=True, exist_ok=True)
+    config.save(results_dir / "config.yaml")
 
     # ── 3. Training stage ────────────────────────────────────────────────────
     trained_model: Optional[DysarthriaASRLightning] = None
@@ -414,6 +431,30 @@ def run_auto(args: argparse.Namespace) -> None:
     # Build test DataLoader (deterministic split matches training)
     test_loader = _build_test_loader(config, dataset)
 
+    # Build bigram LM from training phoneme sequences (if LM weight requested)
+    _lm_scorer: Optional[BigramLMScorer] = None
+    if args.beam_search and args.lm_weight > 0.0:
+        log.info("Building bigram LM from training phoneme sequences (λ=%.2f)...", args.lm_weight)
+        try:
+            from src.utils.config import normalize_phoneme
+            # Use manifest train split to gather phoneme ID sequences
+            import pandas as pd
+            train_df = dataset.df[dataset.df['split'] == 'train'] if 'split' in dataset.df.columns else dataset.df
+            phn_seqs: list = []
+            for phn_str in train_df['phonemes'].dropna():
+                ids = [
+                    dataset.phn_to_id.get(normalize_phoneme(p), dataset.phn_to_id.get('<UNK>', 2))
+                    for p in str(phn_str).split()
+                ]
+                if ids:
+                    phn_seqs.append(ids)
+            _lm_scorer = BigramLMScorer(k=0.5)
+            _lm_scorer.fit(phn_seqs, vocab_size=len(dataset.phn_to_id))
+            log.info("Bigram LM built from %d training sequences.", len(phn_seqs))
+        except Exception as _lm_exc:
+            log.warning("Bigram LM build failed (non-fatal, falling back to acoustic-only): %s", _lm_exc)
+            _lm_scorer = None
+
     run_evaluation(
         model=model_to_eval,
         test_loader=test_loader,
@@ -430,6 +471,8 @@ def run_auto(args: argparse.Namespace) -> None:
             args.uncertainty_samples if args.uncertainty
             else config.experiment.uncertainty_n_samples
         ),
+        lm_scorer=_lm_scorer,
+        lm_weight=args.lm_weight,
     )
 
 
@@ -484,6 +527,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Skip the evaluation stage. Train only.",
+    )
+    orch.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        default=False,
+        dest="detect_anomaly",
+        help="Enable torch.autograd.set_detect_anomaly(True) for NaN/Inf gradient "
+             "debugging. Significantly slower; use only during debugging runs.",
     )
     orch.add_argument(
         "--smoke",
@@ -545,6 +596,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run the explainability pipeline: phoneme attributor, articulatory "
              "confusion analysis, and ExplainableOutputFormatter. "
              "Writes explanations.json and articulatory_confusion.png to results_dir.",
+    )
+    eval_grp.add_argument(
+        "--lm-weight",
+        type=float,
+        default=0.0,
+        metavar="FLOAT",
+        dest="lm_weight",
+        help="Bigram LM shallow-fusion weight λ for beam search. "
+             "0.0 = disabled (acoustic-only). Typical range: 0.1–0.5. "
+             "LM is built from training phoneme sequences automatically.",
     )
     eval_grp.add_argument(
         "--uncertainty",

@@ -25,7 +25,7 @@ class SymbolicRuleTracker:
         explanation = tracker.generate_explanation()
     """
 
-    def __init__(self, min_confidence: float = 0.5):
+    def __init__(self, min_confidence: float = 0.05):
         self.min_confidence = min_confidence
         self._activations: List[Dict[str, Any]] = []
         self._total_frames: int = 0

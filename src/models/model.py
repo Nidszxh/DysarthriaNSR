@@ -810,6 +810,7 @@ class NeuroSymbolicASR(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         speaker_severity: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        ablation_mode: str = "full",
     ) -> Dict[str, torch.Tensor]:
         """
         Full neuro-symbolic forward pass.
@@ -820,6 +821,11 @@ class NeuroSymbolicASR(nn.Module):
             speaker_severity: Continuous severity [B] in [0, 5]
             output_attentions: If True, return HuBERT attention weights for
                                explainability (ROADMAP §6.1 Method 2)
+            ablation_mode:    One of "full" | "neural_only" | "symbolic_only" |
+                              "no_art_heads".  When "neural_only", the
+                              SeverityAdapter and SymbolicConstraintLayer are
+                              bypassed and log-softmax of the neural logits is
+                              returned directly (Q7 — true neural baseline).
 
         Returns:
             Dict with logits_neural, logits_constrained, log_probs_constrained,
@@ -840,8 +846,10 @@ class NeuroSymbolicASR(nn.Module):
         hidden_states = hubert_outputs.last_hidden_state  # [B, T, 768]
 
         # ── Severity Adapter (Proposal P3) ────────────────────────────────────
-        if self.severity_adapter is not None and speaker_severity is not None:
-            hidden_states = self.severity_adapter(hidden_states, speaker_severity)
+        # Skipped in neural_only ablation for a true neural baseline (Q7).
+        if ablation_mode != "neural_only":
+            if self.severity_adapter is not None and speaker_severity is not None:
+                hidden_states = self.severity_adapter(hidden_states, speaker_severity)
 
         # ── SpecAugment (no-op at eval; masks time/freq regions during training) ──
         if self.spec_augment is not None:
@@ -864,7 +872,7 @@ class NeuroSymbolicASR(nn.Module):
         # gives a proper utterance-level representation that captures the dominant
         # articulatory profile of the whole utterance.  The CE loss in train.py
         # then uses the mode of the phoneme label sequence as the utterance target.
-        if self.manner_head is not None:
+        if self.manner_head is not None and ablation_mode not in ("neural_only", "no_art_heads"):
             pooled_for_art = shared_features.mean(dim=1)  # [B, hidden_dim]
             logits_manner = self.manner_head(pooled_for_art)   # [B, num_manner]
             logits_place  = self.place_head(pooled_for_art)    # [B, num_place]
@@ -872,32 +880,46 @@ class NeuroSymbolicASR(nn.Module):
         else:
             logits_manner = logits_place = logits_voice = None
 
-        # ── Symbolic Constraint Layer ─────────────────────────────────────────
-        symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)
-
-        # ── Valid output-frame lengths (audio-space mask → frame-space) ───────
-        # Used by greedy/beam decoders to skip padding frames that would
-        # otherwise generate spurious phoneme insertions.
+        # ── Compute output_lengths (shared by neural_only and full paths) ─────
         if attention_mask is not None:
-            audio_lengths = attention_mask.sum(dim=-1)  # [B] valid audio samples
+            audio_lengths = attention_mask.sum(dim=-1)
             output_lengths = self.hubert._get_feat_extract_output_lengths(
                 audio_lengths
             ).long()
         else:
-            # If downsampled, hidden_states has already been halved; use its T dim.
             pre_downsample_T = hidden_states.size(1)
             output_lengths = torch.full(
                 (hidden_states.size(0),), pre_downsample_T,
                 dtype=torch.long, device=hidden_states.device,
             )
-
-        # After temporal downsampling the frame count has been halved.
-        # Apply the same formula as Conv1d(kernel=3, stride=2, padding=1):
-        #   T_out = (T_in + 1) // 2  (ceiling division = ceil(T/2))
         if self.temporal_downsampler is not None:
             output_lengths = (output_lengths + 1) // 2
-
         output_lengths = output_lengths.clamp(max=hidden_states.size(1))
+
+        # ── Q7: Neural-only short-circuit ─────────────────────────────────────
+        # When ablation_mode == "neural_only" skip the SymbolicConstraintLayer
+        # entirely so gradients never flow through it.  The constrained logits
+        # alias the neural log-softmax — providing a true neural-only baseline.
+        if ablation_mode == "neural_only":
+            log_probs_neural = F.log_softmax(logits_neural, dim=-1)
+            result_neural_only = {
+                'logits_neural':         logits_neural,
+                'logits_constrained':    log_probs_neural,
+                'log_probs_constrained': log_probs_neural,
+                'hidden_states':         hidden_states,
+                'beta':                  torch.zeros(1, device=logits_neural.device),
+                'P_neural':              F.softmax(logits_neural, dim=-1),
+                'P_constrained':         None,
+                'rule_shift':            None,
+                'logits_manner':         logits_manner,
+                'logits_place':          logits_place,
+                'logits_voice':          logits_voice,
+                'output_lengths':        output_lengths,
+            }
+            return result_neural_only
+
+        # ── Symbolic Constraint Layer ─────────────────────────────────────────
+        symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)
 
         result = {
             'logits_neural':         logits_neural,

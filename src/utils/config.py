@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -143,7 +144,8 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 4   # Effective batch=32 (8×4)
     max_epochs: int = 40
     encoder_warmup_epochs: int = 1          # Unfreeze top layers after 1 epoch (was 3) — spend less time VRAM-idle
-    encoder_second_unfreeze_epoch: int = 6  # Stage 2: unfreeze layers 4-11 at epoch 6 (was 10)
+    encoder_second_unfreeze_epoch: int = 6  # Stage 2: unfreeze layers 6-11 at epoch 6
+    encoder_third_unfreeze_epoch: int = 12  # Stage 3: unfreeze layers 4-11 at epoch 12 (deepest adaptation)
     val_check_interval: float = 1.0        # Validate once per epoch (was 0.5) — halves eval overhead
     
     # Regularization & Loss
@@ -161,17 +163,17 @@ class TrainingConfig:
     # Ordinal contrastive severity loss (Proposal P1)
     lambda_ordinal: float = 0.05
     # Blank-prior KL regularisation (fix CTC insertion pathology)
-    lambda_blank_kl: float = 0.35   # Increased from 0.20 — pushes I/D ratio below 3× target
+    lambda_blank_kl: float = 0.20   # Full-stage target (epochs 20+); gentler than old 0.35
     blank_target_prob: float = 0.82   # Slightly below 0.85: allows a bit more phoneme output to reduce deletions while still suppressing insertions
     # I2: Staged lambda_blank_kl warmup — prevents early CTC collapse from aggressively
     # suppressing blanks before the model has learned basic phoneme boundaries.
     # Schedule:  epochs < stage1_end  → stage1_value (gentle push)
     #            epochs < stage2_end  → stage2_value (moderate push)
-    #            epochs >= stage2_end → lambda_blank_kl (full target, 0.35)
-    blank_kl_stage1_end: int = 5
+    #            epochs >= stage2_end → lambda_blank_kl (full target)
+    blank_kl_stage1_end: int = 10
     blank_kl_stage1_value: float = 0.10
-    blank_kl_stage2_end: int = 15
-    blank_kl_stage2_value: float = 0.20
+    blank_kl_stage2_end: int = 20
+    blank_kl_stage2_value: float = 0.15
     # Symbolic KL anchor (keeps learnable C near symbolic prior)
     lambda_symbolic_kl: float = 0.05
 
@@ -180,6 +182,7 @@ class TrainingConfig:
     monitor_mode: str = "min"
     early_stopping_patience: int = 8
     beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
+    beam_lm_weight: float = 0.0           # Bigram LM shallow-fusion weight (0.0 = disabled)
     save_top_k: int = 2
     
     # HW Acceleration — optimised for RTX 4060 + modern NVMe
@@ -211,7 +214,10 @@ class ExperimentConfig:
     """MLflow and Experiment Tracking."""
     experiment_name: str = "DysarthriaNSR"
     run_name: str = "rtx4060_optimized_v1"
-    tracking_uri: str = field(default_factory=lambda: f"file:{ProjectPaths().mlruns_dir}")
+    tracking_uri: str = field(default_factory=lambda: (
+        os.environ.get("MLFLOW_TRACKING_URI")
+        or f"file://{ProjectPaths().mlruns_dir.resolve()}"
+    ))
     log_every_n_steps: int = 20
     log_gradients: bool = False
     log_model_architecture: bool = True
@@ -247,7 +253,7 @@ class SymbolicConfig:
     place_weight: float = 0.35
     voice_weight: float = 0.25
     distance_decay_factor: float = 3.0
-    min_rule_confidence: float = 0.1  # C5: lowered from 0.5; β ≈ 0.05–0.2 means most rules scored below 0.5
+    min_rule_confidence: float = 0.05  # C5: lowered to 0.05; β ≈ 0.05–0.20 at typical operating range
     severity_threshold_mild: float = 2.0
     severity_threshold_severe: float = 4.0
     track_rule_activations: bool = True

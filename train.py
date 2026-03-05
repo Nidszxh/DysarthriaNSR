@@ -25,6 +25,7 @@ project_root = Path(__file__).resolve().parent
 sys.path.insert(2, str(project_root / "src"))
 
 from src.utils.config import Config, get_default_config, get_project_root, get_speaker_severity
+from src.utils.sequence_utils import align_labels_to_logits
 from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
 import os
 from src.models.model import NeuroSymbolicASR
@@ -226,6 +227,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             input_values=batch['input_values'],
             attention_mask=batch['attention_mask'],
             speaker_severity=severity,
+            ablation_mode=self.config.training.ablation_mode,  # Q7: true neural-only ablation
         )
     
     def compute_loss(
@@ -351,7 +353,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         batch_size, time_steps_logits, num_classes = logits.shape
 
         # Align labels to logits time dimension
-        labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
+        labels_aligned = align_labels_to_logits(labels, time_steps_logits)
 
         # Compute loss — CrossEntropyLoss handles softmax internally
         logits_flat = logits.reshape(-1, num_classes)
@@ -391,38 +393,11 @@ class DysarthriaASRLightning(pl.LightningModule):
         else:
             # Legacy frame-level path [B, T, C]
             batch_size, time_steps_logits, num_classes = logits.shape
-            labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
+            labels_aligned = align_labels_to_logits(labels, time_steps_logits)
             logits_flat = logits.reshape(-1, num_classes)
             labels_flat = labels_aligned.reshape(-1)
             return self.art_ce_losses[key](logits_flat, labels_flat)
-    
-    def _align_labels_to_logits(self, labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
-        """
-        Align label sequence length to match logits time dimension.
-        
-        Args:
-            labels: Label tensor [batch, seq_len]
-            time_steps_logits: Target time dimension
-            
-        Returns:
-            Aligned labels [batch, time_steps_logits]
-        """
-        batch_size = labels.size(0)
-        time_steps_labels = labels.size(1)
-        
-        if time_steps_labels < time_steps_logits:
-            # Pad with -100 (ignored by loss)
-            padding = torch.full(
-                (batch_size, time_steps_logits - time_steps_labels),
-                -100,
-                dtype=labels.dtype,
-                device=labels.device
-            )
-            return torch.cat([labels, padding], dim=1)
-        else:
-            # Truncate to match logits
-            return labels[:, :time_steps_logits]
-    
+
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         """
         Training step.
@@ -566,18 +541,33 @@ class DysarthriaASRLightning(pl.LightningModule):
             beta_val = beta_val.mean()
         self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
 
+        # Q4: Gradient norm monitoring — log L2 norm every 50 steps for stability diagnostics.
+        # Logged after the backward pass has populated .grad attributes via Lightning's
+        # on_before_optimizer_step hook ordering; accessing here is safe because
+        # training_step is called before the optimizer step in Lightning 2.x.
+        if self.global_step % 50 == 0:
+            total_norm_sq = sum(
+                p.grad.detach().norm(2).item() ** 2
+                for p in self.parameters()
+                if p.grad is not None
+            )
+            grad_norm = total_norm_sq ** 0.5
+            self.log('train/grad_norm', grad_norm, on_step=True, prog_bar=False)
+
         return losses['loss']
 
     def on_train_epoch_start(self) -> None:
-        """Two-stage progressive HuBERT unfreezing + staged blank-KL warmup (I2).
+        """Three-stage progressive HuBERT unfreezing + staged blank-KL warmup (I2).
 
         Stage 1 (encoder_warmup_epochs, default 1):
             Unfreeze top 4 layers (8-11) after 1 warm-up epoch so the head
             stabilises quickly without wasting VRAM budget.
         Stage 2 (encoder_second_unfreeze_epoch, default 6):
-            Apply permanent freeze config (layers 0-3 only), unlocking 4-11.
-            With freeze_encoder_layers=[0-3] this means 8 layers are active,
-            filling considerably more VRAM on the RTX 4060.
+            Unfreeze layers 6-11; keeps bottom 4 frozen for stability.
+        Stage 3 (encoder_third_unfreeze_epoch, default 12):
+            Unfreeze layers 4-11 for deepest dysarthric adaptation.
+            With freeze_encoder_layers=[0-3] this unlocks the maximum
+            number of HuBERT layers while preserving generic acoustic features.
 
         Blank-KL staging (I2): ramp lambda_blank_kl from a gentle initial value to
         the full target over training to avoid CTC collapse in early epochs when the
@@ -586,6 +576,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         epoch           = self.current_epoch
         warmup_ep       = self.config.training.encoder_warmup_epochs
         second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 6)
+        third_unfreeze  = getattr(self.config.training, 'encoder_third_unfreeze_epoch', 12)
 
         if not self.encoder_unfrozen and epoch >= warmup_ep:
             # Stage 1: unfreeze top 4 layers only
@@ -596,10 +587,18 @@ class DysarthriaASRLightning(pl.LightningModule):
         elif (self.encoder_unfrozen
               and not getattr(self, '_encoder_deep_unfrozen', False)
               and epoch >= second_unfreeze):
-            # Stage 2: apply final freeze config (keeps 0-5 frozen, frees 6-11)
+            # Stage 2: unfreeze layers 6-11
             self.model.unfreeze_after_warmup()
             self._encoder_deep_unfrozen = True
             print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
+
+        elif (getattr(self, '_encoder_deep_unfrozen', False)
+              and not getattr(self, '_encoder_deeper_unfrozen', False)
+              and epoch >= third_unfreeze):
+            # Stage 3: unfreeze layers 4-11 (deepest adaptation to dysarthric speech)
+            self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
+            self._encoder_deeper_unfrozen = True
+            print(f"🔥 Stage 3: Unfroze HuBERT layers 4-11 at epoch {epoch}")
 
         # I2: Staged lambda_blank_kl ramp ─────────────────────────────────────
         tr = self.config.training
@@ -1246,7 +1245,10 @@ def train(
     # Setup callbacks
     checkpoint_dir = get_project_root() / "checkpoints" / config.experiment.run_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # D4: Persist config alongside checkpoint for reproducibility
+    config.save(checkpoint_dir / "config.yaml")
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(checkpoint_dir),
         filename='{epoch:02d}-{val_per:.3f}',

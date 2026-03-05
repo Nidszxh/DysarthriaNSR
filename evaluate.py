@@ -45,28 +45,79 @@ except ImportError:
         def get_project_root() -> Path:
             return project_root
 
-
-def _align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
-    """
-    Align label sequence length to match logits time dimension.
-
-    Pads with -100 (ignored) or truncates to fit the logits time axis.
-    """
-    batch_size = labels.size(0)
-    time_steps_labels = labels.size(1)
-
-    if time_steps_labels < time_steps_logits:
-        padding = torch.full(
-            (batch_size, time_steps_logits - time_steps_labels),
-            -100,
-            dtype=labels.dtype,
-            device=labels.device
-        )
-        return torch.cat([labels, padding], dim=1)
-    return labels[:, :time_steps_logits]
+try:
+    from src.utils.sequence_utils import align_labels_to_logits as _align_labels_to_logits
+except ImportError:
+    # Inline fallback — should not happen in a correctly installed package
+    def _align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
+        batch_size = labels.size(0)
+        t = labels.size(1)
+        if t < time_steps_logits:
+            pad = torch.full((batch_size, time_steps_logits - t), -100,
+                             dtype=labels.dtype, device=labels.device)
+            return torch.cat([labels, pad], dim=1)
+        return labels[:, :time_steps_logits]
 
 
 # DECODING UTILITIES
+
+class BigramLMScorer:
+    """Phoneme bigram language model for CTC beam search shallow fusion.
+
+    Built from training phoneme sequences using add-k (Laplace) smoothing.
+    Provides log P(next_id | prev_id) for use as a beam-search bonus:
+
+        combined_score = acoustic_score + lm_weight * lm_score
+
+    Args:
+        k: Laplace smoothing constant (default 0.5 — softer than add-1).
+    """
+
+    def __init__(self, k: float = 0.5) -> None:
+        self.k = k
+        self._bigram_counts: Dict = defaultdict(int)   # (prev_id, next_id) → count
+        self._unigram_counts: Dict = defaultdict(int)  # prev_id → count
+        self._vocab_size: int = 0
+        self._built: bool = False
+
+    def fit(
+        self,
+        phoneme_id_seqs: List[List[int]],
+        vocab_size: int,
+    ) -> None:
+        """Count bigrams from training sequences and set vocab size for smoothing.
+
+        Args:
+            phoneme_id_seqs: List of phoneme-ID sequences (from training labels).
+            vocab_size:      Total vocabulary size (len(phn_to_id)).
+        """
+        for seq in phoneme_id_seqs:
+            clean = [t for t in seq if t >= 0]  # drop -100 padding
+            for i in range(len(clean) - 1):
+                self._bigram_counts[(clean[i], clean[i + 1])] += 1
+                self._unigram_counts[clean[i]] += 1
+            if clean:
+                self._unigram_counts[clean[-1]] += 1
+        self._vocab_size = vocab_size
+        self._built = True
+
+    def log_prob(self, prev_id: int, next_id: int) -> float:
+        """Return log P(next_id | prev_id) with add-k smoothing."""
+        if not self._built:
+            return 0.0
+        num = self._bigram_counts.get((prev_id, next_id), 0) + self.k
+        den = self._unigram_counts.get(prev_id, 0) + self.k * self._vocab_size
+        return float(np.log(max(num / max(den, 1e-10), 1e-10)))
+
+    def score_prefix(self, prefix: tuple) -> float:
+        """Sum log-bigram probs for all consecutive pairs in prefix."""
+        if len(prefix) < 2:
+            return 0.0
+        return sum(
+            self.log_prob(prefix[i], prefix[i + 1])
+            for i in range(len(prefix) - 1)
+        )
+
 
 class BeamSearchDecoder:
     """
@@ -76,10 +127,19 @@ class BeamSearchDecoder:
     Significantly more accurate than greedy decoding for ambiguous sequences.
     """
     
-    def __init__(self, beam_width: int = 10, blank_id: int = 0, length_norm_alpha: float = 0.0):
+    def __init__(
+        self,
+        beam_width: int = 10,
+        blank_id: int = 0,
+        length_norm_alpha: float = 0.0,
+        lm_scorer: Optional["BigramLMScorer"] = None,
+        lm_weight: float = 0.0,
+    ) -> None:
         self.beam_width        = beam_width
         self.blank_id          = blank_id
-        self.length_norm_alpha = length_norm_alpha   # 0.0 = no normalisation; 0.6 = standard
+        self.length_norm_alpha = length_norm_alpha
+        self.lm_scorer         = lm_scorer    # Optional bigram LM for shallow fusion
+        self.lm_weight         = lm_weight    # λ; 0.0 = acoustic-only
     def decode(
         self,
         log_probs: np.ndarray,
@@ -104,58 +164,74 @@ class BeamSearchDecoder:
             3. Return highest probability hypothesis
         """
         T, num_classes = log_probs.shape
-        
-        # Initialize beam: {prefix: (p_blank, p_non_blank)}
-        beam = {(): (0.0, float('-inf'))}
-        
+
+        # Beam state: {prefix: (p_blank, p_non_blank, lm_cumulative_score)}
+        # p_blank and p_non_blank are PURE acoustic log-probs (CTC semantics).
+        # lm_cumulative_score accumulates bigram log-probs per emitted token.
+        # They are kept separate so CTC collapse arithmetic stays correct.
+        beam: Dict[tuple, tuple] = {(): (0.0, float('-inf'), 0.0)}
+
+        use_lm = (self.lm_scorer is not None and self.lm_weight > 0.0)
+
         for t in range(T):
-            new_beam = defaultdict(lambda: (float('-inf'), float('-inf')))
-            
-            for prefix, (p_b, p_nb) in beam.items():
-                # Extend with blank
+            new_beam: Dict[tuple, tuple] = defaultdict(
+                lambda: (float('-inf'), float('-inf'), 0.0)
+            )
+
+            for prefix, (p_b, p_nb, lm_acc) in beam.items():
+                # --- Extend with blank (acoustic only; LM unchanged) ----------
                 new_p_b = np.logaddexp(p_b, p_nb) + log_probs[t, self.blank_id]
+                prev_b, prev_nb, prev_lm = new_beam[prefix]
                 new_beam[prefix] = (
-                    np.logaddexp(new_beam[prefix][0], new_p_b),
-                    new_beam[prefix][1]
+                    np.logaddexp(prev_b, new_p_b),
+                    prev_nb,
+                    max(prev_lm, lm_acc),  # preserve latest LM acc for this prefix
                 )
-                
-                # Extend with non-blank phonemes
+
+                # --- Extend with non-blank phonemes ---------------------------
                 for c in range(num_classes):
                     if c == self.blank_id:
                         continue
-                    
-                    # New prefix
-                    if len(prefix) > 0 and prefix[-1] == c:
-                        # Repeated token: only extend from blank
-                        new_prefix = prefix
-                        new_p_nb = p_b + log_probs[t, c]
-                    else:
-                        # New token: extend from both blank and non-blank
-                        new_prefix = prefix + (c,)
-                        new_p_nb = np.logaddexp(p_b, p_nb) + log_probs[t, c]
-                    
-                    new_beam[new_prefix] = (
-                        new_beam[new_prefix][0],
-                        np.logaddexp(new_beam[new_prefix][1], new_p_nb)
-                    )
-            
-            # Prune to beam_width
-            beam = dict(sorted(
-                new_beam.items(),
-                key=lambda x: np.logaddexp(x[1][0], x[1][1]),
-                reverse=True
-            )[:self.beam_width])
-        
-        # Get best hypothesis — apply length normalisation to avoid favouring
-        # short sequences (score / len^alpha).  alpha=0.0 → no normalisation.
-        def _norm_score(prefix: tuple, p_b: float, p_nb: float) -> float:
-            raw = np.logaddexp(p_b, p_nb)
-            length = max(len(prefix), 1)
-            return raw / (length ** self.length_norm_alpha)
 
-        best_prefix, (p_b, p_nb) = max(
+                    if len(prefix) > 0 and prefix[-1] == c:
+                        # Repeated token → same prefix, extend from blank only
+                        new_prefix = prefix
+                        new_p_nb   = p_b + log_probs[t, c]
+                        new_lm_acc = lm_acc   # no new token emitted
+                    else:
+                        # New token → extend prefix, update LM accumulator
+                        new_prefix = prefix + (c,)
+                        new_p_nb   = np.logaddexp(p_b, p_nb) + log_probs[t, c]
+                        if use_lm and len(prefix) > 0:
+                            # Incremental bigram score for this single new token
+                            new_lm_acc = lm_acc + self.lm_scorer.log_prob(prefix[-1], c)
+                        else:
+                            new_lm_acc = lm_acc
+
+                    prev_b, prev_nb, prev_lm = new_beam[new_prefix]
+                    new_beam[new_prefix] = (
+                        prev_b,
+                        np.logaddexp(prev_nb, new_p_nb),
+                        max(prev_lm, new_lm_acc),
+                    )
+
+            # Prune to beam_width — rank by acoustic + LM together
+            def _beam_rank(item: tuple) -> float:
+                pfx, (pb, pnb, lm_s) = item
+                return np.logaddexp(pb, pnb) + (self.lm_weight * lm_s if use_lm else 0.0)
+
+            beam = dict(sorted(new_beam.items(), key=_beam_rank, reverse=True)[:self.beam_width])
+
+        # Final selection: acoustic score / len^α + λ * lm_cumulative
+        def _norm_score(prefix: tuple, p_b: float, p_nb: float, lm_s: float) -> float:
+            acoustic = np.logaddexp(p_b, p_nb)
+            lm_bonus = (self.lm_weight * lm_s) if use_lm else 0.0
+            length   = max(len(prefix), 1)
+            return (acoustic + lm_bonus) / (length ** self.length_norm_alpha)
+
+        best_prefix, (p_b, p_nb, _lm) = max(
             beam.items(),
-            key=lambda x: _norm_score(x[0], x[1][0], x[1][1])
+            key=lambda x: _norm_score(x[0], x[1][0], x[1][1], x[1][2])
         )
         best_score = np.logaddexp(p_b, p_nb)
         
@@ -367,6 +443,8 @@ def decode_predictions(
     use_beam_search: bool = False,
     beam_width: int = 10,
     output_lengths: Optional[torch.Tensor] = None,
+    lm_scorer: Optional[BigramLMScorer] = None,
+    lm_weight: float = 0.0,
 ) -> List[List[str]]:
     """
     Decode model logits into phoneme sequences.
@@ -379,6 +457,8 @@ def decode_predictions(
         beam_width:     Beam width for beam search.
         output_lengths: Valid frame count per sample [batch] (from model).
                         Prevents padding-frame noise from becoming insertions.
+        lm_scorer:      Optional BigramLMScorer for shallow-fusion LM rescoring.
+        lm_weight:      LM weight λ for shallow fusion (0.0 = disabled).
     """
     if use_beam_search:
         _alpha = getattr(getattr(config, 'training', None), 'beam_length_norm_alpha', 0.6)
@@ -386,6 +466,8 @@ def decode_predictions(
             beam_width=beam_width,
             blank_id=phn_to_id['<BLANK>'],
             length_norm_alpha=_alpha,
+            lm_scorer=lm_scorer,
+            lm_weight=lm_weight,
         )
         predictions = []
         for i in range(log_probs.size(0)):
@@ -951,6 +1033,8 @@ def evaluate_model(
     generate_explanations: bool = False,
     compute_uncertainty: bool = False,
     uncertainty_n_samples: int = 20,
+    lm_scorer: Optional[BigramLMScorer] = None,
+    lm_weight: float = 0.0,
 ) -> Dict:
     """
     Comprehensive model evaluation with statistical rigor.
@@ -969,6 +1053,8 @@ def evaluate_model(
         compute_uncertainty: Enable MC-Dropout uncertainty estimation via
             UncertaintyAwareDecoder (default: False)
         uncertainty_n_samples: Number of MC-Dropout forward passes (default: 20)
+        lm_scorer: Optional BigramLMScorer for beam-search shallow fusion.
+        lm_weight: LM weight λ (0.0 = acoustic-only; typical range 0.1–0.5).
 
     Returns:
         Dictionary of evaluation metrics with confidence intervals
@@ -979,11 +1065,18 @@ def evaluate_model(
     results_dir.mkdir(parents=True, exist_ok=True)
     
     model.eval()
-    
+
     # Initialize decoder
     if use_beam_search:
-        decoder = BeamSearchDecoder(beam_width=beam_width, blank_id=phn_to_id['<BLANK>'], length_norm_alpha=0.6)
-        print(f"🔍 Using beam search decoder (width={beam_width})")
+        decoder = BeamSearchDecoder(
+            beam_width=beam_width,
+            blank_id=phn_to_id['<BLANK>'],
+            length_norm_alpha=0.6,
+            lm_scorer=lm_scorer,
+            lm_weight=lm_weight,
+        )
+        _lm_tag = f", LM λ={lm_weight:.2f}" if (lm_scorer is not None and lm_weight > 0) else ""
+        print(f"🔍 Using beam search decoder (width={beam_width}{_lm_tag})")
     else:
         print("🔍 Using greedy decoder")
     

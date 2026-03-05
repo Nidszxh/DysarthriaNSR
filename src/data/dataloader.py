@@ -512,7 +512,7 @@ class NeuroSymbolicCollator:
         }
 
 
-def create_dataloaders(
+def create_single_dataloader(
     manifest_path: str,
     processor_id: str = "facebook/hubert-base-ls960",
     batch_size: int = 4,
@@ -567,7 +567,7 @@ def main() -> None:
         )
     
     # Create dataloader
-    loader = create_dataloaders(
+    loader = create_single_dataloader(
         manifest_path=str(manifest_path),
         processor_id=config.model.hubert_model_id,
         batch_size=config.training.batch_size,
