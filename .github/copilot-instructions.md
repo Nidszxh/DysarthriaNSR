@@ -3,9 +3,10 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v4` trained and fully evaluated (March 5, 2026).
-**Latest baseline**: baseline_v4 (March 5, 2026) — beam-search test PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×). **Critical finding**: symbolic constraints hurt (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170).
-**Previous baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
+**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v5` trained and evaluated (March 6, 2026). LOSO-CV not yet run.
+**Latest baseline**: baseline_v5 (March 6, 2026) — beam-search test PER **0.4750**, val/per 0.505 (epoch 28/30), 98.9M total / 66.4M trainable, I/D=0.9×. **Critical finding**: symbolic constraints still hurt (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). Articulatory accuracy: manner 78.3%, place 79.3%, voice 92.3%. Identical performance to v4 — symbolic layer is the bottleneck.
+**Previous baseline**: baseline_v4 (March 5, 2026) — beam-search PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×)
+**Earlier baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
 **Reference only**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; data leakage; results inflated)
 **Superseded**: baseline_v1 — Test PER 0.567 ± 0.365 (B3 attention mask bug was active)
 **Orchestrator**: `run_pipeline.py` is the canonical entry point — use it instead of calling `train.py` / `evaluate.py` directly.
@@ -93,12 +94,12 @@ The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative) | Run `--ablation neural_only` immediately; inspect `LearnableConstraintMatrix` initialization |
-| Test split = only 3 speakers | Severity correlation p=0.347 (n.s.); dys vs ctrl gap may be speaker artifact | Needs full LOSO-CV |
-| Substitution/Deletion dominance | 13,868 subs + 4,292 del vs 3,734 ins in v4 | Insertion bias resolved but substitution bias high |
-| `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are deletions to `<BLANK>` | Rules not matching phoneme confusion patterns |
+| **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative); reproduced in v4 **and** v5 | Run `--ablation neural_only`; set `use_learnable_constraint=False` in config and rerun |
+| **LOSO-CV not run** (HIGH) | n=3 test speakers; severity correlation p=0.347 (n.s.) — no statistically valid macro-PER estimate | `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h); fix symbolic constraint first |
+| Substitution/Deletion dominance | 13,821 subs + 4,338 del vs 3,752 ins in v5 | Insertion bias resolved, substitution dominance persists |
+| `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are X→`<BLANK>` deletions | Rules not matching confusion patterns; linked to symbolic constraint issue |
 | `PhonemeAttributor.attention_attribution` disabled | Requires CTC forced alignment | Future work |
-| `ablation_mode='neural_only'` incomplete | Doesn't disable SeverityAdapter / LearnableConstraintMatrix forward passes | Fix before ablation run |
+| `ablation_mode='neural_only'` incomplete | Doesn't disable SeverityAdapter / LearnableConstraintMatrix forward passes | Fix before running ablation |
 
 ---
 
@@ -519,17 +520,24 @@ for layer_idx in freeze_encoder_layers:
 - ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
 - ✅ Automated tests: `scripts/smoke_test.py` — 7/7 passing
 - ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
-- ✅ **Baseline model (baseline_v4)**: beam PER 0.4748, val/per 0.504 (epoch 28/40); 98.9M params (66.4M trainable, 67.1%); staged unfreezing; insertion bias resolved (I/D=0.87×); articulatory accuracy manner 78.6% / place 79.1% / voice 92.4%
+- ✅ **Baseline model (baseline_v5)**: beam PER **0.4750**, val/per 0.505 (epoch 28/30); 98.9M params (66.4M trainable); I/D=0.9×; articulatory manner 78.3% / place 79.3% / voice 92.3%. Identical to v4 — symbolic layer confirmed bottleneck.
+- ✅ **Baseline model (baseline_v4)**: beam PER 0.4748, val/per 0.504 (epoch 28/40); staged unfreezing; insertion bias resolved (I/D=0.87×); articulatory manner 78.6% / place 79.1% / voice 92.4%
 - ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; first run with valid speaker-independent splits
 - ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused data leakage. Preserved as historical reference.
 
 ## Next Steps: What Remains
 
-- **Neural-only ablation** (CRITICAL — immediate): `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — diagnose symbolic constraint harm (`per_neural=0.305` vs `per_constrained=0.475`)
-- **Fix `ablation_mode='neural_only'`**: Ensure it disables SeverityAdapter / LearnableConstraintMatrix forward passes before running ablation
-- **Regenerate figures** for baseline_v4: `python scripts/generate_figures.py --run-name baseline_v4`
-- **Additional ablations**: `no_art_heads`, `no_constraint_matrix` via `--ablation`
-- **LOSO-CV**: Run 15-speaker leave-one-out for statistically valid macro-PER and severity correlation
+### Immediate (blocking LOSO)
+1. **Fix `ablation_mode='neural_only'`**: Must fully disable SeverityAdapter + LearnableConstraintMatrix forward passes before ablation results are meaningful
+2. **Neural-only ablation** (CRITICAL): `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — confirm neural floor (`per_neural≈0.305`)
+3. **Disable learnable constraint**: Set `use_learnable_constraint=False` in `src/utils/config.py` and validate on a short run
+
+### Next priority
+4. **LOSO-CV** (~15–22h): `python run_pipeline.py --run-name loso_v1 --loso` — run only after symbolic constraint is fixed/ablated; produces statistically valid macro-PER (n=15) and severity correlation
+5. **Regenerate figures** for baseline_v5: `python scripts/generate_figures.py --run-name baseline_v5`
+6. **Additional ablations**: `--ablation no_art_heads`, `--ablation no_constraint_matrix`
+
+### Long-term
 - **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules
 - **CTC forced alignment**: enables `PhonemeAttributor.attention_attribution`
 - **Clinician dashboard**: ONNX export, streaming inference
