@@ -827,10 +827,13 @@ class NeuroSymbolicASR(nn.Module):
             logits_manner/place/voice, attention_weights (if requested)
         """
         # ── HuBERT encoding ───────────────────────────────────────────────────
+        # output_hidden_states only when attn weights are needed (explainability).
+        # Setting it True unconditionally stores all 12 intermediate [B,T,768]
+        # tensors (~120 MB at batch=16) even though only last_hidden_state is used.
         hubert_outputs = self.hubert(
             input_values,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            output_hidden_states=False,
             output_attentions=output_attentions,
             return_dict=True,
         )
@@ -853,10 +856,21 @@ class NeuroSymbolicASR(nn.Module):
             hidden_states, return_features=True
         )
 
-        # ── Articulatory Auxiliary Heads ──────────────────────────────────────
-        logits_manner = self.manner_head(shared_features) if self.manner_head else None
-        logits_place  = self.place_head(shared_features)  if self.place_head  else None
-        logits_voice  = self.voice_head(shared_features)  if self.voice_head  else None
+        # ── Articulatory Auxiliary Heads (utterance-level via GAP) ──────────────
+        # CTC models produce no forced alignment, so frame-level articulatory
+        # supervision assigns a single phoneme label to every output frame, which
+        # is semantically incorrect (the model receives contradictory gradients for
+        # most frame positions).  Global average pooling over the time axis first
+        # gives a proper utterance-level representation that captures the dominant
+        # articulatory profile of the whole utterance.  The CE loss in train.py
+        # then uses the mode of the phoneme label sequence as the utterance target.
+        if self.manner_head is not None:
+            pooled_for_art = shared_features.mean(dim=1)  # [B, hidden_dim]
+            logits_manner = self.manner_head(pooled_for_art)   # [B, num_manner]
+            logits_place  = self.place_head(pooled_for_art)    # [B, num_place]
+            logits_voice  = self.voice_head(pooled_for_art)    # [B, num_voice]
+        else:
+            logits_manner = logits_place = logits_voice = None
 
         # ── Symbolic Constraint Layer ─────────────────────────────────────────
         symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)

@@ -332,35 +332,32 @@ def compute_wer_texts(
 ) -> float:
     """
     Compute Word Error Rate (WER) for lists of predicted and reference texts.
-    
+
+    Compatible with jiwer ≥ 4.0 (list-level batch API).
+    When phoneme sequences are passed as space-separated strings the
+    "words" are individual phoneme tokens, so WER == PER at the token level.
+
     Args:
         predictions_text: List of predicted transcripts (strings)
         references_text: List of reference transcripts (strings)
-    
+
     Returns:
-        Average WER across samples
+        Corpus-level WER (float in [0, ∞))
     """
     if not predictions_text or not references_text:
         return 0.0
-    
+
     assert len(predictions_text) == len(references_text), "Pred/Ref text length mismatch"
-    
-    # Standard normalization chain
-    transformation = jiwer.Compose([
-        jiwer.ToLowerCase(),
-        jiwer.RemoveMultipleSpaces(),
-        jiwer.Strip(),
-        jiwer.RemovePunctuation(),
-    ])
-    
-    wers = []
-    for pred, ref in zip(predictions_text, references_text):
-        wers.append(jiwer.wer(
-            ref, pred,
-            truth_transform=transformation,
-            hypothesis_transform=transformation
-        ))
-    return float(np.mean(wers))
+
+    # Normalise to lowercase, strip extra whitespace
+    def _norm(s: str) -> str:
+        return ' '.join(s.lower().split())
+
+    refs  = [_norm(r) for r in references_text]
+    hyps  = [_norm(p) for p in predictions_text]
+
+    # jiwer 4.x can compute corpus WER directly from two lists of strings
+    return float(jiwer.wer(refs, hyps))
 
 
 def decode_predictions(
@@ -545,6 +542,71 @@ def analyze_phoneme_errors(
     }
 
 
+def compute_per_phoneme_breakdown(
+    predictions: List[List[str]],
+    references: List[List[str]],
+) -> Dict[str, Dict]:
+    """
+    Compute per-phoneme substitution, deletion, insertion counts and PER.
+
+    For each phoneme that appears in the reference, computes:
+      - n_ref : total occurrences in reference
+      - n_sub : times it was substituted by a different phoneme
+      - n_del : times it was deleted
+      - n_ins : times it was spuriously inserted as that phoneme token
+      - per   : (n_sub + n_del) / n_ref
+
+    Args:
+        predictions: List of predicted phoneme sequences.
+        references:  List of reference phoneme sequences.
+
+    Returns:
+        Dict mapping phoneme → {n_ref, n_sub, n_del, n_ins, per},
+        sorted by PER descending.
+    """
+    from collections import defaultdict as _dd
+    counts: Dict[str, Dict[str, int]] = _dd(lambda: {'n_ref': 0, 'n_sub': 0, 'n_del': 0, 'n_ins': 0})
+
+    for pred, ref in zip(predictions, references):
+        alignment = phoneme_alignment(pred, ref)
+        for op, pred_ph, ref_ph in alignment:
+            if op == 'correct':
+                # ref_ph correctly predicted
+                counts[ref_ph]['n_ref'] += 1
+            elif op == 'substitute':
+                # ref_ph present in ref but wrongly predicted as pred_ph
+                counts[ref_ph]['n_ref'] += 1
+                counts[ref_ph]['n_sub'] += 1
+                if pred_ph:
+                    counts[pred_ph]['n_ins'] += 1  # spurious prediction
+            elif op == 'insert':
+                # ref has ref_ph but prediction missed it → deletion from ASR view
+                # (pred_ph is None in this alignment op)
+                if ref_ph:
+                    counts[ref_ph]['n_ref'] += 1
+                    counts[ref_ph]['n_del'] += 1
+            elif op == 'delete':
+                # pred has pred_ph not present in ref → spurious insertion from ASR view
+                # (ref_ph is None in this alignment op)
+                if pred_ph:
+                    counts[pred_ph]['n_ins'] += 1
+
+    result: Dict[str, Dict] = {}
+    for ph, c in counts.items():
+        n_ref = c['n_ref']
+        per_ph = (c['n_sub'] + c['n_del']) / n_ref if n_ref > 0 else 0.0
+        result[ph] = {
+            'n_ref': n_ref,
+            'n_sub': c['n_sub'],
+            'n_del': c['n_del'],
+            'n_ins': c['n_ins'],
+            'per': round(float(per_ph), 4),
+        }
+
+    # Sort by PER descending for human-readable JSON output
+    return dict(sorted(result.items(), key=lambda x: x[1]['per'], reverse=True))
+
+
 # STRATIFIED ANALYSIS
 
 def stratify_by_phoneme_length(
@@ -687,22 +749,111 @@ def plot_per_by_length(
     print(f"✅ Saved length-stratified PER plot to {save_path}")
 
 
-def plot_rule_impact(stats: Dict, save_path: Path) -> None:
-    """Visualize the most active symbolic corrections."""
-    if not stats or not stats.get('top_rules'):
+def plot_rule_impact(
+    stats: Dict,
+    save_path: Path,
+    model=None,
+    id_to_phn: Optional[Dict[int, str]] = None,
+) -> None:
+    """Visualize the most active symbolic corrections.
+
+    E6: When no rule activations have been recorded (``top_rules`` is empty),
+    fall back to displaying the current constraint matrix as a log-scale heatmap.
+    This gives reviewers a symbolic-layer visualisation even when
+    ``SymbolicRuleTracker`` returns zero activations.
+
+    Args:
+        stats:      Rule statistics dict from ``model.get_rule_statistics()``.
+        save_path:  PNG output path.
+        model:      Optional model reference; used for fallback heatmap.
+        id_to_phn:  Optional ID→phoneme mapping; used to label heatmap axes.
+    """
+    if stats and stats.get('top_rules'):
+        # Normal path: bar chart of rule activation frequencies
+        rules  = [f"{r[0][0]}->{r[0][1]}" for r in stats['top_rules']]
+        counts = [r[1] for r in stats['top_rules']]
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=counts, y=rules, palette="viridis")
+        plt.title("Top Symbolic Corrections (Rule Activations)")
+        plt.xlabel("Frequency of Activation")
+        plt.ylabel("Phoneme Substitution (Neural -> Symbolic)")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
         return
 
-    rules = [f"{r[0][0]}->{r[0][1]}" for r in stats['top_rules']]
-    counts = [r[1] for r in stats['top_rules']]
+    # E6 fallback: constraint matrix heatmap ─────────────────────────────────
+    if model is None:
+        return  # Nothing to show
+    try:
+        C = model.get_constraint_matrix()  # [V, V] tensor (or numpy array)
+        if hasattr(C, 'cpu'):
+            C = C.cpu().numpy()
+        C = np.array(C, dtype=float)
 
-    plt.figure(figsize=(10, 6))
-    sns.barplot(x=counts, y=rules, palette="viridis")
-    plt.title("Top Symbolic Corrections (Rule Activations)")
-    plt.xlabel("Frequency of Activation")
-    plt.ylabel("Phoneme Substitution (Neural -> Symbolic)")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
+        # Use log scale to reveal small non-zero entries
+        C_log = np.log1p(C)
+
+        # Build tick labels from id_to_phn if available
+        n = C.shape[0]
+        if id_to_phn and len(id_to_phn) == n:
+            labels = [id_to_phn.get(i, str(i)) for i in range(n)]
+        else:
+            labels = None
+
+        fig, ax = plt.subplots(figsize=(max(10, n // 3), max(8, n // 3)))
+        im = ax.imshow(C_log, aspect='auto', cmap='viridis', origin='upper')
+        plt.colorbar(im, ax=ax, label='log(1 + constraint weight)')
+        if labels:
+            tick_step = max(1, n // 20)
+            ticks = list(range(0, n, tick_step))
+            ax.set_xticks(ticks)
+            ax.set_yticks(ticks)
+            ax.set_xticklabels([labels[t] for t in ticks], rotation=90, fontsize=6)
+            ax.set_yticklabels([labels[t] for t in ticks], fontsize=6)
+        ax.set_xlabel('Target phoneme (column)')
+        ax.set_ylabel('Source phoneme (row)')
+        ax.set_title('Symbolic Constraint Matrix (E6 fallback — no rule activations recorded)')
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print("✅ Constraint matrix heatmap saved (E6 fallback)")
+    except Exception as _e6_exc:
+        print(f"⚠️  Constraint matrix heatmap failed (non-fatal): {_e6_exc}")
+
+
+def plot_blank_histogram(blank_probs: List[float], save_path: Path) -> None:
+    """Histogram of per-utterance mean blank probabilities (I2 diagnostic).
+
+    A healthy CTC model should have a blank probability distribution centred
+    around the ``blank_target_prob`` configured in ``TrainingConfig`` (≈0.82).
+    A distribution peaking near 1.0 indicates the insertion bias pathology.
+
+    Args:
+        blank_probs: List of per-utterance mean blank probabilities.
+        save_path:   PNG output path.
+    """
+    if not blank_probs:
+        return
+    arr = np.array(blank_probs, dtype=float)
+    mean_bp = float(arr.mean())
+    median_bp = float(np.median(arr))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(arr, bins=30, color='steelblue', edgecolor='white', alpha=0.85)
+    ax.axvline(mean_bp,   color='crimson',  linestyle='--', linewidth=1.5,
+               label=f'mean={mean_bp:.3f}')
+    ax.axvline(median_bp, color='darkorange', linestyle=':', linewidth=1.5,
+               label=f'median={median_bp:.3f}')
+    ax.axvline(0.82, color='green', linestyle='-', linewidth=1.2, alpha=0.6,
+               label='target=0.82')
+    ax.set_xlabel('Mean blank probability per utterance')
+    ax.set_ylabel('Count')
+    ax.set_title('Blank Probability Distribution (I2 — CTC Insertion Diagnostic)')
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 
 def plot_clinical_gap(
@@ -722,6 +873,67 @@ def plot_clinical_gap(
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+
+
+def plot_per_phoneme_breakdown(
+    breakdown: Dict[str, Dict],
+    save_path: Path,
+    min_refs: int = 10,
+    top_k: int = 30,
+) -> None:
+    """
+    Bar chart of per-phoneme PER for the most frequently occurring phonemes.
+
+    Phonemes with fewer than ``min_refs`` reference occurrences are excluded
+    to avoid noisy estimates from rare tokens.
+
+    Args:
+        breakdown : Output of compute_per_phoneme_breakdown().
+        save_path : Path at which to write the PNG.  Parent is created if needed.
+        min_refs  : Minimum reference Count (default 10).  Lower → more phonemes shown.
+        top_k     : Maximum bars to display (default 30, sorted by PER desc).
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Filter rare phonemes and take top_k by PER
+    filtered = {
+        ph: v for ph, v in breakdown.items()
+        if v['n_ref'] >= min_refs
+    }
+    sorted_items = sorted(filtered.items(), key=lambda x: x[1]['per'], reverse=True)[:top_k]
+
+    if not sorted_items:
+        print(f"⚠️  No phonemes with ≥{min_refs} reference occurrences — skipping per-phoneme plot.")
+        return
+
+    phonemes = [item[0] for item in sorted_items]
+    per_vals  = [item[1]['per'] for item in sorted_items]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(phonemes) * 0.45), 6))
+    colors = [
+        '#e74c3c' if v > 0.5 else
+        '#f39c12' if v > 0.25 else
+        '#27ae60'
+        for v in per_vals
+    ]
+    ax.bar(phonemes, per_vals, color=colors, alpha=0.85)
+    ax.set_xlabel('Phoneme', fontsize=12)
+    ax.set_ylabel('PER  (sub+del / n_ref)', fontsize=12)
+    ax.set_title(
+        f'Per-Phoneme Error Rate  (top {len(phonemes)}, min_refs={min_refs})',
+        fontsize=13, fontweight='bold',
+    )
+    ax.set_ylim(0.0, 1.05)
+    ax.axhline(0.50, color='red',    linestyle='--', linewidth=0.9, alpha=0.6, label='PER=0.50')
+    ax.axhline(0.25, color='orange', linestyle='--', linewidth=0.9, alpha=0.6, label='PER=0.25')
+    ax.legend(fontsize=9)
+    plt.xticks(rotation=45, ha='right', fontsize=9)
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved per-phoneme PER chart to {save_path}")
 
 
 # COMPREHENSIVE EVALUATION
@@ -781,11 +993,13 @@ def evaluate_model(
     all_status = []
     all_speakers = []
     all_phoneme_lengths = []
+    all_blank_probs: List[float] = []   # I2: per-utterance mean blank probability
     articulatory_results = {"manner": [], "place": [], "voice": []}
 
     # Uncertainty estimation (ROADMAP §9, UncertaintyAwareDecoder)
     uncertainty_decoder = None
     all_utterance_uncertainty: list = []
+    all_confidence_scores: list = []
     if compute_uncertainty:
         try:
             from src.models.uncertainty import UncertaintyAwareDecoder
@@ -838,6 +1052,13 @@ def evaluate_model(
                             )
                         elif isinstance(batch_unc, (list, tuple)):
                             all_utterance_uncertainty.extend(list(batch_unc))
+                    # Collect per-utterance confidence scores (I4)
+                    conf = unc_out.get('confidence_scores')
+                    if conf is not None:
+                        if hasattr(conf, 'cpu'):
+                            all_confidence_scores.extend(conf.cpu().tolist())
+                        elif isinstance(conf, (list, tuple)):
+                            all_confidence_scores.extend(list(conf))
                 except Exception:
                     pass  # Non-fatal; uncertainty simply not recorded for this batch
 
@@ -848,6 +1069,21 @@ def evaluate_model(
             # converted to frame space by the model).  Guards both greedy and
             # beam decoders from emitting padding-frame noise as insertions.
             output_lengths = outputs.get('output_lengths')
+
+            # I2: Track per-utterance mean blank probability for insertion diagnostic
+            try:
+                blank_id = phn_to_id.get('<BLANK>', 0)
+                blank_log_probs = log_probs_constrained[:, :, blank_id]  # [B, T]
+                blank_probs_batch = blank_log_probs.exp()  # [B, T]
+                if output_lengths is not None:
+                    for _s in range(blank_probs_batch.size(0)):
+                        _valid_t = int(output_lengths[_s].item())
+                        _bp = blank_probs_batch[_s, :_valid_t].mean().item()
+                        all_blank_probs.append(float(_bp))
+                else:
+                    all_blank_probs.extend(blank_probs_batch.mean(dim=1).cpu().tolist())
+            except Exception:
+                pass  # Non-fatal
 
             if use_beam_search:
                 # Beam search (slower but more accurate)
@@ -889,19 +1125,46 @@ def evaluate_model(
             if outputs.get('logits_manner') is not None and 'articulatory_labels' in batch:
                 for key in ['manner', 'place', 'voice']:
                     logits = outputs[f'logits_{key}']
-                    labels = batch['articulatory_labels'][key].to(device)
-                    labels = _align_labels_to_logits(labels, logits.size(1))
-                    mask = labels != -100
-                    if mask.any():
-                        preds = torch.argmax(logits, dim=-1)
-                        acc = (preds[mask] == labels[mask]).float().mean().item()
-                        articulatory_results[key].append(acc)
+                    labels_art = batch['articulatory_labels'][key].to(device)
+                    if logits.dim() == 2:
+                        # I5 utterance-level path: logits [B, C], derive mode label
+                        batch_sz = labels_art.size(0)
+                        utt_labels = torch.full(
+                            (batch_sz,), -100, dtype=torch.long, device=device
+                        )
+                        valid_mask_art = labels_art != -100
+                        for _i in range(batch_sz):
+                            valid_seq = labels_art[_i][valid_mask_art[_i]]
+                            if valid_seq.numel() > 0:
+                                utt_labels[_i] = torch.mode(valid_seq).values
+                        mask = utt_labels != -100
+                        if mask.any():
+                            preds = torch.argmax(logits[mask], dim=-1)
+                            acc = (preds == utt_labels[mask]).float().mean().item()
+                            articulatory_results[key].append(acc)
+                    else:
+                        # Legacy frame-level path: logits [B, T, C]
+                        labels_art = _align_labels_to_logits(
+                            labels_art, logits.size(1)
+                        )
+                        mask = labels_art != -100
+                        if mask.any():
+                            preds = torch.argmax(logits, dim=-1)
+                            acc = (preds[mask] == labels_art[mask]).float().mean().item()
+                            articulatory_results[key].append(acc)
             
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
     
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
+
+    # Corpus-level WER (I1 / E2) — join phoneme sequences as space-separated tokens
+    print("📝 Computing corpus-level WER...")
+    predictions_text = [' '.join(p) for p in all_predictions]
+    references_text  = [' '.join(r) for r in all_references]
+    corpus_wer = compute_wer_texts(predictions_text, references_text)
+    print(f"   WER: {corpus_wer:.3f}")
 
     # ── Macro-average PER over speakers (audit fix S4) ────────────────────────
     # Group per-scores by speaker, compute per-speaker mean, then macro-average
@@ -957,11 +1220,26 @@ def evaluate_model(
     print("📊 Analyzing phoneme-level errors...")
     error_analysis = analyze_phoneme_errors(all_predictions, all_references)
 
+    # Per-phoneme PER breakdown (E3)
+    print("📊 Computing per-phoneme PER breakdown...")
+    per_phoneme_breakdown = compute_per_phoneme_breakdown(all_predictions, all_references)
+    _breakdown_path = results_dir / 'per_phoneme_per.json'
+    with open(_breakdown_path, 'w') as _f:
+        json.dump(per_phoneme_breakdown, _f, indent=2)
+    print(f"✅ Saved per_phoneme_per.json ({len(per_phoneme_breakdown)} phonemes)")
+    plot_per_phoneme_breakdown(per_phoneme_breakdown, results_dir / 'per_phoneme_per.png')
+
     # Generate visualizations
     print("📈 Generating visualizations...")
     plot_confusion_matrix(error_analysis['confusion_matrix'], results_dir / 'confusion_matrix.png')
     plot_per_by_length(stratified_by_length, results_dir / 'per_by_length.png')
     plot_clinical_gap(dysarthric_mean, control_mean, results_dir / 'clinical_gap.png')
+
+    # I2: Blank probability histogram (always generated; key insertion-bias diagnostic)
+    if all_blank_probs:
+        plot_blank_histogram(all_blank_probs, results_dir / 'blank_probability_histogram.png')
+        print(f"✅ Blank probability histogram saved "
+              f"(mean={float(np.mean(all_blank_probs)):.3f})")
 
     rule_stats = None
     if hasattr(model, 'get_rule_statistics'):
@@ -974,7 +1252,8 @@ def evaluate_model(
                     [list(pair), count] if isinstance(pair, tuple) else [pair, count]
                     for pair, count in rule_stats['top_rules']
                 ]
-        plot_rule_impact(rule_stats, results_dir / 'rule_impact.png')
+        plot_rule_impact(rule_stats, results_dir / 'rule_impact.png',
+                         model=model, id_to_phn=id_to_phn)
 
     # ── Statistical tests (audit Phase 6 / ROADMAP §8) ───────────────────────
     # Welch t-test dysarthric vs. control (sample-level)
@@ -998,44 +1277,73 @@ def evaluate_model(
     p_corrected = [float(p) for p in p_corrected]
 
     # Intelligibility correlation: per-speaker PER vs. severity score
+    # E1 (revised): Always compute — even n=3 gives a useful directional signal.
+    # Flag validity separately so downstream analysis can gate on it.
+    # Spearman is degenerate (r=0, p=1) when ≥2 speakers share a tied rank
+    # (common with multiple control speakers at severity 0.0); Pearson is still
+    # meaningful.  We report both with an explicit `correlation_valid` flag.
+    n_speakers_eval = len(per_by_speaker)
+    correlation_valid = n_speakers_eval >= 5   # True → statistically interpretable
     try:
         from src.utils.config import get_speaker_severity
-        sev_scores = [get_speaker_severity(spk) for spk in per_by_speaker]
-        per_scores_spk = [per_by_speaker[spk] for spk in per_by_speaker]
-        if len(sev_scores) > 2:
-            pearson_r, pearson_p = stats.pearsonr(sev_scores, per_scores_spk)
+        sev_scores     = [get_speaker_severity(spk) for spk in per_by_speaker]
+        per_scores_spk = [per_by_speaker[spk]        for spk in per_by_speaker]
+        if n_speakers_eval >= 2:
+            pearson_r,  pearson_p  = stats.pearsonr(sev_scores, per_scores_spk)
             spearman_r, spearman_p = stats.spearmanr(sev_scores, per_scores_spk)
+            if not correlation_valid:
+                print(f"ℹ️   Severity ↔ PER correlation computed (n={n_speakers_eval} speakers — "
+                      f"descriptive only; ≥5 needed for statistical validity)")
         else:
             pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
     except Exception:
         pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
 
-    # ── Explainability module (ROADMAP §6, audit Phase 5) ─────────────────────
+    # ── Articulatory confusion + Explainability (ROADMAP §6, audit Phase 5) ───
+    # E5: Always build the articulatory confusion matrix by aligning predictions
+    # against references — this is independent of whether full explanation JSON
+    # is requested and requires no model attentions.
+    _art_analyzer = None
+    _attributed_errors: List[List[Dict]] = []  # reused by formatter if needed
+    try:
+        from src.explainability import (
+            PhonemeAttributor, ArticulatoryConfusionAnalyzer,
+        )
+        _attributor   = PhonemeAttributor()
+        _art_analyzer = ArticulatoryConfusionAnalyzer()
+        for _pred_seq, _ref_seq in zip(all_predictions, all_references):
+            _errors = _attributor.alignment_attribution(_pred_seq, _ref_seq)
+            _subs = [
+                (e['expected_phoneme'], e['predicted_phoneme'])
+                for e in _errors
+                if e['type'] == 'substitution'
+                and e['expected_phoneme'] and e['predicted_phoneme']
+            ]
+            _art_analyzer.accumulate_from_errors(_subs)
+            _attributed_errors.append(_errors)
+        _art_analyzer.plot_feature_confusion(results_dir / 'articulatory_confusion.png')
+        print("✅ Articulatory confusion matrix saved")
+    except Exception as _art_exc:
+        print(f"⚠️  Articulatory confusion matrix failed (non-fatal): {_art_exc}")
+
     if generate_explanations:
         try:
-            from src.explainability import (
-                PhonemeAttributor, ExplainableOutputFormatter,
-                ArticulatoryConfusionAnalyzer,
-            )
-            attributor = PhonemeAttributor()
-            formatter  = ExplainableOutputFormatter()
-            art_analyzer = ArticulatoryConfusionAnalyzer()
-
-            for i, (pred_seq, ref_seq) in enumerate(zip(all_predictions, all_references)):
-                errors = attributor.alignment_attribution(pred_seq, ref_seq)
-
-                # Accumulate articulatory confusions
-                subs = [
-                    (e['expected_phoneme'], e['predicted_phoneme'])
-                    for e in errors if e['type'] == 'substitution'
-                    and e['expected_phoneme'] and e['predicted_phoneme']
+            from src.explainability import ExplainableOutputFormatter
+            formatter = ExplainableOutputFormatter()
+            # Re-use attributed errors computed above; fall back to re-aligning if
+            # the articulatory block above failed (empty list).
+            if not _attributed_errors:
+                from src.explainability import PhonemeAttributor as _PA
+                _fallback_attr = _PA()
+                _attributed_errors = [
+                    _fallback_attr.alignment_attribution(p, r)
+                    for p, r in zip(all_predictions, all_references)
                 ]
-                art_analyzer.accumulate_from_errors(subs)
-
+            for i, (pred_seq, ref_seq) in enumerate(zip(all_predictions, all_references)):
+                errors = _attributed_errors[i] if i < len(_attributed_errors) else []
                 utt_per = compute_per(pred_seq, ref_seq)
-                spk_id = all_speakers[i] if i < len(all_speakers) else None
+                spk_id  = all_speakers[i] if i < len(all_speakers) else None
                 sev_val = float(get_speaker_severity(spk_id)) if spk_id else None
-
                 explanation = formatter.format_utterance(
                     utterance_id=f"utt_{i:04d}",
                     ground_truth=' '.join(ref_seq),
@@ -1048,9 +1356,7 @@ def evaluate_model(
                     severity=sev_val,
                 )
                 formatter.add(explanation)
-
             formatter.save_explanations(results_dir)
-            art_analyzer.plot_feature_confusion(results_dir / 'articulatory_confusion.png')
             print("✅ Explainability artifacts generated")
         except Exception as exc:
             print(f"⚠️  Explainability module failed (non-fatal): {exc}")
@@ -1058,9 +1364,11 @@ def evaluate_model(
     # Compile results
     results = {
         'avg_per': float(mean_per),  # macro-avg (primary metric)
+        'wer': float(corpus_wer),      # corpus-level WER (I1 / E2)
         'overall': {
             'per_macro_speaker': mean_per,
             'per_sample_mean':   float(sample_mean_per),
+            'wer':               float(corpus_wer),
             'ci':                per_ci,
             'std':               float(np.std(per_scores)),
             'n_samples':         len(per_scores),
@@ -1086,6 +1394,8 @@ def evaluate_model(
             'pearson_p_sev_per':   float(pearson_p),
             'spearman_r_sev_per':  float(spearman_r),
             'spearman_p_sev_per':  float(spearman_p),
+            'correlation_n_speakers': n_speakers_eval,
+            'correlation_valid':   correlation_valid,  # False when n<5 (treat as descriptive)
         },
         'rule_impact': rule_stats,
         'stratified': {
@@ -1116,9 +1426,17 @@ def evaluate_model(
         'uncertainty': {
             'computed': compute_uncertainty and len(all_utterance_uncertainty) > 0,
             'n_samples': uncertainty_n_samples if compute_uncertainty else None,
-            'mean_utterance_entropy': (
+            'entropy_mean': (
                 float(np.mean(all_utterance_uncertainty))
                 if all_utterance_uncertainty else None
+            ),
+            'entropy_std': (
+                float(np.std(all_utterance_uncertainty))
+                if len(all_utterance_uncertainty) > 1 else None
+            ),
+            'confidence_mean': (
+                float(np.mean(all_confidence_scores))
+                if all_confidence_scores else None
             ),
             'per_utterance': all_utterance_uncertainty if all_utterance_uncertainty else [],
         },
@@ -1136,9 +1454,11 @@ def evaluate_model(
     print("="*65)
     print(f"Overall PER  (macro-speaker): {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
     print(f"Overall PER  (sample-mean):   {sample_mean_per:.3f}")
+    print(f"Corpus WER   (phoneme-level): {corpus_wer:.3f}")
     print(f"Dysarthric   (sample-mean):   {dysarthric_mean:.3f} (n={len(dysarthric_per)})")
     print(f"Control      (sample-mean):   {control_mean:.3f} (n={len(control_per)})")
-    print(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f})")
+    _corr_note = f"n={n_speakers_eval}" if correlation_valid else f"n={n_speakers_eval}, descriptive only"
+    print(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f}) [{_corr_note}]")
     print(f"Wilcoxon p (dys vs ctrl):     {p_val_wilcox:.4f} (Holm-corr: {p_corrected[1]:.4f})")
     print(f"\nError Breakdown:")
     print(f"  Correct:        {error_analysis['error_counts']['correct']}")

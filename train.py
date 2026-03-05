@@ -172,8 +172,14 @@ class DysarthriaASRLightning(pl.LightningModule):
             blank_id=blank_id,
             target_prob=self.config.training.blank_target_prob,
         )
-        # SymbolicKLLoss is initialised lazily on first use (needs static matrix from model)
-        self._symbolic_kl_loss: Optional[SymbolicKLLoss] = None
+        # I6: Eagerly initialise SymbolicKLLoss so Lightning registers the module
+        # for device management.  The static constraint matrix is already built on
+        # model init, so there is no reason to delay construction.
+        self.symbolic_kl_loss: Optional[SymbolicKLLoss] = None
+        if self.config.model.use_learnable_constraint:
+            sl = self.model.symbolic_layer
+            if sl.learnable_matrix is not None:
+                self.symbolic_kl_loss = SymbolicKLLoss(sl.static_constraint_matrix)
 
         # Register core loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
@@ -275,18 +281,17 @@ class DysarthriaASRLightning(pl.LightningModule):
         loss_symbolic_kl = None
         if self.config.model.use_learnable_constraint and ablation not in ('neural_only', 'symbolic_only'):
             sl = self.model.symbolic_layer
-            if sl.learnable_matrix is not None:
-                if self._symbolic_kl_loss is None:
-                    static_C = sl.static_constraint_matrix
-                    self._symbolic_kl_loss = SymbolicKLLoss(static_C).to(self.device)
-                loss_symbolic_kl = self._symbolic_kl_loss(sl.learnable_matrix.logit_C)
+            if sl.learnable_matrix is not None and self.symbolic_kl_loss is not None:
+                loss_symbolic_kl = self.symbolic_kl_loss(sl.learnable_matrix.logit_C)
 
         # ── Ablation-mode weighting ──────────────────────────────────────────
         lambda_ctc  = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ctc)
         lambda_ce   = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ce)
         lambda_art  = float(self.lambda_articulatory)
         lambda_ord  = self.config.training.lambda_ordinal
-        lambda_bkl  = self.config.training.lambda_blank_kl
+        # I2: Use staged lambda_blank_kl set by on_train_epoch_start (falls back to
+        # config value during evaluation/test when the attribute is not set).
+        lambda_bkl  = getattr(self, '_current_lambda_blank_kl', self.config.training.lambda_blank_kl)
         lambda_skl  = self.config.training.lambda_symbolic_kl
 
         total_loss = lambda_ctc * loss_ctc + lambda_ce * loss_ce
@@ -360,11 +365,36 @@ class DysarthriaASRLightning(pl.LightningModule):
         labels: torch.Tensor,
         key: str
     ) -> torch.Tensor:
-        batch_size, time_steps_logits, num_classes = logits.shape
-        labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
-        logits_flat = logits.reshape(-1, num_classes)
-        labels_flat = labels_aligned.reshape(-1)
-        return self.art_ce_losses[key](logits_flat, labels_flat)
+        """Compute articulatory cross-entropy loss.
+
+        Supports both the new utterance-level path (I5) where ``logits`` is
+        ``[B, num_classes]`` and the legacy frame-level path where ``logits``
+        is ``[B, T, num_classes]``.
+
+        For the utterance-level path the per-utterance target is the *mode*
+        (most frequent class) of the valid (non-padding) phoneme labels in
+        that utterance.  This gives a single, semantically consistent label
+        that reflects the dominant articulatory feature for the whole utterance.
+        """
+        if logits.dim() == 2:
+            # I5: Utterance-level path (logits [B, C])
+            batch_size = labels.size(0)
+            utt_labels = torch.full(
+                (batch_size,), -100, dtype=torch.long, device=labels.device
+            )
+            valid_mask = labels != -100  # [B, L]
+            for i in range(batch_size):
+                valid_seq = labels[i][valid_mask[i]]
+                if valid_seq.numel() > 0:
+                    utt_labels[i] = torch.mode(valid_seq).values
+            return self.art_ce_losses[key](logits, utt_labels)
+        else:
+            # Legacy frame-level path [B, T, C]
+            batch_size, time_steps_logits, num_classes = logits.shape
+            labels_aligned = self._align_labels_to_logits(labels, time_steps_logits)
+            logits_flat = logits.reshape(-1, num_classes)
+            labels_flat = labels_aligned.reshape(-1)
+            return self.art_ce_losses[key](logits_flat, labels_flat)
     
     def _align_labels_to_logits(self, labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
         """
@@ -539,16 +569,23 @@ class DysarthriaASRLightning(pl.LightningModule):
         return losses['loss']
 
     def on_train_epoch_start(self) -> None:
-        """Two-stage progressive HuBERT unfreezing.
+        """Two-stage progressive HuBERT unfreezing + staged blank-KL warmup (I2).
 
-        Stage 1 (encoder_warmup_epochs, default 3):
-            Unfreeze top 4 layers (8-11) while the randomly-initialised head stabilises.
-        Stage 2 (encoder_second_unfreeze_epoch, default 10):
-            Apply permanent freeze config (layers 0-5 only), unlocking layers 6-11.
+        Stage 1 (encoder_warmup_epochs, default 1):
+            Unfreeze top 4 layers (8-11) after 1 warm-up epoch so the head
+            stabilises quickly without wasting VRAM budget.
+        Stage 2 (encoder_second_unfreeze_epoch, default 6):
+            Apply permanent freeze config (layers 0-3 only), unlocking 4-11.
+            With freeze_encoder_layers=[0-3] this means 8 layers are active,
+            filling considerably more VRAM on the RTX 4060.
+
+        Blank-KL staging (I2): ramp lambda_blank_kl from a gentle initial value to
+        the full target over training to avoid CTC collapse in early epochs when the
+        phoneme head has not yet learned basic boundaries.
         """
         epoch           = self.current_epoch
         warmup_ep       = self.config.training.encoder_warmup_epochs
-        second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 10)
+        second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 6)
 
         if not self.encoder_unfrozen and epoch >= warmup_ep:
             # Stage 1: unfreeze top 4 layers only
@@ -563,6 +600,24 @@ class DysarthriaASRLightning(pl.LightningModule):
             self.model.unfreeze_after_warmup()
             self._encoder_deep_unfrozen = True
             print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
+
+        # I2: Staged lambda_blank_kl ramp ─────────────────────────────────────
+        tr = self.config.training
+        stage1_end = getattr(tr, 'blank_kl_stage1_end',   5)
+        stage2_end = getattr(tr, 'blank_kl_stage2_end',  15)
+        val_s1     = getattr(tr, 'blank_kl_stage1_value', 0.10)
+        val_s2     = getattr(tr, 'blank_kl_stage2_value', 0.20)
+        target     = tr.lambda_blank_kl  # Final value (default 0.35)
+        if epoch < stage1_end:
+            current_bkl = val_s1
+        elif epoch < stage2_end:
+            current_bkl = val_s2
+        else:
+            current_bkl = target
+        # Store as an instance attribute so compute_loss can read it without
+        # mutating the config (which would violate per-run isolation in LOSO).
+        self._current_lambda_blank_kl = current_bkl
+        self.log('train/lambda_blank_kl', current_bkl, on_epoch=True, prog_bar=False)
     
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
         """
@@ -1015,6 +1070,101 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader
 
 
+# ---------------------------------------------------------------------------
+# Training-curve helpers (E4)
+# ---------------------------------------------------------------------------
+
+class _MetricLoggerCallback(pl.Callback):
+    """
+    Lightweight PyTorch Lightning callback that records epoch-level training
+    and validation metrics for offline learning-curve plotting.
+
+    Collected lists:
+      - train_loss : from ``trainer.callback_metrics['train/loss']`` at epoch end
+      - val_per    : from ``trainer.callback_metrics['val/per']`` at validation end
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.train_loss: List[float] = []
+        self.val_per:    List[float] = []
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        loss = trainer.callback_metrics.get('train/loss')
+        if loss is not None:
+            self.train_loss.append(float(loss))
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        per = trainer.callback_metrics.get('val/per')
+        if per is not None:
+            self.val_per.append(float(per))
+
+
+def _save_learning_curve(
+    train_losses: List[float],
+    val_pers: List[float],
+    results_dir: Path,
+) -> None:
+    """
+    Produce and save a two-axis learning-curve plot.
+
+    Left axis  : ``train/loss`` vs epoch.
+    Right axis : ``val/per``   vs epoch.
+
+    The plot is saved to ``results_dir/learning_curve.png``.
+
+    Args:
+        train_losses : Per-epoch training loss values.
+        val_pers     : Per-epoch validation PER values.
+        results_dir  : Directory in which to write the PNG.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if not train_losses and not val_pers:
+        print("\u26a0\ufe0f  No metric history available \u2014 skipping learning curve.")
+        return
+
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    epochs_loss = list(range(1, len(train_losses) + 1))
+    epochs_per  = list(range(1, len(val_pers)    + 1))
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    color_loss = '#e74c3c'
+    color_per  = '#3498db'
+
+    if train_losses:
+        ax1.plot(epochs_loss, train_losses, color=color_loss, linewidth=2.0,
+                 marker='o', markersize=4, label='train/loss')
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Training Loss', color=color_loss, fontsize=12)
+        ax1.tick_params(axis='y', labelcolor=color_loss)
+
+    ax2 = ax1.twinx()
+    if val_pers:
+        ax2.plot(epochs_per, val_pers, color=color_per, linewidth=2.0,
+                 marker='s', markersize=4, label='val/per')
+        ax2.set_ylabel('Validation PER', color=color_per, fontsize=12)
+        ax2.tick_params(axis='y', labelcolor=color_per)
+
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=10)
+
+    plt.title('Learning Curve: Training Loss & Validation PER', fontsize=13, fontweight='bold')
+    ax1.grid(alpha=0.3)
+    plt.tight_layout()
+
+    save_path = results_dir / 'learning_curve.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\u2705 Learning curve saved to {save_path}")
+
+
 def train(
     config: Optional[Config] = None,
     limit_train_batches: Optional[int] = None,
@@ -1030,7 +1180,8 @@ def train(
     Returns:
         Tuple of (trained_model, trainer)
     """
-    # Mitigate memory fragmentation for long audio sequences
+    # Mitigate memory fragmentation — critical for variable-length audio batches.
+    # PyTorch ≥2.0 uses PYTORCH_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF is deprecated).
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     torch.set_float32_matmul_precision('high')
 
@@ -1113,7 +1264,8 @@ def train(
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='step')
-    
+    metric_logger_cb = _MetricLoggerCallback()   # E4: collect epoch metrics for learning curve
+
     # Create trainer
     trainer_kwargs: Dict = dict(
         max_epochs=config.training.max_epochs,
@@ -1124,7 +1276,7 @@ def train(
         gradient_clip_val=config.training.gradient_clip_val,
         val_check_interval=config.training.val_check_interval,
         logger=mlflow_logger,
-        callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
+        callbacks=[checkpoint_callback, early_stop_callback, lr_monitor, metric_logger_cb],
         deterministic=False,  # Handled manually above
         log_every_n_steps=config.experiment.log_every_n_steps,
     )
@@ -1135,6 +1287,13 @@ def train(
     # Train
     print("🚀 Starting training...")
     trainer.fit(lightning_model, train_loader, val_loader)
+
+    # Save learning curve immediately after fit (E4)
+    _save_learning_curve(
+        train_losses=metric_logger_cb.train_loss,
+        val_pers=metric_logger_cb.val_per,
+        results_dir=get_project_root() / "results" / config.experiment.run_name,
+    )
 
     # Resolve checkpoint: prefer best scored ckpt, fall back to last.ckpt
     best_model_path = checkpoint_callback.best_model_path
@@ -1249,6 +1408,8 @@ def run_loso(
     base_run_name = config.experiment.run_name
 
     per_per_fold = []
+    wer_per_fold = []
+    n_samples_per_fold: List[int] = []
     for i, spk in enumerate(speakers):
         print(f"\n── Fold {i+1}/{len(speakers)}: held-out speaker = {spk} ──")
         fold_run_name = f"{base_run_name}_loso_{spk}"
@@ -1303,8 +1464,12 @@ def run_loso(
             results_dir=results_dir,
         )
         fold_per = eval_results.get('avg_per', float('nan'))
+        fold_wer = eval_results.get('wer', float('nan'))
+        fold_n   = eval_results.get('overall', {}).get('n_samples', 0)
         per_per_fold.append(fold_per)
-        print(f"   Fold PER ({spk}): {fold_per:.4f}")
+        wer_per_fold.append(fold_wer)
+        n_samples_per_fold.append(fold_n)
+        print(f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}")
 
     # Bootstrap 95% CI over fold PERs
     per_arr = np.array(per_per_fold)
@@ -1314,15 +1479,53 @@ def run_loso(
                      for _ in range(2000)])
     ci_lo, ci_hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
 
-    print(f"\n✅ LOSO Complete: macro-avg PER = {macro_per:.4f} "
-          f"[95% CI: {ci_lo:.4f} – {ci_hi:.4f}]")
+    # Weighted-average PER (weighted by number of test samples per fold)
+    n_arr = np.array(n_samples_per_fold, dtype=float)
+    valid_mask = ~np.isnan(per_arr) & (n_arr > 0)
+    weighted_per = (
+        float(np.sum(per_arr[valid_mask] * n_arr[valid_mask]) / np.sum(n_arr[valid_mask]))
+        if valid_mask.any() else float('nan')
+    )
 
-    return {
+    # WER aggregation (both simple mean and weighted)
+    wer_arr = np.array([w for w in wer_per_fold if not np.isnan(w)])
+    macro_wer = float(np.nanmean(wer_arr)) if len(wer_arr) > 0 else float('nan')
+    wer_arr_full = np.array(wer_per_fold, dtype=float)
+    wer_valid_mask = ~np.isnan(wer_arr_full) & (n_arr > 0)
+    weighted_wer = (
+        float(np.sum(wer_arr_full[wer_valid_mask] * n_arr[wer_valid_mask]) / np.sum(n_arr[wer_valid_mask]))
+        if wer_valid_mask.any() else float('nan')
+    )
+
+    print(f"\n✅ LOSO Complete:")
+    print(f"   Mean PER     = {macro_per:.4f}  [95% CI: {ci_lo:.4f} – {ci_hi:.4f}]")
+    print(f"   Weighted PER = {weighted_per:.4f}  (weighted by fold sample count)")
+    print(f"   Mean WER     = {macro_wer:.4f}  |  Weighted WER = {weighted_wer:.4f}")
+
+    loso_summary = {
         'per_per_fold': per_per_fold,
+        'wer_per_fold': wer_per_fold,
+        'n_samples_per_fold': n_samples_per_fold,
         'fold_speakers': speakers,
+        # Simple (macro) averages
         'macro_avg_per': macro_per,
-        'per_95ci': (ci_lo, ci_hi),
+        'per_95ci': [ci_lo, ci_hi],
+        'macro_avg_wer': macro_wer,
+        # Sample-weighted averages (I3 requirement)
+        'weighted_avg_per': weighted_per,
+        'weighted_avg_wer': weighted_wer,
     }
+
+    # Save aggregated LOSO summary to results/{base_run_name}_loso_summary.json (I3)
+    import json as _json
+    summary_dir = get_project_root() / "results"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f"{base_run_name}_loso_summary.json"
+    with open(summary_path, 'w') as _sf:
+        _json.dump(loso_summary, _sf, indent=2)
+    print(f"💾 LOSO summary saved to {summary_path}")
+
+    return loso_summary
 
 
 def main() -> None:

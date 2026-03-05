@@ -220,10 +220,12 @@ def run_training(
         log.info("=== Starting LOSO cross-validation ===")
         loso_results = run_loso(config, dataset)
         log.info(
-            "LOSO complete: macro-avg PER = %.4f [95%% CI: %.4f – %.4f]",
+            "LOSO complete: mean PER = %.4f [95%% CI: %.4f – %.4f] | weighted PER = %.4f | mean WER = %.4f",
             loso_results["macro_avg_per"],
             loso_results["per_95ci"][0],
             loso_results["per_95ci"][1],
+            loso_results.get("weighted_avg_per", float("nan")),
+            loso_results.get("macro_avg_wer", float("nan")),
         )
         # Each fold evaluated internally; no single model or test_loader to return.
         return None, None
@@ -422,8 +424,12 @@ def run_auto(args: argparse.Namespace) -> None:
         use_beam_search=args.beam_search,
         beam_width=args.beam_width,
         generate_explanations=args.explain,
-        compute_uncertainty=args.uncertainty,
-        uncertainty_n_samples=args.uncertainty_samples,
+        # I4: CLI flag OR config.experiment flag enables uncertainty; CLI takes priority for n_samples
+        compute_uncertainty=args.uncertainty or config.experiment.compute_uncertainty,
+        uncertainty_n_samples=(
+            args.uncertainty_samples if args.uncertainty
+            else config.experiment.uncertainty_n_samples
+        ),
     )
 
 

@@ -87,10 +87,11 @@ class ModelConfig:
     hubert_model_id: str = "facebook/hubert-base-ls960"
     freeze_feature_extractor: bool = True
     
-    # Permanently freeze only the bottom 6 layers (robust generic acoustic features).
-    # Layers 6-11 are fine-tuned progressively via the two-stage warmup schedule in
-    # on_train_epoch_start (epoch 3: unfreeze 8-11; epoch 10: unfreeze 6-11).
-    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 6)))
+    # Permanently freeze only the bottom 4 layers (robust generic acoustic features).
+    # Layers 4-11 are fine-tuned progressively via the two-stage warmup schedule in
+    # on_train_epoch_start (epoch 1: unfreeze 8-11; epoch 6: unfreeze 4-11).
+    # Keeping 8 layers trainable at full training maximizes VRAM utilisation on the RTX 4060.
+    freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 4)))
 
     hidden_dim: int = 512
     num_phonemes: int = 44
@@ -138,12 +139,12 @@ class TrainingConfig:
     warmup_steps: int = 250
     warmup_ratio: float = 0.05
     
-    batch_size: int = 4  # Increased from 1 or 2 to maximize 4060 core utilization
-    gradient_accumulation_steps: int = 8  # Effective batch = 32
+    batch_size: int = 8   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 32
+    gradient_accumulation_steps: int = 4   # Effective batch=32 (8×4)
     max_epochs: int = 40
-    encoder_warmup_epochs: int = 3
-    encoder_second_unfreeze_epoch: int = 10  # Stage 2: unfreeze layers 6-11 at this epoch
-    val_check_interval: float = 0.5
+    encoder_warmup_epochs: int = 1          # Unfreeze top layers after 1 epoch (was 3) — spend less time VRAM-idle
+    encoder_second_unfreeze_epoch: int = 6  # Stage 2: unfreeze layers 4-11 at epoch 6 (was 10)
+    val_check_interval: float = 1.0        # Validate once per epoch (was 0.5) — halves eval overhead
     
     # Regularization & Loss
     dropout: float = 0.1
@@ -162,6 +163,15 @@ class TrainingConfig:
     # Blank-prior KL regularisation (fix CTC insertion pathology)
     lambda_blank_kl: float = 0.35   # Increased from 0.20 — pushes I/D ratio below 3× target
     blank_target_prob: float = 0.82   # Slightly below 0.85: allows a bit more phoneme output to reduce deletions while still suppressing insertions
+    # I2: Staged lambda_blank_kl warmup — prevents early CTC collapse from aggressively
+    # suppressing blanks before the model has learned basic phoneme boundaries.
+    # Schedule:  epochs < stage1_end  → stage1_value (gentle push)
+    #            epochs < stage2_end  → stage2_value (moderate push)
+    #            epochs >= stage2_end → lambda_blank_kl (full target, 0.35)
+    blank_kl_stage1_end: int = 5
+    blank_kl_stage1_value: float = 0.10
+    blank_kl_stage2_end: int = 15
+    blank_kl_stage2_value: float = 0.20
     # Symbolic KL anchor (keeps learnable C near symbolic prior)
     lambda_symbolic_kl: float = 0.05
 
@@ -172,10 +182,10 @@ class TrainingConfig:
     beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
     save_top_k: int = 2
     
-    # HW Acceleration
-    num_workers: int = 4
+    # HW Acceleration — optimised for RTX 4060 + modern NVMe
+    num_workers: int = 8          # saturate PCIe; was 4
     pin_memory: bool = True
-    prefetch_factor: int = 2
+    prefetch_factor: int = 4       # deeper prefetch queue reduces GPU stalls; was 2
     blank_priority_weight: float = 2.5  # Increased from 1.5 — up-weights blank in CE class weights to suppress insertions
 
     # --- Phase 4: Training infrastructure (audit G2, ablations) ---
@@ -194,7 +204,7 @@ class DataConfig:
     test_split: float = 0.15
     split_strategy: str = "speaker_stratified"
     sampling_rate: int = 16000
-    max_audio_length: float = 6.0  # 6s covers ~99% of TORGO clips
+    max_audio_length: float = 6.0  # 6s — reverted from 8s after OOM at batch=16+8s; safe on 8 GB VRAM
 
 @dataclass
 class ExperimentConfig:
@@ -266,11 +276,18 @@ class Config:
         """Prints a safety report for the 4060's 8GB limit."""
         if self.device == "cuda":
             total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-            # Estimation based on BF16 + 10-layer freeze + severity adapter
-            est_vram = (self.training.batch_size * self.data.max_audio_length * 0.24) + 2.0
+            # Refined VRAM estimate (BF16):
+            #   params     ≈ 94M × 2B  = 0.19 GB (frozen params kept in bf16)
+            #   optimizer  ≈ trainable × 8B fp32 (AdamW m+v) — scales with unfrozen layers
+            #   activations ≈ batch × T_frames × 768 × active_layers × 2B × overhead_factor(4)
+            n_active_layers = 12 - len(self.model.freeze_encoder_layers)
+            T_frames = self.data.max_audio_length * 50  # ~50 Hz HuBERT output
+            act_gb = (self.training.batch_size * T_frames * 768 * n_active_layers * 2 * 4) / 1e9
+            est_vram = 0.19 + act_gb + 0.4  # params + activations + misc overhead
             margin = total_vram - est_vram
             print(f"--- ⚡ RTX 4060 OPTIMIZATION ---")
-            print(f"Est. Peak VRAM: {est_vram:.2f}GB / {total_vram:.2f}GB (Margin: {margin:.2f}GB)")
+            print(f"Est. Peak VRAM: {est_vram:.2f}GB / {total_vram:.2f}GB (Margin: {margin:.2f}GB) "
+                  f"[batch={self.training.batch_size}, T={int(T_frames)}, active_layers={n_active_layers}]")
             print(f"Precision: {self.training.precision} | Batch Size: {self.training.batch_size}")
             print(f"SeverityAdapter: {self.model.use_severity_adapter} | "
                   f"LearnableC: {self.model.use_learnable_constraint} | "
@@ -349,7 +366,20 @@ class Config:
 
         return config
 
-def get_default_config() -> "Config":
-    return cfg
+_default_config: Optional["Config"] = None
 
-cfg = Config()
+
+def get_default_config() -> "Config":
+    """Return the shared default Config instance, creating it lazily on first call.
+
+    Lazy construction avoids the VRAM check and directory creation side-effects
+    that ``Config.__init__`` triggers running at import time (which happens every
+    time any module does ``from src.utils.config import ...``).  Callers that
+    need the default configuration should always go through this function; code
+    that wants a fresh config (e.g., tests or the LOSO loop) should call
+    ``Config()`` directly.
+    """
+    global _default_config
+    if _default_config is None:
+        _default_config = Config()
+    return _default_config
