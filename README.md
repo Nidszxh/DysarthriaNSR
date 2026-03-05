@@ -15,16 +15,8 @@ For detailed architecture and research context, see [ROADMAP.md](ROADMAP.md).
 
 ## Recent Updates (March 2026)
 
-- **`run_pipeline.py` orchestrator**: Single entry point replacing direct `train.py` + `evaluate.py` calls; owns checkpoint resolution, training, and full evaluation lifecycle.
-- **12 confirmed bugs fixed (B1–B12)**: KL direction in `SymbolicKLLoss`, CTC stride in attention-mask downsampling, LOSO run-name mutation, `generate_explanations` missing from `evaluate.py` signature, hardcoded `wer=0.0`, NaN guard in `OrdinalContrastiveLoss`, and more — see `RESEARCH_BRIEF.md` for the full list.
-- **Speaker extraction bug fully resolved (B12)**: `manifest.py` line 233 was extracting position `[0]` (literal `'unknown'`); now correctly uses position `[2]` (TORGO speaker ID). Manifest regenerated on March 4, 2026 — speaker IDs confirmed correct in dataloader batches.
-- **Uncertainty module wired**: `UncertaintyAwareDecoder` (MC Dropout) is now called from `evaluate_model` via `--uncertainty` flag.
-- **Explainability wired**: `SymbolicRuleTracker` connected to `SymbolicConstraintLayer`; `ExplainableOutputFormatter` emits per-utterance phoneme-error JSON.
-- **Publication-quality figures**: `scripts/generate_figures.py` generates the full diagnostic visualization suite (6 plots) from `evaluation_results.json` / `explanations.json`.
-- **Smoke tests**: `scripts/smoke_test.py` — 7 automated end-to-end tests, all passing.
-- **baseline_v4 trained and evaluated** (March 5, 2026): batch=8, 40 epochs, staged progressive unfreezing (layers 8-11 at epoch 1, layers 6-11 at epoch 6), 66.4M trainable params (67.1%). Best val/per = **0.504** (epoch 28). Beam-search test PER = **0.4748**, WER = 0.664. Insertion bias resolved (I/D = 0.87×). First full end-to-end valid evaluation.
-- **baseline_v3 trained** (post-B12, March 4 2026): first run with correct speaker-stratified splits; 30 epochs, val/per = 0.574 (epoch 26), 23.9M trainable (24.2%). Test evaluation was not run separately.
-- **baseline_v2 trained** (pre-B12, March 2026): greedy test PER = 0.215, beam-search PER = 0.243 (width=25); speaker split was invalid (all `'unknown'`) — results inflated due to data leakage. Preserved as historical reference.
+- **`baseline_v5` trained and evaluated** (March 6, 2026): 30 epochs, 66.4M trainable params. Best val/per = **0.505** (epoch 28). Beam-search test PER = **0.4750**, WER = 0.665. Articulatory: manner 78.3%, place 79.3%, voice 92.3%. I/D = 0.9×. Essentially identical to v4 — v5 confirms the symbolic constraint layer is the consistent bottleneck (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). LOSO-CV not yet run.
+- **`baseline_v4` trained and evaluated** (March 5, 2026): batch=8, 40 epochs, staged progressive unfreezing (layers 8–11 at epoch 1, layers 6–11 at epoch 6), 66.4M trainable params (67.1%). Best val/per = **0.504** (epoch 28). Beam-search test PER = **0.4748**, WER = 0.664. Insertion bias resolved (I/D = 0.87×). First full end-to-end valid evaluation.
 
 ## Quick Start
 
@@ -235,24 +227,30 @@ After each `run_pipeline.py` run, `evaluate_model()` generates:
 
 ### Baseline Results
 
-#### `baseline_v4` (March 5, 2026) — **Current Reference**
+#### `baseline_v5` (March 6, 2026) — **Current Reference**
 - **Dataset**: 16,531 samples, 15 TORGO speakers (manifest with correct speaker IDs)
 - **Train/Val/Test split**: speaker-stratified; Train 11,654 / Val 1,329 / Test 3,548 (10/2/3 speakers)
-- **Model**: 98.9M params total / 66.4M trainable (67.1%) — staged progressive unfreezing, 40 epochs
-- **Best checkpoint**: epoch 28 (val/per = 0.504)
+- **Model**: 98.9M params total / 66.4M trainable — 30 epochs, same staged unfreezing as v4
+- **Best checkpoint**: epoch 28 (val/per = 0.505)
 - **Evaluation**: beam-search (width=25) + `--explain` + `--uncertainty` (20 MC samples)
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Beam-search test PER** (macro-speaker) | 0.4748 | 3,548 test samples, 3 speakers |
-| **WER** | 0.664 | |
-| 95% CI | [0.448, 0.503] | Bootstrap 1000 resamples |
-| Dysarthric PER | 0.448 | M03 (n=810) |
-| Control PER | 0.488 | MC02 (0.503), MC04 (0.474), n=2,738 |
-| Substitutions / Deletions / Insertions | 13,868 / 4,292 / 3,734 | **I/D = 0.87×** — insertion bias resolved |
-| Articulatory accuracy | manner 78.6%, place 79.1%, voice 92.4% | |
-| Model size | 98.9M / 66.4M trainable (67.1%) | |
-| Uncertainty (MC Dropout) | entropy mean 0.414, confidence mean 0.889 | 20 samples |
+| **Beam-search test PER** (macro-speaker) | 0.4750 | 3,548 test samples, 3 speakers |
+| **WER** | 0.6646 | |
+| 95% CI | [0.448, 0.503] | Bootstrap |
+| Dysarthric PER | ~0.45 | M03 |
+| Control PER (avg) | ~0.49 | MC02, MC04 |
+| Substitutions / Deletions / Insertions | 13,821 / 4,338 / 3,752 | **I/D = 0.9×** |
+| Articulatory accuracy | manner 78.3%, place 79.3%, voice 92.3% | |
+| per_neural / per_constrained | 0.305 / 0.475 | Δ=−0.170 — constraint layer hurts |
+| Wilcoxon p (Holm) | 0.0027 (0.0050) | Significant; n=3 speakers only |
+
+> ⚠️ **Critical finding — identical to v4**: `per_neural = 0.305` vs `per_constrained = 0.475` (Δ = −0.170). The symbolic constraint layer consistently degrades PER by ~57% relative across both v4 and v5. Ablation and LOSO-CV are the immediate next steps.
+
+#### `baseline_v4` (March 5, 2026) — Previous Reference
+- **Model**: 98.9M params / 66.4M trainable (67.1%), 40 epochs, staged progressive unfreezing
+- **Best val/per**: 0.504 (epoch 28); beam PER 0.4748, WER 0.664
 
 #### `baseline_v3` (March 4, 2026) — Previous Valid Run
 - **Model**: 98.9M params / 23.9M trainable (24.2%), 30 epochs
@@ -304,16 +302,47 @@ Features:
 ## Known Issues and Next Steps
 
 **Active issues (March 2026)**:
-- Test split = 3 speakers only → severity correlation not statistically significant (Pearson p=0.347, n=3); needs full LOSO-CV
-- Symbolic constraint layer reduces performance: neural-only PER = 0.305 vs constrained PER = 0.475 (Δ = −0.170) — ablation study needed
-- `SymbolicRuleTracker` wired but low activation confidence (0.131 avg) — most rule activations are deletions to `<BLANK>`
-- Uncertainty plots require `--uncertainty` flag (MC Dropout not default); 20 samples used in baseline_v4
+- **Symbolic constraint layer degrades performance** (CRITICAL): neural-only PER = 0.305 vs constrained PER = 0.475 (Δ = −0.170) — consistent across v4 and v5. Ablation required.
+- **LOSO-CV not yet run**: test split = 3 speakers only → severity correlation p=0.347 (n.s.); statistically valid macro-PER requires full 15-fold LOSO (~15–22h)
+- `SymbolicRuleTracker` wired but low activation confidence (0.131 avg) — most rule activations are X→`<BLANK>` deletions
+- `ablation_mode='neural_only'` does not fully disable SeverityAdapter / LearnableConstraintMatrix — fix before running ablation
 
 **Immediate next steps**:
-1. Run neural-only ablation to verify symbolic constraint harm: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only`
-2. Regenerate figures for baseline_v4: `python scripts/generate_figures.py --run-name baseline_v4`
-3. Run additional ablations: `--ablation no_art_heads`, `no_constraint_matrix`
-4. Design LOSO-CV (15-speaker leave-one-out) for statistically valid PER and severity correlation estimates
+1. Fix `ablation_mode='neural_only'` to properly bypass symbolic components
+2. Run neural-only ablation: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only`
+3. Disable learnable constraint (`use_learnable_constraint=False` in config) and short-run to verify fix
+4. Run LOSO-CV after confirming constraint fix: `python run_pipeline.py --run-name loso_v1 --loso`
+5. Regenerate figures for baseline_v5: `python scripts/generate_figures.py --run-name baseline_v5`
+6. Run additional ablations: `--ablation no_art_heads`, `no_constraint_matrix`
+
+## Reproducibility
+
+All experiments use a fixed global seed and deterministic settings to minimise run-to-run variance.
+
+| Factor | Value |
+|--------|-------|
+| Random seed | `42` (`pl.seed_everything(42, workers=True)`) |
+| Python | 3.12 |
+| PyTorch | 2.9.0 |
+| CUDA | 12.x |
+| HuBERT checkpoint | `facebook/hubert-base-ls960` |
+| Deterministic ops | `torch.use_deterministic_algorithms(True, warn_only=True)` |
+| Precision | `bf16-mixed` (ADA / Ampere) |
+
+**Config snapshot**: every run writes `config.yaml` into both `checkpoints/<run_name>/` and
+`results/<run_name>/` so the exact hyperparameters used for any checkpoint are always recoverable.
+
+**Dependency pinning**: see `requirements.txt` for exact package versions.
+
+**Known non-determinism**: HuBERT uses `attn_implementation="eager"` which is not fully
+deterministic across all CUDA drivers. `warn_only=True` allows these operations to
+proceed silently. Expect ±0.005 PER run-to-run variance on identical hardware.
+
+To reproduce `baseline_v5`:
+```bash
+python run_pipeline.py --run-name baseline_v5_repro \
+    --beam-search --beam-width 25 --explain --uncertainty
+```
 
 ## References
 

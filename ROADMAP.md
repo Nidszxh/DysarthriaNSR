@@ -17,7 +17,22 @@ The complete end-to-end pipeline is **fully implemented** and running:
 - ✅ Automated smoke tests (`scripts/smoke_test.py`, 7/7 passing)
 - ✅ 12 confirmed bugs fixed (B1–B12, see `RESEARCH_BRIEF.md`)
 
-**Current Run: baseline_v4 (March 5, 2026) — First Complete Valid Evaluation**
+**Current Run: baseline_v5 (March 6, 2026) — Latest Evaluated Baseline**
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Beam-search test PER** (macro-speaker) | 0.4750 | 3,548 samples, 3 speakers, width=25 |
+| **WER** | 0.6646 | |
+| 95% CI | [0.448, 0.503] | Bootstrap |
+| Substitutions / Deletions / Insertions | 13,821 / 4,338 / 3,752 | **I/D = 0.9×** |
+| Articulatory accuracy | manner 78.3%, place 79.3%, voice 92.3% | Consistent with v4 |
+| per_neural / per_constrained | 0.305 / 0.475 | Δ=−0.170 — constraint layer still hurts |
+| Model size | 98.9M params / 66.4M trainable | Same architecture as v4 |
+| Best val/per | 0.505 (epoch 28/30) | |
+| Wilcoxon p (Holm) | 0.0027 (0.0050) | Significant; n=3 test speakers only |
+
+> ⚠️ **Critical finding — v5 = v4 performance**: `per_neural = 0.305` vs `per_constrained = 0.475` (Δ = −0.170). Both v4 and v5 produce identical degradation from the symbolic layer. The `LearnableConstraintMatrix` converges to a degenerate state (dominant X→⁠`<BLANK>` activations). Neural-only ablation and LOSO-CV are the immediate next steps.
+
+**Previous Run: baseline_v4 (March 5, 2026)**
 | Metric | Value | Notes |
 |--------|-------|-------|
 | **Beam-search test PER** (macro-speaker) | 0.4748 | 3,548 samples, 3 speakers, width=25 |
@@ -31,8 +46,6 @@ The complete end-to-end pipeline is **fully implemented** and running:
 | Best val/per | 0.504 (epoch 28/40) | |
 | Uncertainty | entropy 0.414, confidence 0.889 | MC Dropout, 20 samples |
 | Welch t / Wilcoxon p | 0.0029 / 0.0028 | Significant dys vs. ctrl |
-
-> ⚠️ **Critical finding — Symbolic Constraint Layer hurts performance**: `per_neural = 0.305` vs `per_constrained = 0.475` (delta = −0.170). The symbolic constraint integration is increasing PER by ~57% relative. This strongly motivates the neural-only ablation to establish a clean baseline before re-evaluating the symbolic component design.
 
 **Previous Run: baseline_v3 (March 4, 2026) — First Valid Splits, No Test Eval**
 | Metric | Value | Notes |
@@ -601,39 +614,21 @@ Where:
 
 ## Known Issues & Mitigation Strategies
 
-### Issue 0: Symbolic Constraint Layer Harms Performance ⚠️ (Critical Priority — New in baseline_v4)
+### Issue 0: Symbolic Constraint Layer Harms Performance ⚠️ (Critical — Reproduced in v4 AND v5)
 
-**Symptom**: `per_neural = 0.305` vs `per_constrained = 0.475` (delta = −0.170, i.e. +57% relative degradation from constraints)
-- The `SymbolicConstraintLayer` blending is making predictions worse, not better
-- Neural-only decoding yields significantly lower PER than the full neuro-symbolic model
+**Symptom**: `per_neural = 0.305` vs `per_constrained = 0.475` (Δ = −0.170, i.e. +57% relative degradation from constraints)
+- Reproduced identically in baseline_v4 (PER 0.4748) and baseline_v5 (PER 0.4750) — not a training fluke
+- Rule activations dominated by X→`<BLANK>` deletions (P→⁠`<BLANK>`=71, T→⁠`<BLANK>`=33, etc.); `avg_confidence=0.131`
 
 **Root cause hypotheses** (TBD — ablation required):
-1. **Learnable constraint matrix badly initialized** — `LearnableConstraintMatrix` may be spreading probability mass across wrong phonemes during early training
-2. **Severity-adaptive β misuse** — status-to-severity scaling (0 or 5.0) may be forcing extreme constraint weight for dysarthric speakers
-3. **Symbolic rules mismatched to CTC outputs** — hard-coded substitution probabilities not calibrated to data-driven confusion patterns
-4. **Frame-level constraint application** — applying phoneme-level rules to CTC frame logits (which include blank) may corrupt blank probabilities
+1. **`LearnableConstraintMatrix` degeneracy** — converges to spreading mass toward `<BLANK>` (ID 0); `lambda_symbolic_kl=0.05` is too weak to prevent drift (~0.001 effective per-row penalty)
+2. **Severity-adaptive β extremes** — status×5.0 scaling forces β≈0.8 for all dysarthric speakers; degenerate constraints get 80% weight
+3. **CTC frame-level constraint mismatch** — phoneme-level rules applied to CTC frame logits (which model blank alignment, not phoneme identity)
 
-**Diagnostic steps**:
-```python
-# Compare neural vs constrained logits on same batch
-with torch.no_grad():
-    out = model(batch, return_intermediate=True)
-    per_neural = compute_per(out['logits_neural'], labels)
-    per_constrained = compute_per(out['logits'], labels)
-    print(f"Neural PER: {per_neural:.3f} | Constrained PER: {per_constrained:.3f}")
-    print(f"Beta values: {out['beta'].mean():.3f} ± {out['beta'].std():.3f}")
-
-# Inspect constraint matrix
-cm = model.constraint_layer.constraint_matrix
-print(f"Constraint matrix diagonal mean: {cm.diag().mean():.3f}")  # High = identity-like = good
-print(f"Constraint matrix off-diagonal max: {(cm - cm.diag().diag()).max():.3f}")
-```
-
-**Recommended immediate experiments** (in priority order):
-1. `--ablation neural_only` — disable constraint layer entirely; establishes clean baseline
-2. Fix β at low value (0.05) and disable learning — check if tiny blending hurts
-3. Inspect LearnableConstraintMatrix weight evolution across epochs
-4. Compare confusion-matrix-derived rules against hard-coded PHONEME_DETAILS rules
+**Recommended fix sequence**:
+1. `--ablation neural_only` (first fix the incomplete ablation mode, then run) — confirm `per_neural≈0.305`
+2. Set `use_learnable_constraint=False` in config — fall back to static articulatory prior
+3. Raise `lambda_symbolic_kl` from 0.05 to 0.5 if static prior still underperforms
 
 ---
 
@@ -682,20 +677,23 @@ for beta in variants:
 
 ### Short-term (1–2 months)
 
-#### 1. Symbolic constraint ablation — Critical (Issue 0)
-- **Task**: Establish neural-only PER baseline; diagnose constraint layer harm
-- **Approach**: Run `--ablation neural_only`; inspect beta evolution; audit `LearnableConstraintMatrix` init
-- **Success metric**: Understand delta between `per_neural` (0.305) and full model (0.475)
+#### 1. Fix `ablation_mode='neural_only'` and run ablation — Critical (blocks everything)
+- **Task**: Fully disable SeverityAdapter + LearnableConstraintMatrix forward passes when `ablation_mode='neural_only'`
+- **Success metric**: `per_neural ≈ 0.305` confirmed on same test split
 
-#### 2. Length-stratified analysis
-- **Task**: Understand dysarthric vs. control PER direction
-- **Approach**: Publish per-length breakdowns; full LOSO-CV for speaker-level CI
-- **Output**: Diagnostic report
+#### 2. LOSO-CV (15-fold leave-one-out) — High Priority
+- **Task**: Run after symbolic constraint is fixed/ablated
+- **Command**: `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h)
+- **Output**: Statistically valid macro-PER (n=15), severity correlation Pearson r with p-value
+- **Success metric**: Severity correlation p < 0.05
 
 #### 3. Symbolic rule ablation
-- **Task**: Quantify neural vs. symbolic contribution
-- **Approach**: Neural-only (β=1.0), symbolic-only (β=0.0), varying β
-- **Output**: Ablation table in paper
+- **Task**: Quantify neural vs. symbolic contribution with repaired logic
+- **Approach**: Neural-only (β=1.0), static prior (`use_learnable_constraint=False`), varying `lambda_symbolic_kl`
+- **Output**: Ablation table for paper
+
+#### 4. Regenerate figures for baseline_v5
+- **Command**: `python scripts/generate_figures.py --run-name baseline_v5`
 
 ### Medium-term (2–3 months)
 
