@@ -489,6 +489,12 @@ class NeuroSymbolicCollator:
             for key in ["manner", "place", "voice"]
         }
 
+        # NOTE (L7 / Audit F-01): input_lengths is an APPROXIMATION computed as
+        # len(audio_samples) // ctc_stride (default 320, matching HuBERT's CNN stride).
+        # HuBERT's actual output length is _get_feat_extract_output_lengths(n_samples),
+        # which differs by up to ~3 frames (e.g. 64000 // 320 = 200, but actual = 197).
+        # train.py overrides this with outputs['output_lengths'] from the live model;
+        # do NOT use batch['input_lengths'] directly for CTC loss without that override.
         input_lengths = torch.tensor(
             [len(x) // self.ctc_stride for x in input_values], dtype=torch.long
         )

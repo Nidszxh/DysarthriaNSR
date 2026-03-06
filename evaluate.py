@@ -222,12 +222,14 @@ class BeamSearchDecoder:
 
             beam = dict(sorted(new_beam.items(), key=_beam_rank, reverse=True)[:self.beam_width])
 
-        # Final selection: acoustic score / len^α + λ * lm_cumulative
+        # Final selection: acoustic / len^α + λ * lm_cumulative
+        # §3.3 fix: length norm applied to acoustic score only; LM bonus is
+        # per-token so it should NOT be divided by sequence length.
         def _norm_score(prefix: tuple, p_b: float, p_nb: float, lm_s: float) -> float:
-            acoustic = np.logaddexp(p_b, p_nb)
-            lm_bonus = (self.lm_weight * lm_s) if use_lm else 0.0
-            length   = max(len(prefix), 1)
-            return (acoustic + lm_bonus) / (length ** self.length_norm_alpha)
+            acoustic  = np.logaddexp(p_b, p_nb)
+            lm_bonus  = (self.lm_weight * lm_s) if use_lm else 0.0
+            length    = max(len(prefix), 1)
+            return acoustic / (length ** self.length_norm_alpha) + lm_bonus
 
         best_prefix, (p_b, p_nb, _lm) = max(
             beam.items(),
@@ -461,7 +463,9 @@ def decode_predictions(
         lm_weight:      LM weight λ for shallow fusion (0.0 = disabled).
     """
     if use_beam_search:
-        _alpha = getattr(getattr(config, 'training', None), 'beam_length_norm_alpha', 0.6)
+        # §3.1 fix: `config` is not in scope here; use hardcoded default 0.6
+        # (caller can override indirectly through BeamSearchDecoder constructor).
+        _alpha = 0.6
         decoder = BeamSearchDecoder(
             beam_width=beam_width,
             blank_id=phn_to_id['<BLANK>'],
@@ -689,6 +693,111 @@ def compute_per_phoneme_breakdown(
     return dict(sorted(result.items(), key=lambda x: x[1]['per'], reverse=True))
 
 
+def compute_articulatory_stratified_per(
+    predictions: List[List[str]],
+    references: List[List[str]],
+) -> Dict[str, Dict]:
+    """
+    Compute PER stratified by manner-of-articulation class (E-02).
+
+    Groups reference phonemes by their manner class (stop, fricative, nasal,
+    liquid, glide, vowel, affricate, diphthong) and reports per-class error
+    counts and PER.  Phonemes not present in PHONEME_FEATURES are grouped
+    under the key ``"other"``.
+
+    Args:
+        predictions: List of predicted phoneme sequences.
+        references:  List of reference phoneme sequences.
+
+    Returns:
+        Dict mapping manner_class → {per, n_ref, n_sub, n_del}, sorted by
+        PER descending.
+    """
+    from src.models.model import ArticulatoryFeatureEncoder
+
+    phoneme_features = ArticulatoryFeatureEncoder.PHONEME_FEATURES
+    from collections import defaultdict as _dd
+    counts: Dict[str, Dict[str, int]] = _dd(lambda: {'n_ref': 0, 'n_sub': 0, 'n_del': 0})
+
+    for pred, ref in zip(predictions, references):
+        alignment = phoneme_alignment(pred, ref)
+        for op, _pred_ph, ref_ph in alignment:
+            if op in ('correct', 'substitute', 'insert'):
+                if ref_ph:
+                    manner = phoneme_features.get(ref_ph, {}).get('manner', 'other')
+                    counts[manner]['n_ref'] += 1
+                    if op == 'substitute':
+                        counts[manner]['n_sub'] += 1
+                    elif op == 'insert':  # deletion from ASR perspective
+                        counts[manner]['n_del'] += 1
+
+    result: Dict[str, Dict] = {}
+    for manner, c in counts.items():
+        n_ref = c['n_ref']
+        per_m = (c['n_sub'] + c['n_del']) / n_ref if n_ref > 0 else 0.0
+        result[manner] = {
+            'per': round(float(per_m), 4),
+            'n_ref': n_ref,
+            'n_sub': c['n_sub'],
+            'n_del': c['n_del'],
+        }
+
+    return dict(sorted(result.items(), key=lambda x: x[1]['per'], reverse=True))
+
+
+def compute_rule_pair_confusion(
+    predictions_neural: List[List[str]],
+    predictions_constrained: List[List[str]],
+    references: List[List[str]],
+    substitution_rules: Dict,
+) -> Dict[str, Dict]:
+    """
+    Compare per-rule-pair substitution counts between the neural and constrained
+    decoders (E-03).
+
+    For each symbolic substitution rule (e.g. B→P), counts how many times that
+    substitution appears in the neural predictions vs. the constrained predictions
+    and reports the delta.  A positive delta means the constraint *reduced* that
+    substitution (helpful); a negative delta means it *increased* it (harmful).
+
+    Args:
+        predictions_neural:      Neural-only decoded phoneme sequences.
+        predictions_constrained: Constrained decoded phoneme sequences.
+        references:              Ground-truth phoneme sequences.
+        substitution_rules:      Dict with Tuple[str, str] keys, e.g. {('B','P'): 0.85}.
+
+    Returns:
+        Dict mapping ``"SRC->TGT"`` → {neural_count, constrained_count, delta,
+        rule_weight}, sorted by |delta| descending.
+    """
+    from collections import defaultdict as _dd
+
+    def _count_subs(preds: List[List[str]], refs: List[List[str]]) -> Dict[str, int]:
+        sub_counts: Dict[str, int] = _dd(int)
+        for pred, ref in zip(preds, refs):
+            for op, pred_ph, ref_ph in phoneme_alignment(pred, ref):
+                if op == 'substitute' and ref_ph and pred_ph:
+                    sub_counts[f"{ref_ph}->{pred_ph}"] += 1
+        return dict(sub_counts)
+
+    neural_subs      = _count_subs(predictions_neural,      references)
+    constrained_subs = _count_subs(predictions_constrained, references)
+
+    result: Dict[str, Dict] = {}
+    for (src, tgt), weight in substitution_rules.items():
+        key = f"{src}->{tgt}"
+        n_neural = neural_subs.get(key, 0)
+        n_const  = constrained_subs.get(key, 0)
+        result[key] = {
+            'neural_count':      n_neural,
+            'constrained_count': n_const,
+            'delta':             n_neural - n_const,  # positive = constraint reduced it
+            'rule_weight':       float(weight),
+        }
+
+    return dict(sorted(result.items(), key=lambda x: abs(x[1]['delta']), reverse=True))
+
+
 # STRATIFIED ANALYSIS
 
 def stratify_by_phoneme_length(
@@ -745,6 +854,55 @@ def stratify_by_phoneme_length(
             }
     
     return stratified
+
+
+def compute_severity_stratified_per(
+    per_by_speaker: Dict[str, float],
+) -> Dict[str, Dict[str, float]]:
+    """Stratify per-speaker PER into clinical severity buckets (audit Phase 8).
+
+    Buckets follow the standard TORGO intelligibility grouping:
+    - ``mild``     : severity ∈ [0, 2)  — controls + mild dysarthria
+    - ``moderate`` : severity ∈ [2, 4)  — moderate dysarthria
+    - ``severe``   : severity ∈ [4, 5]  — severe / profound dysarthria
+
+    Args:
+        per_by_speaker: Mapping of speaker_id → mean PER.
+
+    Returns:
+        ``{'mild': {'mean_per': float, 'n_speakers': int, 'speakers': [...], 'ci': [lo, hi]},
+            'moderate': {...}, 'severe': {...}}``
+    """
+    from src.utils.config import get_speaker_severity
+
+    buckets: Dict[str, List[float]] = {'mild': [], 'moderate': [], 'severe': []}
+    bucket_speakers: Dict[str, List[str]] = {'mild': [], 'moderate': [], 'severe': []}
+
+    for spk, per in per_by_speaker.items():
+        sev = get_speaker_severity(spk)
+        if sev < 2.0:
+            bucket = 'mild'
+        elif sev < 4.0:
+            bucket = 'moderate'
+        else:
+            bucket = 'severe'
+        buckets[bucket].append(per)
+        bucket_speakers[bucket].append(spk)
+
+    result = {}
+    for b in ('mild', 'moderate', 'severe'):
+        scores = buckets[b]
+        if scores:
+            mean_val, ci = compute_per_with_ci(scores)
+        else:
+            mean_val, ci = 0.0, [0.0, 0.0]
+        result[b] = {
+            'mean_per':   float(mean_val),
+            'ci':         ci,
+            'n_speakers': len(scores),
+            'speakers':   bucket_speakers[b],
+        }
+    return result
 
 
 # VISUALIZATION
@@ -1035,6 +1193,7 @@ def evaluate_model(
     uncertainty_n_samples: int = 20,
     lm_scorer: Optional[BigramLMScorer] = None,
     lm_weight: float = 0.0,
+    ablation_mode: str = "full",
 ) -> Dict:
     """
     Comprehensive model evaluation with statistical rigor.
@@ -1128,6 +1287,7 @@ def evaluate_model(
                 attention_mask=attention_mask,
                 speaker_severity=severity,
                 output_attentions=generate_explanations,
+                ablation_mode=ablation_mode,
             )
 
             # Per-utterance uncertainty (MC-Dropout, optional)
@@ -1281,6 +1441,32 @@ def evaluate_model(
         ]
     mean_per_neural = float(np.mean(neural_per_scores)) if neural_per_scores else None
 
+    # Constraint precision: per-utterance rate at which the constraint improved,
+    # was neutral, or degraded recognition vs. the neural-only path (audit Phase 8).
+    # "Helpful" = per_constrained < per_neural for that utterance; metric is
+    # analogous to rule precision without requiring per-frame forced alignment.
+    constraint_precision: Optional[Dict[str, float]] = None
+    if all_predictions_neural and len(all_predictions_neural) == len(per_scores):
+        helpful = neutral = harmful = 0
+        for p_c, p_n in zip(per_scores, neural_per_scores):
+            if p_c < p_n - 1e-6:
+                helpful += 1
+            elif p_c > p_n + 1e-6:
+                harmful += 1
+            else:
+                neutral += 1
+        total = len(per_scores)
+        constraint_precision = {
+            'helpful_rate':  helpful / total,
+            'neutral_rate':  neutral / total,
+            'harmful_rate':  harmful / total,
+            'n_utterances':  total,
+        }
+        print(
+            f"   Constraint precision  — helpful: {helpful/total:.1%}  "
+            f"neutral: {neutral/total:.1%}  harmful: {harmful/total:.1%}"
+        )
+
     # Stratified by dysarthric status (sample-level for clinical reporting)
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
     control_per    = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
@@ -1296,6 +1482,9 @@ def evaluate_model(
     stratified_by_length = stratify_by_phoneme_length(
         per_scores, all_phoneme_lengths, all_status
     )
+
+    # Stratified by clinical severity bucket (mild / moderate / severe)
+    stratified_by_severity = compute_severity_stratified_per(per_by_speaker)
 
     # Per-speaker metrics
     speaker_metrics = {}
@@ -1321,6 +1510,40 @@ def evaluate_model(
         json.dump(per_phoneme_breakdown, _f, indent=2)
     print(f"✅ Saved per_phoneme_per.json ({len(per_phoneme_breakdown)} phonemes)")
     plot_per_phoneme_breakdown(per_phoneme_breakdown, results_dir / 'per_phoneme_per.png')
+
+    # Articulatory-stratified PER (H4 / E-02): PER broken down by manner class
+    print("📊 Computing articulatory-stratified PER (E-02)...")
+    try:
+        per_by_manner = compute_articulatory_stratified_per(all_predictions, all_references)
+        with open(results_dir / 'per_by_manner.json', 'w') as _f:
+            json.dump(per_by_manner, _f, indent=2)
+        print(f"✅ Saved per_by_manner.json ({len(per_by_manner)} manner classes)")
+    except Exception as _e:
+        per_by_manner = {}
+        print(f"⚠️  per_by_manner failed (non-fatal): {_e}")
+
+    # Rule-pair confusion analysis (H4 / E-03): neural vs. constrained sub counts per rule
+    print("📊 Computing rule-pair confusion analysis (E-03)...")
+    rule_pair_confusion: Dict = {}
+    if all_predictions_neural and len(all_predictions_neural) == len(all_references):
+        _rules_for_analysis = symbolic_rules or {}
+        if _rules_for_analysis:
+            try:
+                rule_pair_confusion = compute_rule_pair_confusion(
+                    all_predictions_neural,
+                    all_predictions,
+                    all_references,
+                    _rules_for_analysis,
+                )
+                with open(results_dir / 'rule_pair_confusion.json', 'w') as _f:
+                    json.dump(rule_pair_confusion, _f, indent=2)
+                print(f"✅ Saved rule_pair_confusion.json ({len(rule_pair_confusion)} rule pairs)")
+            except Exception as _e:
+                print(f"⚠️  rule_pair_confusion failed (non-fatal): {_e}")
+        else:
+            print("ℹ️  rule_pair_confusion skipped: no symbolic_rules provided")
+    else:
+        print("ℹ️  rule_pair_confusion skipped: neural predictions not available")
 
     # Generate visualizations
     print("📈 Generating visualizations...")
@@ -1506,6 +1729,10 @@ def evaluate_model(
             },
         },
         'by_length': stratified_by_length,
+        'by_severity': stratified_by_severity,
+        'per_by_manner': per_by_manner,
+        'rule_pair_confusion': rule_pair_confusion,
+        'constraint_precision': constraint_precision,
         'per_speaker': speaker_metrics,
         'error_analysis': {
             'error_counts': error_analysis['error_counts'],

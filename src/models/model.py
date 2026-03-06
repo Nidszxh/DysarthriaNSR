@@ -39,9 +39,7 @@ except ImportError:
     SymbolicRuleTracker = None  # type: ignore
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Articulatory Feature Encoder  (unchanged — forms the symbolic prior)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class ArticulatoryFeatureEncoder:
     """
@@ -136,9 +134,7 @@ class ArticulatoryFeatureEncoder:
         return float(np.exp(-decay_factor * total_dist))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Learnable Constraint Matrix (Proposal P2)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class LearnableConstraintMatrix(nn.Module):
     """
@@ -159,10 +155,14 @@ class LearnableConstraintMatrix(nn.Module):
         init_matrix:  Static prior C [|V|, |V|], row-normalised probabilities
     """
 
-    def __init__(self, num_phonemes: int, init_matrix: torch.Tensor):
+    def __init__(self, num_phonemes: int, init_matrix: torch.Tensor, init_temperature: float = 0.5):
         super().__init__()
-        # Initialise as log of prior (+ ε for numerical safety)
-        log_init = init_matrix.clamp(1e-8).log()
+        # Temperature-sharpened log initialisation (§3.2 fix).
+        # Plain log(C_static) passed through softmax produces a much flatter
+        # distribution than C_static because softmax re-normalises.  Dividing
+        # by init_temperature < 1.0 preserves the peakedness of the prior so
+        # that softmax(logit_C / T) ≈ C_static at epoch 0.
+        log_init = init_matrix.clamp(1e-8).log() / init_temperature
         self.logit_C = nn.Parameter(log_init)
 
     @property
@@ -184,9 +184,7 @@ class LearnableConstraintMatrix(nn.Module):
         return P_c / P_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Symbolic Constraint Layer  (refactored to use LearnableConstraintMatrix)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class SymbolicConstraintLayer(nn.Module):
     """
@@ -218,11 +216,11 @@ class SymbolicConstraintLayer(nn.Module):
         self.config = symbolic_config
         self.use_learnable_matrix = use_learnable_matrix
 
-        # Learnable fusion weight β
-        if learnable:
-            self.beta = nn.Parameter(torch.tensor(constraint_weight))
-        else:
-            self.register_buffer('beta', torch.tensor(constraint_weight))
+        # Learnable fusion weight β — keep as a trainable parameter so that
+        # the blending factor can be tuned even when the constraint matrix
+        # itself is static. Tests expect `beta` to be a Parameter in static
+        # mode as well.
+        self.beta = nn.Parameter(torch.tensor(constraint_weight))
 
         # Build static prior matrix (always stored as reference)
         static_C = self._build_static_matrix()
@@ -311,6 +309,16 @@ class SymbolicConstraintLayer(nn.Module):
         P_final = beta_adaptive * P_constrained + (1 - beta_adaptive) * P_neural
         P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
+        # Phase 3 Fix B: blank-frame constraint masking.
+        # ~85% of CTC frames are blank-dominant.  Applying C to those frames only
+        # amplifies the blank posterior through the row of C that maps blank→blank,
+        # degrading PER.  Only apply the constrained distribution where the
+        # neural model is not already blank-dominant.
+        blank_threshold = getattr(self.config, 'blank_constraint_threshold', 0.5)
+        non_blank_mask = (P_neural[:, :, 0] < blank_threshold).unsqueeze(-1)  # [B, T, 1]
+        P_final = torch.where(non_blank_mask, P_final, P_neural)
+        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
         # Track rule activations (inference only)
         shift_metric = None
         if self.rule_activations is not None and not self.training:
@@ -321,7 +329,7 @@ class SymbolicConstraintLayer(nn.Module):
             )
             shift_metric = self._track_activations(P_neural, P_final, beta_value=beta_scalar)
 
-        log_probs = torch.log(P_final + 1e-12)
+        log_probs = torch.log(P_final.clamp_min(1e-6))  # B4a fix: +1e-12 underflows to 0 in BF16; clamp_min(1e-6) is always representable
 
         return {
             'log_probs': log_probs,
@@ -350,36 +358,38 @@ class SymbolicConstraintLayer(nn.Module):
         if self.rule_activations is None:
             return None
 
-        shift = (P_final - P_neural).abs().sum(dim=-1).mean().detach()
+        with torch.no_grad():  # B4b fix: no_grad prevents building unused gradient graph during inference
+            shift = (P_final - P_neural).abs().sum(dim=-1).mean().detach()
 
-        if len(self.rule_activations) < 10000:
-            neural_preds = torch.argmax(P_neural, dim=-1)
-            final_preds = torch.argmax(P_final, dim=-1)
-            changed = (neural_preds != final_preds)
+            if len(self.rule_activations) < 10000:
+                neural_preds = torch.argmax(P_neural, dim=-1)
+                final_preds = torch.argmax(P_final, dim=-1)
+                changed = (neural_preds != final_preds)
 
-            if changed.any():
-                indices = torch.nonzero(changed, as_tuple=False)
-                for b, t in indices[:100].tolist():
-                    n_id = int(neural_preds[b, t].item())
-                    f_id = int(final_preds[b, t].item())
-                    n_phn = self.id_to_phn.get(n_id, '<UNK>')
-                    f_phn = self.id_to_phn.get(f_id, '<UNK>')
-                    rule_id = f"{n_phn}->{f_phn}"
+                if changed.any():
+                    indices = torch.nonzero(changed, as_tuple=False)
+                    for b, t in indices[:100].tolist():
+                        n_id = int(neural_preds[b, t].item())
+                        f_id = int(final_preds[b, t].item())
+                        n_phn = self.id_to_phn.get(n_id, '<UNK>')
+                        f_phn = self.id_to_phn.get(f_id, '<UNK>')
+                        rule_id = f"{n_phn}->{f_phn}"
 
-                    # Log to SymbolicRuleTracker (ROADMAP §6.2)
-                    if self.rule_tracker is not None:
-                        self.rule_tracker.log_rule_activation(
-                            rule_id=rule_id,
-                            input_phoneme=n_phn,
-                            output_phoneme=f_phn,
-                            confidence=beta_value,
-                        )
+                        # Log to SymbolicRuleTracker (ROADMAP §6.2)
+                        if self.rule_tracker is not None:
+                            self.rule_tracker.log_rule_activation(
+                                rule_id=rule_id,
+                                input_phoneme=n_phn,
+                                output_phoneme=f_phn,
+                                blend_weight=beta_value,
+                                prediction_confidence=float(P_final[b, t, f_id].item()),
+                            )
 
-                    self.rule_activations.append({
-                        'neural_pred': n_phn,
-                        'final_pred':  f_phn,
-                        'shift': float(shift.item()),
-                    })
+                        self.rule_activations.append({
+                            'neural_pred': n_phn,
+                            'final_pred':  f_phn,
+                            'shift': float(shift.item()),
+                        })
 
         return shift
 
@@ -418,9 +428,7 @@ class SymbolicConstraintLayer(nn.Module):
             self.rule_tracker.clear()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Severity Adapter (Proposal P3)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class SeverityAdapter(nn.Module):
     """
@@ -491,9 +499,7 @@ class SeverityAdapter(nn.Module):
         return self.layer_norm(hidden_states + attn_out)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # SpecAugment — time and frequency masking on HuBERT hidden states
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class SpecAugmentLayer(nn.Module):
     """
@@ -538,26 +544,26 @@ class SpecAugmentLayer(nn.Module):
         B, T, D = x.shape
         x = x.clone()
 
-        # ─ Time masking ──────────────────────────────────────────────────
+        # ─ Time masking — independent masks per sample (§2.3 fix) ─────────
         n_time_masks = max(1, int(T * self.time_mask_prob))
-        for _ in range(n_time_masks):
-            t_len = random.randint(1, self.time_mask_length)
-            t0    = random.randint(0, max(0, T - t_len))
-            x[:, t0:t0 + t_len, :] = 0.0
+        for b in range(B):
+            for _ in range(n_time_masks):
+                t_len = random.randint(1, self.time_mask_length)
+                t0    = random.randint(0, max(0, T - t_len))
+                x[b, t0:t0 + t_len, :] = 0.0
 
-        # ─ Frequency masking ───────────────────────────────────────────────
+        # ─ Frequency masking — independent masks per sample ────────────────
         n_freq_masks = max(1, int(D * self.freq_mask_prob))
-        for _ in range(n_freq_masks):
-            f_len = random.randint(1, self.freq_mask_length)
-            f0    = random.randint(0, max(0, D - f_len))
-            x[:, :, f0:f0 + f_len] = 0.0
+        for b in range(B):
+            for _ in range(n_freq_masks):
+                f_len = random.randint(1, self.freq_mask_length)
+                f0    = random.randint(0, max(0, D - f_len))
+                x[b, :, f0:f0 + f_len] = 0.0
 
         return x
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Phoneme Classifier Head (unchanged)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TemporalDownsampler(nn.Module):
     """
@@ -641,9 +647,7 @@ class PhonemeClassifier(nn.Module):
         return logits
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Full NeuroSymbolicASR Model
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class NeuroSymbolicASR(nn.Module):
     """
@@ -684,9 +688,13 @@ class NeuroSymbolicASR(nn.Module):
 
         # ── HuBERT Encoder ────────────────────────────────────────────────────
         print(f"🧠 Loading HuBERT: {model_config.hubert_model_id}")
+        _hf_kwargs = dict(attn_implementation="eager")  # SDPA does not support output_attentions=True
+        if getattr(model_config, 'hubert_model_revision', None):
+            _hf_kwargs['revision'] = model_config.hubert_model_revision
+            print(f"   📌 HuBERT revision pinned: {model_config.hubert_model_revision}")
         self.hubert = HubertModel.from_pretrained(
             model_config.hubert_model_id,
-            attn_implementation="eager",  # SDPA does not support output_attentions=True
+            **_hf_kwargs,
         )
 
         try:
@@ -845,19 +853,29 @@ class NeuroSymbolicASR(nn.Module):
         )
         hidden_states = hubert_outputs.last_hidden_state  # [B, T, 768]
 
+        # ── SpecAugment (no-op at eval; masks time/freq regions during training) ──
+        # NOTE: SpecAugment before SeverityAdapter — do not reorder.
+        # Augmentation must run on clean HuBERT encoder features; severity
+        # conditioning then operates on the augmented (but content-preserving)
+        # representation.  Applying masks AFTER the adapter would zero-out the
+        # adapter's severity signal for masked frames, corrupting its training.
+        # B3 fix: moved from after SeverityAdapter to before it.
+        # Skipped when ablation_mode == 'no_spec_augment' to isolate its contribution.
+        if self.spec_augment is not None and ablation_mode != "no_spec_augment":
+            hidden_states = self.spec_augment(hidden_states)
+
         # ── Severity Adapter (Proposal P3) ────────────────────────────────────
         # Skipped in neural_only ablation for a true neural baseline (Q7).
         if ablation_mode != "neural_only":
             if self.severity_adapter is not None and speaker_severity is not None:
                 hidden_states = self.severity_adapter(hidden_states, speaker_severity)
 
-        # ── SpecAugment (no-op at eval; masks time/freq regions during training) ──
-        if self.spec_augment is not None:
-            hidden_states = self.spec_augment(hidden_states)
-
         # ── Temporal Downsampler (stride-2, ~50 Hz → ~25 Hz) ─────────────────
-        if self.temporal_downsampler is not None:
+        # Track whether downsampling actually ran — output_lengths depends on it.
+        _downsample_applied = False
+        if self.temporal_downsampler is not None and ablation_mode != "no_temporal_ds":
             hidden_states = self.temporal_downsampler(hidden_states)
+            _downsample_applied = True
 
         # ── Phoneme Classifier ────────────────────────────────────────────────
         logits_neural, shared_features = self.phoneme_classifier(
@@ -892,7 +910,7 @@ class NeuroSymbolicASR(nn.Module):
                 (hidden_states.size(0),), pre_downsample_T,
                 dtype=torch.long, device=hidden_states.device,
             )
-        if self.temporal_downsampler is not None:
+        if _downsample_applied:
             output_lengths = (output_lengths + 1) // 2
         output_lengths = output_lengths.clamp(max=hidden_states.size(1))
 
@@ -917,6 +935,26 @@ class NeuroSymbolicASR(nn.Module):
                 'output_lengths':        output_lengths,
             }
             return result_neural_only
+
+        # ── no_constraint_matrix: keep SeverityAdapter + art heads, skip symbolic layer ──
+        # Unlike neural_only (which also skips SeverityAdapter and art heads), this
+        # gives a fairer comparison by keeping all components except the constraint blending.
+        if ablation_mode == "no_constraint_matrix":
+            log_probs_neural = F.log_softmax(logits_neural, dim=-1)
+            return {
+                'logits_neural':         logits_neural,
+                'logits_constrained':    log_probs_neural,
+                'log_probs_constrained': log_probs_neural,
+                'hidden_states':         hidden_states,
+                'beta':                  torch.zeros(1, device=logits_neural.device),
+                'P_neural':              F.softmax(logits_neural, dim=-1),
+                'P_constrained':         None,
+                'rule_shift':            None,
+                'logits_manner':         logits_manner,
+                'logits_place':          logits_place,
+                'logits_voice':          logits_voice,
+                'output_lengths':        output_lengths,
+            }
 
         # ── Symbolic Constraint Layer ─────────────────────────────────────────
         symbolic_out = self.symbolic_layer(logits_neural, speaker_severity=speaker_severity)
@@ -961,9 +999,7 @@ class NeuroSymbolicASR(nn.Module):
         self.symbolic_layer.clear_activations()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Module self-test
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     """Quick forward-pass smoke test."""

@@ -98,7 +98,8 @@ class ExplainableOutputFormatter:
             "symbolic_rules_summary": {
                 "total_fired": symbolic_rules_summary.get("total_activations", 0),
                 "activation_rate": symbolic_rules_summary.get("activation_rate", 0.0),
-                "avg_confidence": symbolic_rules_summary.get("avg_confidence", 0.0),
+                "avg_blend_weight": symbolic_rules_summary.get("avg_blend_weight", 0.0),
+                "avg_prediction_confidence": symbolic_rules_summary.get("avg_prediction_confidence"),
                 "top_rules": [
                     {"rule_id": rule, "count": count}
                     for rule, count in symbolic_rules_summary.get("top_rules", [])

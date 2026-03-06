@@ -20,7 +20,8 @@ class SymbolicRuleTracker:
     Usage:
         tracker = SymbolicRuleTracker()
         # In SymbolicConstraintLayer._track_activations():
-        tracker.log_rule_activation(rule_id, input_ctx, output_correction, confidence)
+        tracker.log_rule_activation(rule_id, input_ctx, output_correction,
+                                    blend_weight=beta, prediction_confidence=prob)
         # After evaluation:
         explanation = tracker.generate_explanation()
     """
@@ -30,16 +31,15 @@ class SymbolicRuleTracker:
         self._activations: List[Dict[str, Any]] = []
         self._total_frames: int = 0
 
-    # ──────────────────────────────────────────────────────────────────────────
     # Logging API
-    # ──────────────────────────────────────────────────────────────────────────
 
     def log_rule_activation(
         self,
         rule_id: str,
         input_phoneme: str,
         output_phoneme: str,
-        confidence: float,
+        blend_weight: float,
+        prediction_confidence: Optional[float] = None,
         frame_idx: Optional[int] = None,
         speaker_id: Optional[str] = None,
     ) -> None:
@@ -47,19 +47,22 @@ class SymbolicRuleTracker:
         Log a single rule activation event.
 
         Args:
-            rule_id:        Identifier string, e.g. "B->P" or "R->W"
-            input_phoneme:  Neural top-1 phoneme (before symbolic correction)
-            output_phoneme: Final top-1 phoneme (after symbolic correction)
-            confidence:     Constraint blend weight β at this frame
-            frame_idx:      Frame index in the utterance (optional)
-            speaker_id:     Speaker identifier (optional, for stratification)
+            rule_id:               Identifier string, e.g. "B->P" or "R->W"
+            input_phoneme:         Neural top-1 phoneme (before symbolic correction)
+            output_phoneme:        Final top-1 phoneme (after symbolic correction)
+            blend_weight:          Constraint blend weight β at this frame (range ≈ 0.05–0.25)
+            prediction_confidence: max(P_final) at this frame — actual softmax confidence
+                                   of the final prediction (optional)
+            frame_idx:             Frame index in the utterance (optional)
+            speaker_id:            Speaker identifier (optional, for stratification)
         """
-        if confidence >= self.min_confidence:
+        if blend_weight >= self.min_confidence:
             self._activations.append({
                 "rule_id": rule_id,
                 "input": input_phoneme,
                 "output_correction": output_phoneme,
-                "confidence": confidence,
+                "blend_weight": blend_weight,
+                "prediction_confidence": prediction_confidence,
                 "frame_idx": frame_idx,
                 "speaker_id": speaker_id,
             })
@@ -68,9 +71,7 @@ class SymbolicRuleTracker:
         """Register the total number of frames processed (for activation rate)."""
         self._total_frames += n_frames
 
-    # ──────────────────────────────────────────────────────────────────────────
     # Analysis API
-    # ──────────────────────────────────────────────────────────────────────────
 
     def generate_explanation(self) -> Dict[str, Any]:
         """
@@ -80,11 +81,12 @@ class SymbolicRuleTracker:
             {
               total_activations: int,
               activation_rate: float,            # activations / total_frames
-              high_confidence_corrections: list, # confidence > 0.7
+              high_confidence_corrections: list, # prediction_confidence > 0.7
               rule_frequency: {rule_id: count},
               top_rules: [(rule_id, count), ...],# Top-10
               per_speaker_activations: {speaker: {rule_id: count}},
-              avg_confidence: float,
+              avg_blend_weight: float,           # mean β across activations
+              avg_prediction_confidence: float | None,  # mean max(P_final) at changed frames
             }
         """
         if not self._activations:
@@ -95,12 +97,17 @@ class SymbolicRuleTracker:
                 "rule_frequency": {},
                 "top_rules": [],
                 "per_speaker_activations": {},
-                "avg_confidence": 0.0,
+                "avg_blend_weight": 0.0,
+                "avg_prediction_confidence": None,
             }
 
         rule_counts = Counter(a["rule_id"] for a in self._activations)
-        high_conf = [a for a in self._activations if a["confidence"] > 0.7]
-        avg_conf = sum(a["confidence"] for a in self._activations) / len(self._activations)
+        # Filter on prediction_confidence (max P_final) rather than blend_weight (β ≈ 0.05–0.25)
+        high_conf = [a for a in self._activations if (a.get("prediction_confidence") or 0) > 0.7]
+        avg_blend = sum(a["blend_weight"] for a in self._activations) / len(self._activations)
+        pred_confs = [a["prediction_confidence"] for a in self._activations
+                      if a.get("prediction_confidence") is not None]
+        avg_pred_conf = sum(pred_confs) / len(pred_confs) if pred_confs else None
 
         per_speaker: Dict[str, Counter] = defaultdict(Counter)
         for a in self._activations:
@@ -122,7 +129,8 @@ class SymbolicRuleTracker:
             "per_speaker_activations": {
                 spk: dict(cnt) for spk, cnt in per_speaker.items()
             },
-            "avg_confidence": round(avg_conf, 4),
+            "avg_blend_weight": round(avg_blend, 4),
+            "avg_prediction_confidence": round(avg_pred_conf, 4) if avg_pred_conf is not None else None,
         }
 
     def rule_precision(

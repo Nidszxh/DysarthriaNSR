@@ -86,6 +86,10 @@ class ProjectPaths:
 class ModelConfig:
     """Architecture settings optimized for 8GB VRAM."""
     hubert_model_id: str = "facebook/hubert-base-ls960"
+    # Pin the exact HuBERT Hub commit hash for reproducibility (H7/R-01).
+    # Pinned to dba3bb02 — verified from local cache 2026-03-06.
+    # Override to None only for development / CI where offline access is required.
+    hubert_model_revision: Optional[str] = "dba3bb02fda4248b6e082697eee756de8fe8aa8a"
     freeze_feature_extractor: bool = True
     
     # Permanently freeze only the bottom 4 layers (robust generic acoustic features).
@@ -156,15 +160,15 @@ class TrainingConfig:
 
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
-    lambda_ce: float = 0.2
-    lambda_articulatory: float = 0.15  # Increased from 0.1 — stronger articulatory supervision
+    lambda_ce: float = 0.35           # T-01: raised from 0.2 — stronger phoneme discrimination against substitution-dominant errors
+    lambda_articulatory: float = 0.08  # T-01: reduced from 0.15 — articulatory accuracy already ~78–92%; marginal gain is low
 
     # --- Phase 2: New loss weights (audit Proposals P1, P2, R3) ---
     # Ordinal contrastive severity loss (Proposal P1)
     lambda_ordinal: float = 0.05
     # Blank-prior KL regularisation (fix CTC insertion pathology)
     lambda_blank_kl: float = 0.20   # Full-stage target (epochs 20+); gentler than old 0.35
-    blank_target_prob: float = 0.82   # Slightly below 0.85: allows a bit more phoneme output to reduce deletions while still suppressing insertions
+    blank_target_prob: float = 0.75   # B2/T-03 fix: 0.82 overshoots deletion rate; 0.75 allows slightly more phoneme emission (audit §3.3 / §4-T03)
     # I2: Staged lambda_blank_kl warmup — prevents early CTC collapse from aggressively
     # suppressing blanks before the model has learned basic phoneme boundaries.
     # Schedule:  epochs < stage1_end  → stage1_value (gentle push)
@@ -175,7 +179,9 @@ class TrainingConfig:
     blank_kl_stage2_end: int = 20
     blank_kl_stage2_value: float = 0.15
     # Symbolic KL anchor (keeps learnable C near symbolic prior)
-    lambda_symbolic_kl: float = 0.05
+    # §3.8 fix: 0.05 with batchmean/V=47 rows → effective per-row weight ≈0.001,
+    # too weak to prevent degenerate constraint matrix.  0.5 gives ~0.01 per row.
+    lambda_symbolic_kl: float = 0.5
 
     # Logging & Checkpointing
     monitor_metric: str = "val/per"
@@ -189,7 +195,7 @@ class TrainingConfig:
     num_workers: int = 8          # saturate PCIe; was 4
     pin_memory: bool = True
     prefetch_factor: int = 4       # deeper prefetch queue reduces GPU stalls; was 2
-    blank_priority_weight: float = 2.5  # Increased from 1.5 — up-weights blank in CE class weights to suppress insertions
+    blank_priority_weight: float = 1.0  # B2 fix: reduced from 2.5 — insertion bias resolved (I/D=0.87×); no special blank boost needed
 
     # --- Phase 4: Training infrastructure (audit G2, ablations) ---
     # Leave-One-Speaker-Out cross-validation (opt-in, keeps fast single-split default)
@@ -259,6 +265,10 @@ class SymbolicConfig:
     track_rule_activations: bool = True
     generate_confusion_matrix: bool = True
     severity_beta_slope: float = 0.2
+    # Blank-frame constraint masking (Phase 3 Fix B): apply symbolic constraint
+    # only at frames where P_neural[blank] < threshold; avoids amplifying blank
+    # posteriors (which make up ~85% of CTC frames) through the constraint matrix.
+    blank_constraint_threshold: float = 0.5
 
 
 # --- Master Config Handler ---
@@ -276,6 +286,13 @@ class Config:
         self.effective_batch_size = self.training.batch_size * self.training.gradient_accumulation_steps
         
         self.paths.ensure_directories()
+        # NOTE: _print_vram_status() is intentionally NOT called here.
+        # run_pipeline.py sets config.training.ablation_mode *after* Config() is
+        # constructed, so printing the banner here would always show 'Ablation: full'.
+        # Call config.print_vram_status() explicitly after all overrides are applied.
+
+    def print_vram_status(self):
+        """Print the RTX 4060 VRAM safety report.  Call AFTER all config overrides."""
         self._print_vram_status()
 
     def _print_vram_status(self):
@@ -311,6 +328,8 @@ class Config:
         }
         # Flatten rules for YAML (Tuples are not YAML standard)
         data["symbolic"]["substitution_rules"] = {f"{k[0]}_{k[1]}": v for k, v in self.symbolic.substitution_rules.items()}
+        # H8: Persist TORGO_SEVERITY_MAP so any change is tracked in saved configs
+        data["severity_map"] = dict(TORGO_SEVERITY_MAP)
         return data
 
     def save(self, path: Path):

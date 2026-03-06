@@ -206,10 +206,18 @@ class SymbolicKLLoss(nn.Module):
         # KL(learned || prior): F.kl_div(input=log_prior, target=log_learned, log_target=True)
         # F.kl_div(log_q, log_p, log_target=True) = KL(p || q), so to get KL(learned || prior)
         # we pass input=log_prior, target=log_learned.
+        # Use reduction="sum" then divide by V (number of rows) to get the
+        # mean per-row KL divergence, matching the docstring formula:
+        #   loss = (1/V) Σ_i KL(C_learned[i] || C_static[i])
+        # "batchmean" is mathematically identical for a 2-D [V,V] tensor
+        # (divides by V, the first dimension), but "sum/size(0)" makes the
+        # normalisation explicit and avoids confusion if the tensor shape ever
+        # changes (e.g. a batched C in future work).
+        # B1 fix: explicit sum/V normalisation
         kl = F.kl_div(
             self.log_prior,
             log_learned,
-            reduction="batchmean",
+            reduction="sum",
             log_target=True,
-        )
+        ) / log_learned.size(0)
         return kl

@@ -252,6 +252,7 @@ def run_evaluation(
     uncertainty_n_samples: int,
     lm_scorer: Optional["BigramLMScorer"] = None,
     lm_weight: float = 0.0,
+    ablation_mode: str = "full",
 ) -> Dict:
     """
     Execute the evaluation stage via ``evaluate_model()``.
@@ -307,6 +308,7 @@ def run_evaluation(
         uncertainty_n_samples=uncertainty_n_samples,
         lm_scorer=lm_scorer,
         lm_weight=lm_weight,
+        ablation_mode=ablation_mode,
     )
 
     log.info(
@@ -359,6 +361,9 @@ def run_auto(args: argparse.Namespace) -> None:
     # Forwarded training overrides
     config.training.ablation_mode = args.ablation
     config.training.use_loso = args.loso
+
+    # Print VRAM banner AFTER all overrides are applied so ablation mode is correct.
+    config.print_vram_status()
     if args.max_epochs is not None:
         config.training.max_epochs = args.max_epochs
 
@@ -465,6 +470,7 @@ def run_auto(args: argparse.Namespace) -> None:
         use_beam_search=args.beam_search,
         beam_width=args.beam_width,
         generate_explanations=args.explain,
+        ablation_mode=config.training.ablation_mode,
         # I4: CLI flag OR config.experiment flag enables uncertainty; CLI takes priority for n_samples
         compute_uncertainty=args.uncertainty or config.experiment.compute_uncertainty,
         uncertainty_n_samples=(
@@ -552,7 +558,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ablation",
         type=str,
         default="full",
-        choices=["full", "neural_only", "symbolic_only", "no_art_heads"],
+        choices=["full", "neural_only", "symbolic_only", "no_art_heads",
+                 "no_constraint_matrix", "no_spec_augment", "no_temporal_ds"],
         metavar="STR",
         help="Ablation mode.",
     )

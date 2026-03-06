@@ -44,21 +44,26 @@ PHONEME_DETAILS = {
     'DH': ('fricative', 'dental', 'voiced'),
     'S': ('fricative', 'alveolar', 'voiceless'),
     'Z': ('fricative', 'alveolar', 'voiced'),
-    'SH': ('fricative', 'palatal', 'voiceless'),
-    'ZH': ('fricative', 'palatal', 'voiced'),
+    # §5.3 fix: SH/ZH are postalveolar (retroflex/laminal), not palatal — aligned
+    # with IPA and model.py PHONEME_FEATURES
+    'SH': ('fricative', 'postalveolar', 'voiceless'),
+    'ZH': ('fricative', 'postalveolar', 'voiced'),
     'HH': ('fricative', 'glottal', 'voiceless'),
     # Affricates
-    'CH': ('affricate', 'palatal', 'voiceless'),
-    'JH': ('affricate', 'palatal', 'voiced'),
+    # §5.3 fix: CH/JH are postalveolar affricates, not palatal
+    'CH': ('affricate', 'postalveolar', 'voiceless'),
+    'JH': ('affricate', 'postalveolar', 'voiced'),
     # Nasals
     'M': ('nasal', 'bilabial', 'voiced'),
     'N': ('nasal', 'alveolar', 'voiced'),
     'NG': ('nasal', 'velar', 'voiced'),
     # Liquids
     'L': ('liquid', 'alveolar', 'voiced'),
-    'R': ('liquid', 'palatal', 'voiced'),
+    # §5.3 fix: American English /r/ is a retroflex approximant — alveolar, not palatal
+    'R': ('liquid', 'alveolar', 'voiced'),
     # Glides
-    'W': ('glide', 'bilabial', 'voiced'),
+    # §5.3 fix: /w/ is labio-velar (labialized velar), not merely bilabial
+    'W': ('glide', 'labio-velar', 'voiced'),
     'Y': ('glide', 'palatal', 'voiced'),
     # Vowels (Monophthongs)
     'IY': ('vowel', 'front', 'voiced'),
