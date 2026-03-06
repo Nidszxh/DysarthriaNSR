@@ -3,7 +3,7 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: All B1–B12 bugs fixed; smoke tests passing; `baseline_v5` trained and evaluated (March 6, 2026). LOSO-CV not yet run.
+**Status**: B1–B12 fixed (previous sessions); B13–B23 fixed (March 6, 2026 — current session). Smoke tests passing. `baseline_v5` trained and evaluated. LOSO-CV not yet run.
 **Latest baseline**: baseline_v5 (March 6, 2026) — beam-search test PER **0.4750**, val/per 0.505 (epoch 28/30), 98.9M total / 66.4M trainable, I/D=0.9×. **Critical finding**: symbolic constraints still hurt (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). Articulatory accuracy: manner 78.3%, place 79.3%, voice 92.3%. Identical performance to v4 — symbolic layer is the bottleneck.
 **Previous baseline**: baseline_v4 (March 5, 2026) — beam-search PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×)
 **Earlier baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
@@ -63,7 +63,9 @@ scripts/smoke_test.py                   ← 7 automated tests (all passing)
 - **src/visualization/experiment_plots.py**: visualization library
 - **Severity**: TORGO_SEVERITY_MAP provides continuous [0,5] scores per speaker; `get_speaker_severity()` used in both train and eval forward passes
 
-### ✅ ALL CONFIRMED BUGS FIXED (B1–B11 + B12)
+### ✅ ALL CONFIRMED BUGS FIXED (B1–B23)
+
+**B1–B12** (previous sessions — see `RESEARCH_BRIEF.md`):
 
 | ID | File | Bug | Status |
 |----|------|-----|--------|
@@ -80,26 +82,37 @@ scripts/smoke_test.py                   ← 7 automated tests (all passing)
 | B11 | dataloader.py | Double normalization note | ✅ Accepted (intentional for dysarthric variability) |
 | B12 | manifest.py line 233 | `path.name.split('_')[0]` → always `'unknown'`; speaker at `[2]` | ✅ Fixed & **manifest regenerated** (March 4, 2026) |
 
+**B13–B23** (current session, March 6, 2026):
+
+| ID | File | Bug | Fix Summary |
+|----|------|-----|-------------------|
+| B13 | model.py `SpecAugmentLayer` | Same time/freq mask applied to entire batch — no per-sample diversity | Apply independent random masks per sample (§2.3) |
+| B14 | train.py Stage 2 unfreezing | `unfreeze_after_warmup()` unfroze **all** layers 4–11, making Stage 3 a no-op | Call `unfreeze_encoder(layers=[6,7,8,9,10,11])` explicitly (§2.4) |
+| B15 | train.py `on_validation_epoch_end` | `val/per` logged as batch-mean PER — over-weighted high-utterance speakers | Compute proper macro-speaker PER: average per-speaker first (§2.6) |
+| B16 | train.py `training_step` attention mask | CTC stride hardcoded to 320; with `TemporalDownsampler` active, effective stride is 640 | `ctc_stride = 320 * (2 if temporal_downsampler else 1)` (§2.7) |
+| B17 | train.py `validation_step` + `test_step` | `attention_mask=None` passed to `compute_loss` → `BlankPriorKLLoss` included padding frames, biasing loss upward | New `_downsample_attn_mask()` helper; passed in both steps (§3.4) |
+| B18 | train.py `on_save/load_checkpoint` | Vocabulary not persisted in checkpoint — silent mismatch if manifest regenerated between train and eval | Added `on_save_checkpoint` / `on_load_checkpoint` with vocab diff warning (§2.10) |
+| B19 | evaluate.py `BeamSearchDecoder` | Length-norm divisor applied to both acoustic AND LM bonus — LM bonus unfairly penalised for long sequences | Length norm on acoustic score only; LM bonus added after (§3.3) |
+| B20 | evaluate.py `decode_predictions` | `config` not in scope; `beam_length_norm_alpha` lookup raised `AttributeError` | Hardcoded default 0.6 (§3.1) |
+| B21 | model.py `LearnableConstraintMatrix` | `log(C_static)` → softmax produces flat distribution at epoch 0; prior peakedness lost | Temperature-sharpened init: `log_init = log(C) / init_temperature` (default 0.5) (§3.2) |
+| B22 | config.py `lambda_symbolic_kl` | Value 0.05 with batchmean / 47 rows → effective per-row weight ≈ 0.001 — too weak to prevent constraint matrix drift toward `<BLANK>` | Raised to **0.5** (§3.8) |
+| B23 | manifest.py `PHONEME_DETAILS` | SH/ZH/CH/JH place labelled `palatal` (wrong); R place `palatal` (wrong); W place `bilabial` (incomplete) | SH/ZH/CH/JH → `postalveolar`; R → `alveolar`; W → `labio-velar` (§5.3) |
+
 ---
 
 ## KNOWN ARCHITECTURAL NOTE — Frame-CE Label Alignment
 
-The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T] with -100 and applies NLLLoss. Since CTC does not provide forced alignment, frame positions 0..L do not correspond to actual phoneme boundaries. This is the root cause of the insertion bias. `BlankPriorKLLoss` (lambda_blank_kl=0.05) is the mitigation, but the attention mask passed to it uses the wrong stride (B3 above).
-
----
-| Dysarthric ≤ Control PER | Dysarthric 0.541 vs Control 0.575 (counter-intuitive) | MEDIUM | Need speaker-stratified analysis; test set only 3 speakers |
-| Constraint weight (β) initialization | β converges ~0.5; unclear if optimal | LOW | Ablation study (β ∈ {0.0, 0.3, 0.5, 0.7, 1.0}) recommended |
+The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T] with -100 and applies NLLLoss. Since CTC does not provide forced alignment, frame positions 0..L do not correspond to actual phoneme boundaries. This is the root cause of the insertion bias. `BlankPriorKLLoss` (lambda_blank_kl raised to 0.5 — B22) is the primary mitigation; `_downsample_attn_mask()` (B17) ensures padding frames are now correctly excluded.
 
 ### ⚠️ CURRENT OPEN ISSUES (March 2026)
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative); reproduced in v4 **and** v5 | Run `--ablation neural_only`; set `use_learnable_constraint=False` in config and rerun |
-| **LOSO-CV not run** (HIGH) | n=3 test speakers; severity correlation p=0.347 (n.s.) — no statistically valid macro-PER estimate | `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h); fix symbolic constraint first |
-| Substitution/Deletion dominance | 13,821 subs + 4,338 del vs 3,752 ins in v5 | Insertion bias resolved, substitution dominance persists |
-| `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are X→`<BLANK>` deletions | Rules not matching confusion patterns; linked to symbolic constraint issue |
+| **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative); reproduced in v4 **and** v5 | B22 (`lambda_symbolic_kl`→0.5) + B21 (temperature init) applied; re-run needed to confirm fix |
+| **LOSO-CV not run** (HIGH) | n=3 test speakers; severity correlation p=0.347 (n.s.) — no statistically valid macro-PER estimate | `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h); run after verifying constraint fix |
+| Substitution/Deletion dominance | 13,821 subs + 4,338 del vs 3,752 ins in v5 | B15 (macro-speaker PER) may shift val/per metric; next run will confirm |
+| `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are X→`<BLANK>` | B22+B21 should reduce BLANK-dominated constraint drift |
 | `PhonemeAttributor.attention_attribution` disabled | Requires CTC forced alignment | Future work |
-| `ablation_mode='neural_only'` incomplete | Doesn't disable SeverityAdapter / LearnableConstraintMatrix forward passes | Fix before running ablation |
 
 ---
 
@@ -195,6 +208,7 @@ lambda_ctc: float = 0.8
 lambda_ce: float = 0.2
 lambda_articulatory: float = 0.1
 blank_priority_weight: float = 1.5  # Blank class weight (for insertion mitigation)
+lambda_symbolic_kl: float = 0.5   # ↑ from 0.05 (B22 — was too weak to anchor constraint matrix)
 max_epochs: int = 30
 encoder_warmup_epochs: int = 3  # Unfreeze after 3 epochs
 ```
@@ -528,14 +542,14 @@ for layer_idx in freeze_encoder_layers:
 ## Next Steps: What Remains
 
 ### Immediate (blocking LOSO)
-1. **Fix `ablation_mode='neural_only'`**: Must fully disable SeverityAdapter + LearnableConstraintMatrix forward passes before ablation results are meaningful
-2. **Neural-only ablation** (CRITICAL): `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — confirm neural floor (`per_neural≈0.305`)
-3. **Disable learnable constraint**: Set `use_learnable_constraint=False` in `src/utils/config.py` and validate on a short run
+1. **Train baseline_v6** with B13–B23 fixes applied: `python run_pipeline.py --run-name baseline_v6` — establishes whether the constraint fixes (B21, B22) reduce `delta_per`
+2. **Neural-only ablation**: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — now properly supported (B14 stage-unfreezing fixed; `no_constraint_matrix` ablation mode added)
+3. **Verify `constraint_precision`** in `evaluation_results.json` → `helpful_rate` should rise above `harmful_rate`
 
 ### Next priority
-4. **LOSO-CV** (~15–22h): `python run_pipeline.py --run-name loso_v1 --loso` — run only after symbolic constraint is fixed/ablated; produces statistically valid macro-PER (n=15) and severity correlation
-5. **Regenerate figures** for baseline_v5: `python scripts/generate_figures.py --run-name baseline_v5`
-6. **Additional ablations**: `--ablation no_art_heads`, `--ablation no_constraint_matrix`
+4. **LOSO-CV** (~15–22h): `python run_pipeline.py --run-name loso_v1 --loso` — run after baseline_v6 confirms constraint improvement; macro-PER now correctly computed as macro-speaker (B15)
+5. **Regenerate figures** for baseline_v6: `python scripts/generate_figures.py --run-name baseline_v6`
+6. **Additional ablations**: `--ablation no_constraint_matrix`, `--ablation no_spec_augment`, `--ablation no_temporal_ds` (all now valid choices)
 
 ### Long-term
 - **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules

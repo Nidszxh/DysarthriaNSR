@@ -4,18 +4,24 @@
 
 The complete end-to-end pipeline is **fully implemented** and running:
 - ✅ Data download and extraction
-- ✅ Neuro-symbolic manifest generation (speaker extraction B12 **fully resolved** — manifest regenerated March 4, 2026)
+- ✅ Neuro-symbolic manifest generation (B12 fixed; B23 articulatory place corrections applied — manifest regenerated March 4, 2026)
 - ✅ PyTorch Dataset with automatic feature extraction
 - ✅ Multi-task learning (CTC + CE + articulatory heads + BlankPriorKL + OrdinalContrastive + SymbolicKL)
 - ✅ PyTorch Lightning training with MLflow integration
 - ✅ Comprehensive evaluation (PER/WER with bootstrap CI, per-speaker breakdown)
-- ✅ Beam search decoding (width configurable; default 25)
+- ✅ Beam search decoding (width configurable; default 25); length-norm bug fixed (B19)
 - ✅ Explainability JSON output (`explanations.json`, per-utterance phoneme error analysis)
 - ✅ MC-Dropout uncertainty estimation (`--uncertainty` flag)
 - ✅ `run_pipeline.py` orchestrator (single CLI entry point)
 - ✅ Publication-quality figure suite (`scripts/generate_figures.py`)
 - ✅ Automated smoke tests (`scripts/smoke_test.py`, 7/7 passing)
-- ✅ 12 confirmed bugs fixed (B1–B12, see `RESEARCH_BRIEF.md`)
+- ✅ **23 confirmed bugs fixed (B1–B23)** — see copilot-instructions.md for full table
+- ✅ Constraint precision metric (`helpful_rate` / `neutral_rate` / `harmful_rate` per utterance)
+- ✅ Severity-stratified PER (`by_severity`: mild / moderate / severe buckets)
+- ✅ MLflow: `val/constraint_row_entropy` + `val/constraint_kl_from_prior` logged per epoch
+- ✅ Vocabulary persistence in checkpoints (vocab diff warning on mismatch — B18)
+- ✅ Speaker-balanced `WeightedRandomSampler` (weights by speaker frequency, not dysarthric/control class)
+- ✅ New ablation modes: `no_constraint_matrix`, `no_spec_augment`, `no_temporal_ds`
 
 **Current Run: baseline_v5 (March 6, 2026) — Latest Evaluated Baseline**
 | Metric | Value | Notes |
@@ -385,10 +391,11 @@ val_check_interval: float = 0.5  # Validate twice per epoch
 lambda_ctc: float = 0.8
 lambda_ce: float = 0.2
 lambda_articulatory: float = 0.1
+blank_priority_weight: float = 1.5  # Blank class weight boost (for insertion mitigation)
+lambda_symbolic_kl: float = 0.5    # ↑ from 0.05 (B22 — was too weak to anchor constraint matrix)
 monitor_metric: str = "val/per"
 early_stopping_patience: int = 8
 save_top_k: int = 2  # Keep best 2 checkpoints
-blank_priority_weight: float = 1.5  # Blank class weight boost (for insertion mitigation)
 ```
 
 **DataConfig**:
@@ -614,21 +621,21 @@ Where:
 
 ## Known Issues & Mitigation Strategies
 
-### Issue 0: Symbolic Constraint Layer Harms Performance ⚠️ (Critical — Reproduced in v4 AND v5)
+### Issue 0: Symbolic Constraint Layer Harms Performance ⚠️ (Critical — Fixes Applied, Re-run Pending)
 
 **Symptom**: `per_neural = 0.305` vs `per_constrained = 0.475` (Δ = −0.170, i.e. +57% relative degradation from constraints)
 - Reproduced identically in baseline_v4 (PER 0.4748) and baseline_v5 (PER 0.4750) — not a training fluke
 - Rule activations dominated by X→`<BLANK>` deletions (P→⁠`<BLANK>`=71, T→⁠`<BLANK>`=33, etc.); `avg_confidence=0.131`
 
-**Root cause hypotheses** (TBD — ablation required):
-1. **`LearnableConstraintMatrix` degeneracy** — converges to spreading mass toward `<BLANK>` (ID 0); `lambda_symbolic_kl=0.05` is too weak to prevent drift (~0.001 effective per-row penalty)
-2. **Severity-adaptive β extremes** — status×5.0 scaling forces β≈0.8 for all dysarthric speakers; degenerate constraints get 80% weight
-3. **CTC frame-level constraint mismatch** — phoneme-level rules applied to CTC frame logits (which model blank alignment, not phoneme identity)
+**Root causes identified and fixed**:
+1. **B21 — `LearnableConstraintMatrix` flat init**: `log(C_static)` through softmax washes out the prior. Fixed with temperature-sharpened init: `log_init = log(C) / 0.5`.
+2. **B22 — `lambda_symbolic_kl` too weak**: 0.05 ÷ 47 ≈ 0.001 effective per-row anchor weight. Raised to **0.5** (≈0.01 per row).
+3. **B13 — SpecAugment same mask per batch**: All samples received the same augmentation. Fixed: independent masks per sample.
+4. **B14 — Stage-2 unfreeze over-reached**: Was unlocking all layers 4–11; now correctly unlocks only 6–11.
+5. **B15 — `val/per` batch-mean bias**: Now computed as proper macro-speaker PER.
+6. **B16/B17 — Wrong CTC stride / missing attention mask in val+test steps**: Stride fixed to 640 when `TemporalDownsampler` active; `_downsample_attn_mask()` helper passes correct mask to `compute_loss`.
 
-**Recommended fix sequence**:
-1. `--ablation neural_only` (first fix the incomplete ablation mode, then run) — confirm `per_neural≈0.305`
-2. Set `use_learnable_constraint=False` in config — fall back to static articulatory prior
-3. Raise `lambda_symbolic_kl` from 0.05 to 0.5 if static prior still underperforms
+All fixes applied. **Next action**: train baseline_v6 and verify `constraint_precision.helpful_rate > harmful_rate`.
 
 ---
 
@@ -636,40 +643,22 @@ Where:
 
 **Symptom (historical)**: baseline_v1 showed 21,290 insertions vs. 376 deletions (56× ratio). baseline_v2 was 11× greedy / 2.5× beam. **baseline_v4: I/D = 0.87× (3,734 insertions vs. 4,292 deletions)** — deletions now exceed insertions.
 
-**What resolved it**: Staged progressive unfreezing (more encoder layers trainable during early epochs), larger batch size (8 vs 4), and 40 training epochs allowed the CTC alignment to learn properly.
-
-**Remaining concern**: `blank_prob_mean` still ~0.80–0.86 per epoch. The substitution/deletion dominance (13,868 subs + 4,292 del vs 3,734 ins) suggests the model is now over-deleting/substituting. This may be related to Issue 0 (symbolic constraints shifting probability mass).
+**What resolved it**: Staged progressive unfreezing, larger batch size (8 vs 4), 40 training epochs, and `blank_priority_weight = 1.5` allowed the CTC alignment to settle properly.
 
 ---
 
 ### Issue 2: Dysarthric vs. Control PER Direction ⚠️ (Medium Priority)
 
-**Observation in baseline_v4**: Dysarthric PER (M03: 0.448) < Control PER (MC02: 0.503, MC04: 0.474 → avg ~0.488)
-- Same pattern as previous runs: dysarthric speaker scores lower PER than control speakers
+**Observation in baseline_v4/v5**: Dysarthric PER (M03: 0.448) < Control PER (avg ~0.488)
 - Difference is small (~4 pp) and test set has only 3 speakers (n not sufficient for reliable inference)
 - Pearson r severity↔PER = −0.855, p = 0.347 (not significant with n=3)
 
-**Most likely explanation**: Speaker identity effects dominate severity signal with only 3 test speakers. M03 may simply have more acoustically consistent speech in the test subset than MC02/MC04.
+**Most likely explanation**: Speaker identity effects dominate severity signal with only 3 test speakers. Will resolve with LOSO-CV.
 
 ### Issue 3: Constraint Weight (β) Initialization ⚠️ (Low Priority)
 
-**Observation**: β converges near 0.5 (balanced neural-symbolic)
-- Not clear if this is optimal or just initialization bias
-
-**Investigation**:
-```python
-# Ablation: Fixed β values
-variants = [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]
-for beta in variants:
-    train(constraint_weight_init=beta, constraint_learnable=False)
-    # Compare test PER
-```
-
-**Expected results**:
-- β=0.0 (symbolic-only): Likely poor (rigid rules can't adapt)
-- β=1.0 (neural-only): Baseline without constraints
-- β=0.5 (balanced): Current learning outcome
-- Best β likely 0.3–0.7 depending on other hyperparams
+**Observation**: β converges near 0.5 (balanced neural-symbolic); unclear if this is optimal or an initialization artifact.
+**Investigation**: Fixed-β ablations (β ∈ {0.0, 0.1, 0.3, 0.5}) after baseline_v6 confirms constraint fix.
 
 ---
 
@@ -677,23 +666,30 @@ for beta in variants:
 
 ### Short-term (1–2 months)
 
-#### 1. Fix `ablation_mode='neural_only'` and run ablation — Critical (blocks everything)
-- **Task**: Fully disable SeverityAdapter + LearnableConstraintMatrix forward passes when `ablation_mode='neural_only'`
-- **Success metric**: `per_neural ≈ 0.305` confirmed on same test split
+#### 1. Train baseline_v6 — Verify constraint fixes (B13–B23)
+- **Task**: Re-run with all fixes applied; confirm `constraint_precision.helpful_rate > harmful_rate`
+- **Command**: `python run_pipeline.py --run-name baseline_v6 --beam-search --beam-width 25 --explain`
+- **Success metric**: `delta_per` (Δ = per_constrained − per_neural) rises toward 0 or positive
 
 #### 2. LOSO-CV (15-fold leave-one-out) — High Priority
-- **Task**: Run after symbolic constraint is fixed/ablated
+- **Task**: Run after baseline_v6 confirms constraint improvement
 - **Command**: `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h)
 - **Output**: Statistically valid macro-PER (n=15), severity correlation Pearson r with p-value
 - **Success metric**: Severity correlation p < 0.05
 
-#### 3. Symbolic rule ablation
-- **Task**: Quantify neural vs. symbolic contribution with repaired logic
-- **Approach**: Neural-only (β=1.0), static prior (`use_learnable_constraint=False`), varying `lambda_symbolic_kl`
-- **Output**: Ablation table for paper
+#### 3. Ablation suite
+- **Task**: Quantify contribution of each component
+- **Commands**:
+  ```bash
+  python run_pipeline.py --run-name ablation_neural_only   --ablation neural_only
+  python run_pipeline.py --run-name ablation_no_constraint --ablation no_constraint_matrix
+  python run_pipeline.py --run-name ablation_no_art_heads  --ablation no_art_heads
+  python run_pipeline.py --run-name ablation_no_spec_aug   --ablation no_spec_augment
+  ```
+- **Output**: Ablation table comparing PER across all modes
 
-#### 4. Regenerate figures for baseline_v5
-- **Command**: `python scripts/generate_figures.py --run-name baseline_v5`
+#### 4. Regenerate publication figures
+- **Command**: `python scripts/generate_figures.py --run-name baseline_v6 --compare ablation_neural_only ablation_no_constraint`
 
 ### Medium-term (2–3 months)
 

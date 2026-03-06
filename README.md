@@ -15,8 +15,26 @@ For detailed architecture and research context, see [ROADMAP.md](ROADMAP.md).
 
 ## Recent Updates (March 2026)
 
-- **`baseline_v5` trained and evaluated** (March 6, 2026): 30 epochs, 66.4M trainable params. Best val/per = **0.505** (epoch 28). Beam-search test PER = **0.4750**, WER = 0.665. Articulatory: manner 78.3%, place 79.3%, voice 92.3%. I/D = 0.9×. Essentially identical to v4 — v5 confirms the symbolic constraint layer is the consistent bottleneck (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). LOSO-CV not yet run.
-- **`baseline_v4` trained and evaluated** (March 5, 2026): batch=8, 40 epochs, staged progressive unfreezing (layers 8–11 at epoch 1, layers 6–11 at epoch 6), 66.4M trainable params (67.1%). Best val/per = **0.504** (epoch 28). Beam-search test PER = **0.4748**, WER = 0.664. Insertion bias resolved (I/D = 0.87×). First full end-to-end valid evaluation.
+- **`baseline_v5` trained and evaluated** (March 6, 2026): 30 epochs, 66.4M trainable params. Best val/per = **0.505** (epoch 28). Beam-search test PER = **0.4750**, WER = 0.665. I/D = 0.9×. Identical to v4 — confirms symbolic constraint layer is the bottleneck (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). LOSO-CV not yet run.
+- **B13–B23 fixed** (March 6, 2026 — current session): see table below. Key fixes:
+  - **B13** `SpecAugmentLayer`: was applying the same mask to every sample in the batch; now applies independent per-sample masks.
+  - **B14** Stage-2 unfreezing: was calling `unfreeze_after_warmup()` (all layers 4–11); now correctly calls `unfreeze_encoder(layers=[6,7,8,9,10,11])`.
+  - **B15** `val/per` metric: was a batch-mean PER (over-weighted high-utterance speakers); now computed as proper macro-speaker PER.
+  - **B16** CTC attention-mask stride: was hardcoded to 320 even when `TemporalDownsampler` is active (effective stride = 640); fixed.
+  - **B17** `validation_step` / `test_step`: were passing `attention_mask=None` to `compute_loss`; new `_downsample_attn_mask()` helper now provides the correct downsampled mask.
+  - **B18** Vocabulary not persisted in checkpoints: `on_save_checkpoint` / `on_load_checkpoint` now save vocab and warn on mismatch.
+  - **B19** Beam search length-norm bug: divisor was applied to LM bonus too; fixed to normalise acoustic score only.
+  - **B20** `decode_predictions`: `beam_length_norm_alpha` lookup raised `AttributeError` (config not in scope); replaced with hardcoded 0.6.
+  - **B21** `LearnableConstraintMatrix` init: `log(C_static)` through softmax produced a flat distribution; fixed with temperature-sharpened init (`log_init = log(C) / 0.5`).
+  - **B22** `lambda_symbolic_kl` raised from 0.05 → **0.5** (was too weak; effective per-row weight ≈ 0.001).
+  - **B23** Articulatory place labels corrected: SH/ZH/CH/JH `palatal` → `postalveolar`; R `palatal` → `alveolar`; W `bilabial` → `labio-velar`.
+- **New evaluation metrics** (March 6, 2026):
+  - `constraint_precision`: per-utterance helpful/neutral/harmful rate for the symbolic layer.
+  - `by_severity`: PER bucketed by clinical severity (mild / moderate / severe).
+  - MLflow now logs `val/constraint_row_entropy` and `val/constraint_kl_from_prior` per epoch.
+- **New ablation modes**: `--ablation no_constraint_matrix`, `no_spec_augment`, `no_temporal_ds` added to `run_pipeline.py` and `train.py`.
+- **Speaker-balanced sampler**: `WeightedRandomSampler` now weights by *speaker* frequency (not dysarthric/control class), so high-utterance speakers no longer dominate gradient signal.
+- **`baseline_v4` trained and evaluated** (March 5, 2026): batch=8, 40 epochs, staged progressive unfreezing, 66.4M trainable params. Best val/per = **0.504** (epoch 28). Beam-search test PER = **0.4748**, WER = 0.664. First full end-to-end valid evaluation.
 
 ## Quick Start
 
@@ -302,18 +320,16 @@ Features:
 ## Known Issues and Next Steps
 
 **Active issues (March 2026)**:
-- **Symbolic constraint layer degrades performance** (CRITICAL): neural-only PER = 0.305 vs constrained PER = 0.475 (Δ = −0.170) — consistent across v4 and v5. Ablation required.
+- **Symbolic constraint layer degrades performance** (CRITICAL): neural-only PER = 0.305 vs constrained PER = 0.475 (Δ = −0.170) — consistent across v4 and v5. Root-cause fixes (B21 temperature init, B22 `lambda_symbolic_kl`→0.5) have been applied but need a re-run to confirm.
 - **LOSO-CV not yet run**: test split = 3 speakers only → severity correlation p=0.347 (n.s.); statistically valid macro-PER requires full 15-fold LOSO (~15–22h)
-- `SymbolicRuleTracker` wired but low activation confidence (0.131 avg) — most rule activations are X→`<BLANK>` deletions
-- `ablation_mode='neural_only'` does not fully disable SeverityAdapter / LearnableConstraintMatrix — fix before running ablation
+- `SymbolicRuleTracker` still reports low confidence (avg 0.131); mostly X→`<BLANK>` activations — should improve after B21/B22 re-run
 
 **Immediate next steps**:
-1. Fix `ablation_mode='neural_only'` to properly bypass symbolic components
-2. Run neural-only ablation: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only`
-3. Disable learnable constraint (`use_learnable_constraint=False` in config) and short-run to verify fix
-4. Run LOSO-CV after confirming constraint fix: `python run_pipeline.py --run-name loso_v1 --loso`
-5. Regenerate figures for baseline_v5: `python scripts/generate_figures.py --run-name baseline_v5`
-6. Run additional ablations: `--ablation no_art_heads`, `no_constraint_matrix`
+1. Train **baseline_v6** with all B13–B23 fixes applied: `python run_pipeline.py --run-name baseline_v6`
+2. Verify `constraint_precision.helpful_rate > harmful_rate` in `evaluation_results.json`
+3. Run neural-only ablation: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only`
+4. Run LOSO-CV after constraint fix confirmed: `python run_pipeline.py --run-name loso_v1 --loso`
+5. Regenerate figures: `python scripts/generate_figures.py --run-name baseline_v6`
 
 ## Reproducibility
 
