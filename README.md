@@ -16,6 +16,7 @@ For detailed architecture and research context, see [ROADMAP.md](ROADMAP.md).
 ## Recent Updates (March 2026)
 
 - **`baseline_v5` trained and evaluated** (March 6, 2026): 30 epochs, 66.4M trainable params. Best val/per = **0.505** (epoch 28). Beam-search test PER = **0.4750**, WER = 0.665. I/D = 0.9×. Identical to v4 — confirms symbolic constraint layer is the bottleneck (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). LOSO-CV not yet run.
+- **HuBERT model revision pinned** (R-01, March 2026): `facebook/hubert-base-ls960` is now pinned to commit `dba3bb02fda4248b6e082697eee756de8fe8aa8a` via `ModelConfig.hubert_model_revision`. Set this field to `None` to always pull the latest Hub weights. Prevents silent result drift between runs if the Hub model card is updated.
 - **B13–B23 fixed** (March 6, 2026 — current session): see table below. Key fixes:
   - **B13** `SpecAugmentLayer`: was applying the same mask to every sample in the batch; now applies independent per-sample masks.
   - **B14** Stage-2 unfreezing: was calling `unfreeze_after_warmup()` (all layers 4–11); now correctly calls `unfreeze_encoder(layers=[6,7,8,9,10,11])`.

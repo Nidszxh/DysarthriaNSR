@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")  # Headless backend; must appear before pyplot import
@@ -131,13 +131,14 @@ def plot_error_distribution(
 def plot_per_by_speaker(
     per_speaker: Dict[str, Dict],
     save_path: Path,
+    severity_map: Optional[Dict[str, float]] = None,
 ) -> Path:
     """
     Horizontal bar chart of per-speaker PER with 95 % bootstrap CI whiskers.
 
     Args:
-        per_speaker:  Dict mapping speaker ID → ``{per, ci, std, n_samples, status}``.
-                      ``status`` 0 = control, 1 = dysarthric.
+        per_speaker:   Dict mapping speaker ID → ``{per, ci, std, n_samples, status}``.
+                       ``status`` 0 = control, 1 = dysarthric.
         save_path:    Destination PNG path.
 
     Returns:
@@ -149,8 +150,18 @@ def plot_per_by_speaker(
         warnings.warn("plot_per_by_speaker: empty per_speaker dict — skipping.", stacklevel=2)
         return Path(save_path)
 
-    # Sort by PER descending for readability
-    speakers = sorted(per_speaker.keys(), key=lambda s: per_speaker[s]["per"], reverse=True)
+    # M-6: Sort by severity order — control speakers first (severity 0), then
+    # dysarthric ordered by ascending severity.  This directly illustrates the
+    # severity↔PER relationship for SPCOM audiences.
+    if severity_map is None:
+        # Fallback: sort by PER descending when no severity map is available
+        speakers = sorted(per_speaker.keys(), key=lambda s: per_speaker[s]["per"], reverse=True)
+    else:
+        def _sev_key(s: str) -> Tuple[int, float]:
+            base = s.split("_")[0].upper()
+            sev = severity_map.get(base, 2.5)
+            return (0 if sev == 0.0 else 1, sev)
+        speakers = sorted(per_speaker.keys(), key=_sev_key)
     pers     = [per_speaker[s]["per"]    for s in speakers]
     statuses = [per_speaker[s].get("status", -1) for s in speakers]
 
@@ -427,6 +438,90 @@ def plot_uncertainty_distribution(
 
 
 # ---------------------------------------------------------------------------
+# 5b. Rule-Pair Confusion (symbolic constraint impact per substitution rule)
+# ---------------------------------------------------------------------------
+
+def plot_rule_pair_confusion(
+    rule_pair_confusion: Dict[str, Dict],
+    save_path: Path,
+    top_n: int = 20,
+) -> Path:
+    """
+    Horizontal bar chart showing per-rule counts: neural vs. constrained substitutions.
+
+    A positive delta (``rule_pair_confusion[rule]['delta']``) means the constraint
+    *reduced* that substitution (helpful); negative means it *increased* it (harmful).
+    Bars are coloured green for helpful rules and red for harmful rules.
+
+    Args:
+        rule_pair_confusion: Output of ``evaluate.compute_rule_pair_confusion()``,
+                             dict mapping ``"SRC->TGT"`` → ``{neural_count,
+                             constrained_count, delta, rule_weight}``.
+        save_path:           Destination PNG path.
+        top_n:               Maximum number of rules to display (by |delta|, default 20).
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not rule_pair_confusion:
+        warnings.warn("plot_rule_pair_confusion: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    # Sort by |delta| descending, take top_n
+    sorted_rules = sorted(
+        rule_pair_confusion.items(),
+        key=lambda x: abs(x[1].get("delta", 0)),
+        reverse=True,
+    )[:top_n]
+
+    if not sorted_rules:
+        return Path(save_path)
+
+    labels  = [r[0] for r in sorted_rules]
+    neural  = np.array([r[1].get("neural_count", 0) for r in sorted_rules], dtype=float)
+    const   = np.array([r[1].get("constrained_count", 0) for r in sorted_rules], dtype=float)
+    deltas  = np.array([r[1].get("delta", 0) for r in sorted_rules], dtype=float)
+
+    # Colour by direction: helpful (delta>0) = constraint reduced subs → green
+    bar_colours = [_COLOUR_CONTROL if d < 0 else "#2ca02c" for d in deltas]
+
+    y_pos = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 2, figsize=(10, max(4, 0.45 * len(labels) + 1.5)),
+                              sharey=True)
+
+    # Left panel: absolute counts
+    axes[0].barh(y_pos, neural, color="dimgrey", alpha=0.5, label="Neural", zorder=3)
+    axes[0].barh(y_pos, const,  color=_COLOUR_DYSARTHRIC, alpha=0.8, label="Constrained", zorder=3)
+    axes[0].set_xlabel("Substitution count")
+    axes[0].set_title("Neural vs Constrained counts")
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(labels)
+    axes[0].legend(frameon=False, fontsize=8)
+    axes[0].xaxis.grid(True, alpha=0.4, zorder=0)
+    axes[0].set_axisbelow(True)
+
+    # Right panel: delta  (positive = constraint helped)
+    axes[1].barh(y_pos, deltas, color=bar_colours, zorder=3)
+    axes[1].axvline(0, color="dimgrey", linewidth=0.8)
+    axes[1].set_xlabel("Δ substitutions  (+ = constraint helped)")
+    axes[1].set_title("Constraint Impact per Rule")
+    axes[1].xaxis.grid(True, alpha=0.4, zorder=0)
+    axes[1].set_axisbelow(True)
+
+    legend_handles = [
+        mpatches.Patch(color="#2ca02c", label="Helpful (↓ subs)"),
+        mpatches.Patch(color=_COLOUR_CONTROL, label="Harmful (↑ subs)"),
+    ]
+    axes[1].legend(handles=legend_handles, frameon=False, fontsize=8, loc="lower right")
+
+    fig.suptitle(f"Rule-Pair Confusion  (top {len(labels)} by |Δ|)", fontsize=10)
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
 # 6. Experiment Comparison
 # ---------------------------------------------------------------------------
 
@@ -564,7 +659,8 @@ def generate_all_plots(
     # 2. PER by Speaker
     # ------------------------------------------------------------------
     if per_speaker:
-        p = plot_per_by_speaker(per_speaker, save_dir / "per_by_speaker.png")
+        p = plot_per_by_speaker(per_speaker, save_dir / "per_by_speaker.png",
+                                severity_map=severity_map)
         saved["per_by_speaker"] = p
         print(f"  ✓ per_by_speaker            → {p.name}")
     else:
@@ -593,6 +689,17 @@ def generate_all_plots(
     p = plot_uncertainty_distribution(utterances, severity_map or {}, save_dir / "uncertainty_distribution.png")
     saved["uncertainty_distribution"] = p
     print(f"  ✓ uncertainty_distribution  → {p.name}")
+
+    # ------------------------------------------------------------------
+    # 5b. Rule-Pair Confusion
+    # ------------------------------------------------------------------
+    rule_pair_confusion: Dict = eval_results.get("rule_pair_confusion", {})
+    if rule_pair_confusion:
+        p = plot_rule_pair_confusion(rule_pair_confusion, save_dir / "rule_pair_confusion.png")
+        saved["rule_pair_confusion"] = p
+        print(f"  ✓ rule_pair_confusion       → {p.name}")
+    else:
+        print("  ⚠  rule_pair_confusion skipped — not present in eval_results")
 
     # ------------------------------------------------------------------
     # 6. Experiment Comparison
