@@ -587,6 +587,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # Stage 1: unfreeze top 4 layers only
             self.model.unfreeze_encoder(layers=[8, 9, 10, 11])
             self.encoder_unfrozen = True
+            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 1: Unfroze HuBERT layers 8-11 at epoch {epoch}")
 
         elif (self.encoder_unfrozen
@@ -597,6 +598,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # Stage 3 a no-op)
             self.model.unfreeze_encoder(layers=[6, 7, 8, 9, 10, 11])
             self._encoder_deep_unfrozen = True
+            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
 
         elif (getattr(self, '_encoder_deep_unfrozen', False)
@@ -605,6 +607,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # Stage 3: unfreeze layers 4-11 (deepest adaptation to dysarthric speech)
             self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
             self._encoder_deeper_unfrozen = True
+            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 3: Unfroze HuBERT layers 4-11 at epoch {epoch}")
 
         # I2: Staged lambda_blank_kl ramp ─────────────────────────────────────
@@ -624,7 +627,33 @@ class DysarthriaASRLightning(pl.LightningModule):
         # mutating the config (which would violate per-run isolation in LOSO).
         self._current_lambda_blank_kl = current_bkl
         self.log('train/lambda_blank_kl', current_bkl, on_epoch=True, prog_bar=False)
-    
+
+    def _reset_hubert_lr_warmup(self) -> None:
+        """T-04: Reset AdamW optimizer state for newly-unfrozen HuBERT params.
+
+        OneCycleLR is built once at configure_optimizers() and its step counter
+        cannot be rewound.  Newly unfrozen layers therefore start at the current
+        (potentially decayed) LR rather than at the original peak LR.  While a
+        full fix requires switching to CosineAnnealingWarmRestarts (T_mult=2)
+        or per-group schedulers, resetting the Adam first/second moment estimates
+        gives newly-active parameters the closest equivalent to a "fresh start":
+        gradients are not polluted by stale momentum from pre-unfreeze noise.
+        Called after each unfreeze event in on_train_epoch_start.
+        """
+        optimizer = self.optimizers()
+        if isinstance(optimizer, list):
+            optimizer = optimizer[0]
+        for pg in optimizer.param_groups:
+            if pg.get('name') == 'hubert_encoder':
+                for p in pg['params']:
+                    if p.requires_grad and p in optimizer.state:
+                        state = optimizer.state[p]
+                        # Clear Adam momentum so newly-active params start fresh.
+                        state.pop('exp_avg', None)
+                        state.pop('exp_avg_sq', None)
+                        state.pop('max_exp_avg_sq', None)  # AMSGrad variant
+                break
+
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
         """
         Validation step with metrics computation.
@@ -841,13 +870,11 @@ class DysarthriaASRLightning(pl.LightningModule):
         control_per = []
         
         for output in self.validation_step_outputs:
-            for pred, ref, status in zip(
-                output['predictions'],
-                output['references'],
-                output['status']
-            ):
-                per = compute_per(pred, ref)
-                if status == 1:  # Dysarthric
+            # H-6: Reuse pre-computed per_scores (already in validation_step_outputs)
+            # instead of calling compute_per() again for each utterance.
+            stored_per = output.get('per_scores', [])
+            for per, status in zip(stored_per, output['status']):
+                if int(status) == 1:  # Dysarthric
                     dysarthric_per.append(per)
                 else:  # Control
                     control_per.append(per)
@@ -1541,6 +1568,14 @@ def run_loso(
             filename='{epoch:02d}-{val_per:.3f}',
             save_top_k=1, save_last=False,
         )
+        # C-02: Create a per-fold MLFlowLogger so each fold's metrics are tracked
+        # individually in MLflow under the same experiment.  The trainer is rebuilt
+        # per fold anyway (fresh lm + ckpt_cb), so there is no extra cost.
+        fold_logger = MLFlowLogger(
+            experiment_name=config.experiment.experiment_name,
+            run_name=fold_run_name,
+            tracking_uri=config.experiment.tracking_uri,
+        )
         trainer = pl.Trainer(
             max_epochs=config.training.max_epochs,
             accelerator='gpu' if config.device == 'cuda' else 'cpu',
@@ -1548,12 +1583,8 @@ def run_loso(
             precision=config.training.precision,
             accumulate_grad_batches=config.training.gradient_accumulation_steps,
             gradient_clip_val=config.training.gradient_clip_val,
-            callbacks=[ckpt_cb, EarlyStopping(monitor='val/per', patience=5, mode='min')],
-            # L4: logger=False is intentional — LOSO runs share a single MLflow experiment
-            # but each fold mutates config.experiment.run_name before Trainer.fit().
-            # Creating a per-fold MLFlowLogger here instead would require rebuilding
-            # the trainer per fold anyway; False avoids accidental run-name bleed-through.
-            logger=False,
+            callbacks=[ckpt_cb, EarlyStopping(monitor='val_per', patience=5, mode='min')],
+            logger=fold_logger,
             enable_progress_bar=True,
             log_every_n_steps=50,
         )
@@ -1575,6 +1606,10 @@ def run_loso(
         wer_per_fold.append(fold_wer)
         n_samples_per_fold.append(fold_n)
         print(f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}")
+
+        # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
+        del trainer, lm
+        torch.cuda.empty_cache()
 
     # Bootstrap 95% CI over fold PERs
     per_arr = np.array(per_per_fold)

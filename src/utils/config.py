@@ -160,7 +160,7 @@ class TrainingConfig:
 
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
-    lambda_ce: float = 0.35           # T-01: raised from 0.2 — stronger phoneme discrimination against substitution-dominant errors
+    lambda_ce: float = 0.10           # C-1: reduced from 0.35 — frame-CE uses pad/truncate alignment (not forced), so high weight confounds constraint layer
     lambda_articulatory: float = 0.08  # T-01: reduced from 0.15 — articulatory accuracy already ~78–92%; marginal gain is low
 
     # --- Phase 2: New loss weights (audit Proposals P1, P2, R3) ---

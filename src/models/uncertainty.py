@@ -120,15 +120,19 @@ class UncertaintyAwareDecoder:
         coverage: float = 0.95,
     ) -> List[List[List[str]]]:
         """
-        Produce phoneme sets with guaranteed marginal coverage via conformal
-        prediction (threshold-based prediction sets).
+        Produce phoneme prediction sets targeting a given cumulative coverage level.
 
-        Uses the least-ambiguous-set (LAS) method: sort phoneme probabilities
-        descending, include the top-k phonemes until cumulative probability ≥ τ.
-        τ is set so that inclusion guarantees coverage at the given level.
+        Uses an APS-like (Adaptive Prediction Set) heuristic: sort phoneme
+        probabilities descending, include top-k phonemes until cumulative
+        probability ≥ τ.
 
-        Note: Requires a held-out calibration set to set τ correctly. Without
-        calibration, this defaults to a heuristic τ = 1 - (1 - coverage).
+        NOTE: This is NOT calibrated conformal prediction.  True conformal
+        calibration requires fitting τ on a held-out calibration set via the
+        ``(ceil((n+1)(1-α))/n)``-th quantile of nonconformity scores.  Here
+        τ = coverage is used as a conservative approximation (equivalent to
+        top-k by cumulative mass).  The name ``conformal_phoneme_sets`` is
+        kept for API stability but the method should be interpreted as an
+        APS-style heuristic until proper calibration data is available.
 
         Args:
             log_probs: [B, T, V] log-probabilities (mean across MC samples)
@@ -137,7 +141,7 @@ class UncertaintyAwareDecoder:
         Returns:
             List[B] of List[T] of List[phoneme_strings]
         """
-        tau = 1.0 - (1.0 - coverage)   # heuristic τ without calibration data
+        tau = 1.0 - (1.0 - coverage)   # = coverage; APS-like heuristic — see note below
         probs = log_probs.exp()          # [B, T, V]
 
         B, T, V = probs.shape

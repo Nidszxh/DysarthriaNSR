@@ -574,7 +574,8 @@ def phoneme_alignment(
 
 def analyze_phoneme_errors(
     predictions: List[List[str]],
-    references: List[List[str]]
+    references: List[List[str]],
+    alignments: Optional[List[List[Tuple]]] = None,
 ) -> Dict:
     """
     Comprehensive phoneme-level error analysis.
@@ -582,6 +583,9 @@ def analyze_phoneme_errors(
     Args:
         predictions: List of predicted phoneme sequences
         references: List of reference phoneme sequences
+        alignments: Optional pre-computed alignments from ``phoneme_alignment()``.
+                    When provided, skips internal alignment (4× speedup when shared
+                    across multiple analysis functions).
     
     Returns:
         Dictionary containing:
@@ -598,8 +602,8 @@ def analyze_phoneme_errors(
     deletion_phonemes = []
     insertion_phonemes = []
     
-    for pred, ref in zip(predictions, references):
-        alignment = phoneme_alignment(pred, ref)
+    for i, (pred, ref) in enumerate(zip(predictions, references)):
+        alignment = alignments[i] if alignments is not None else phoneme_alignment(pred, ref)
         
         for op, pred_ph, ref_ph in alignment:
             if op == 'correct':
@@ -631,6 +635,7 @@ def analyze_phoneme_errors(
 def compute_per_phoneme_breakdown(
     predictions: List[List[str]],
     references: List[List[str]],
+    alignments: Optional[List[List[Tuple]]] = None,
 ) -> Dict[str, Dict]:
     """
     Compute per-phoneme substitution, deletion, insertion counts and PER.
@@ -645,6 +650,8 @@ def compute_per_phoneme_breakdown(
     Args:
         predictions: List of predicted phoneme sequences.
         references:  List of reference phoneme sequences.
+        alignments:  Optional pre-computed alignments. When provided, skips
+                     internal ``phoneme_alignment()`` calls (4× speedup).
 
     Returns:
         Dict mapping phoneme → {n_ref, n_sub, n_del, n_ins, per},
@@ -653,8 +660,8 @@ def compute_per_phoneme_breakdown(
     from collections import defaultdict as _dd
     counts: Dict[str, Dict[str, int]] = _dd(lambda: {'n_ref': 0, 'n_sub': 0, 'n_del': 0, 'n_ins': 0})
 
-    for pred, ref in zip(predictions, references):
-        alignment = phoneme_alignment(pred, ref)
+    for i, (pred, ref) in enumerate(zip(predictions, references)):
+        alignment = alignments[i] if alignments is not None else phoneme_alignment(pred, ref)
         for op, pred_ph, ref_ph in alignment:
             if op == 'correct':
                 # ref_ph correctly predicted
@@ -696,6 +703,7 @@ def compute_per_phoneme_breakdown(
 def compute_articulatory_stratified_per(
     predictions: List[List[str]],
     references: List[List[str]],
+    alignments: Optional[List[List[Tuple]]] = None,
 ) -> Dict[str, Dict]:
     """
     Compute PER stratified by manner-of-articulation class (E-02).
@@ -708,6 +716,8 @@ def compute_articulatory_stratified_per(
     Args:
         predictions: List of predicted phoneme sequences.
         references:  List of reference phoneme sequences.
+        alignments:  Optional pre-computed alignments. When provided, skips
+                     internal ``phoneme_alignment()`` calls (4× speedup).
 
     Returns:
         Dict mapping manner_class → {per, n_ref, n_sub, n_del}, sorted by
@@ -719,8 +729,8 @@ def compute_articulatory_stratified_per(
     from collections import defaultdict as _dd
     counts: Dict[str, Dict[str, int]] = _dd(lambda: {'n_ref': 0, 'n_sub': 0, 'n_del': 0})
 
-    for pred, ref in zip(predictions, references):
-        alignment = phoneme_alignment(pred, ref)
+    for i, (pred, ref) in enumerate(zip(predictions, references)):
+        alignment = alignments[i] if alignments is not None else phoneme_alignment(pred, ref)
         for op, _pred_ph, ref_ph in alignment:
             if op in ('correct', 'substitute', 'insert'):
                 if ref_ph:
@@ -750,6 +760,8 @@ def compute_rule_pair_confusion(
     predictions_constrained: List[List[str]],
     references: List[List[str]],
     substitution_rules: Dict,
+    neural_alignments: Optional[List[List[Tuple]]] = None,
+    constrained_alignments: Optional[List[List[Tuple]]] = None,
 ) -> Dict[str, Dict]:
     """
     Compare per-rule-pair substitution counts between the neural and constrained
@@ -765,6 +777,10 @@ def compute_rule_pair_confusion(
         predictions_constrained: Constrained decoded phoneme sequences.
         references:              Ground-truth phoneme sequences.
         substitution_rules:      Dict with Tuple[str, str] keys, e.g. {('B','P'): 0.85}.
+        neural_alignments:       Optional pre-computed alignments for neural predictions.
+                                 When provided, skips internal ``phoneme_alignment()``
+                                 calls (4× speedup when shared across functions).
+        constrained_alignments:  Optional pre-computed alignments for constrained predictions.
 
     Returns:
         Dict mapping ``"SRC->TGT"`` → {neural_count, constrained_count, delta,
@@ -772,16 +788,21 @@ def compute_rule_pair_confusion(
     """
     from collections import defaultdict as _dd
 
-    def _count_subs(preds: List[List[str]], refs: List[List[str]]) -> Dict[str, int]:
+    def _count_subs(
+        preds: List[List[str]],
+        refs: List[List[str]],
+        cached: Optional[List[List[Tuple]]] = None,
+    ) -> Dict[str, int]:
         sub_counts: Dict[str, int] = _dd(int)
-        for pred, ref in zip(preds, refs):
-            for op, pred_ph, ref_ph in phoneme_alignment(pred, ref):
+        for i, (pred, ref) in enumerate(zip(preds, refs)):
+            alignment = cached[i] if cached is not None else phoneme_alignment(pred, ref)
+            for op, pred_ph, ref_ph in alignment:
                 if op == 'substitute' and ref_ph and pred_ph:
                     sub_counts[f"{ref_ph}->{pred_ph}"] += 1
         return dict(sub_counts)
 
-    neural_subs      = _count_subs(predictions_neural,      references)
-    constrained_subs = _count_subs(predictions_constrained, references)
+    neural_subs      = _count_subs(predictions_neural,      references, neural_alignments)
+    constrained_subs = _count_subs(predictions_constrained, references, constrained_alignments)
 
     result: Dict[str, Dict] = {}
     for (src, tgt), weight in substitution_rules.items():
@@ -1062,16 +1083,18 @@ def plot_rule_impact(
         print(f"⚠️  Constraint matrix heatmap failed (non-fatal): {_e6_exc}")
 
 
-def plot_blank_histogram(blank_probs: List[float], save_path: Path) -> None:
+def plot_blank_histogram(blank_probs: List[float], save_path: Path, target_prob: float = 0.75) -> None:
     """Histogram of per-utterance mean blank probabilities (I2 diagnostic).
 
     A healthy CTC model should have a blank probability distribution centred
-    around the ``blank_target_prob`` configured in ``TrainingConfig`` (≈0.82).
+    around the ``blank_target_prob`` configured in ``TrainingConfig``.
     A distribution peaking near 1.0 indicates the insertion bias pathology.
 
     Args:
-        blank_probs: List of per-utterance mean blank probabilities.
-        save_path:   PNG output path.
+        blank_probs:  List of per-utterance mean blank probabilities.
+        save_path:    PNG output path.
+        target_prob:  Target blank probability drawn as a reference line
+                      (should match ``TrainingConfig.blank_target_prob``, default 0.75).
     """
     if not blank_probs:
         return
@@ -1085,8 +1108,8 @@ def plot_blank_histogram(blank_probs: List[float], save_path: Path) -> None:
                label=f'mean={mean_bp:.3f}')
     ax.axvline(median_bp, color='darkorange', linestyle=':', linewidth=1.5,
                label=f'median={median_bp:.3f}')
-    ax.axvline(0.82, color='green', linestyle='-', linewidth=1.2, alpha=0.6,
-               label='target=0.82')
+    ax.axvline(target_prob, color='green', linestyle='-', linewidth=1.2, alpha=0.6,
+               label=f'target={target_prob:.2f}')
     ax.set_xlabel('Mean blank probability per utterance')
     ax.set_ylabel('Count')
     ax.set_title('Blank Probability Distribution (I2 — CTC Insertion Diagnostic)')
@@ -1498,13 +1521,24 @@ def evaluate_model(
             'status': speaker_status_map.get(spk, -1),
         }
 
+    # H-2: Pre-compute phoneme alignments ONCE; all 4 analysis functions share the cache.
+    print("🔍 Pre-computing phoneme alignments (shared cache for all analysis functions)...")
+    _all_alignments: List[List[Tuple]] = [
+        phoneme_alignment(p, r) for p, r in zip(all_predictions, all_references)
+    ]
+    _neural_alignments: Optional[List[List[Tuple]]] = None
+    if all_predictions_neural and len(all_predictions_neural) == len(all_references):
+        _neural_alignments = [
+            phoneme_alignment(p, r) for p, r in zip(all_predictions_neural, all_references)
+        ]
+
     # Phoneme-level error analysis
     print("📊 Analyzing phoneme-level errors...")
-    error_analysis = analyze_phoneme_errors(all_predictions, all_references)
+    error_analysis = analyze_phoneme_errors(all_predictions, all_references, alignments=_all_alignments)
 
     # Per-phoneme PER breakdown (E3)
     print("📊 Computing per-phoneme PER breakdown...")
-    per_phoneme_breakdown = compute_per_phoneme_breakdown(all_predictions, all_references)
+    per_phoneme_breakdown = compute_per_phoneme_breakdown(all_predictions, all_references, alignments=_all_alignments)
     _breakdown_path = results_dir / 'per_phoneme_per.json'
     with open(_breakdown_path, 'w') as _f:
         json.dump(per_phoneme_breakdown, _f, indent=2)
@@ -1514,7 +1548,7 @@ def evaluate_model(
     # Articulatory-stratified PER (H4 / E-02): PER broken down by manner class
     print("📊 Computing articulatory-stratified PER (E-02)...")
     try:
-        per_by_manner = compute_articulatory_stratified_per(all_predictions, all_references)
+        per_by_manner = compute_articulatory_stratified_per(all_predictions, all_references, alignments=_all_alignments)
         with open(results_dir / 'per_by_manner.json', 'w') as _f:
             json.dump(per_by_manner, _f, indent=2)
         print(f"✅ Saved per_by_manner.json ({len(per_by_manner)} manner classes)")
@@ -1534,6 +1568,8 @@ def evaluate_model(
                     all_predictions,
                     all_references,
                     _rules_for_analysis,
+                    neural_alignments=_neural_alignments,
+                    constrained_alignments=_all_alignments,
                 )
                 with open(results_dir / 'rule_pair_confusion.json', 'w') as _f:
                     json.dump(rule_pair_confusion, _f, indent=2)
@@ -1553,9 +1589,30 @@ def evaluate_model(
 
     # I2: Blank probability histogram (always generated; key insertion-bias diagnostic)
     if all_blank_probs:
-        plot_blank_histogram(all_blank_probs, results_dir / 'blank_probability_histogram.png')
+        plot_blank_histogram(all_blank_probs, results_dir / 'blank_probability_histogram.png',
+                             target_prob=0.75)
         print(f"✅ Blank probability histogram saved "
               f"(mean={float(np.mean(all_blank_probs)):.3f})")
+
+    # C-4: Severity vs PER scatter plot (key SPCOM figure)
+    try:
+        from src.visualization.experiment_plots import plot_severity_vs_per
+        from src.utils.config import TORGO_SEVERITY_MAP
+        _sev_plot_path = plot_severity_vs_per(
+            speaker_metrics, TORGO_SEVERITY_MAP, results_dir / 'severity_vs_per.png'
+        )
+        print(f"✅ Severity vs PER scatter saved → {_sev_plot_path.name}")
+    except Exception as _sev_exc:
+        print(f"⚠️  Severity vs PER scatter failed (non-fatal): {_sev_exc}")
+
+    # C-5: Rule-pair confusion bar chart (symbolic constraint impact per rule)
+    if rule_pair_confusion:
+        try:
+            from src.visualization.experiment_plots import plot_rule_pair_confusion as _plot_rpc
+            _rpc_path = _plot_rpc(rule_pair_confusion, results_dir / 'rule_pair_confusion.png')
+            print(f"✅ Rule-pair confusion chart saved → {_rpc_path.name}")
+        except Exception as _rpc_exc:
+            print(f"⚠️  Rule-pair confusion chart failed (non-fatal): {_rpc_exc}")
 
     rule_stats = None
     if hasattr(model, 'get_rule_statistics'):
