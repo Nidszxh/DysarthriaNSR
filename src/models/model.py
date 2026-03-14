@@ -16,7 +16,6 @@ Components:
 """
 
 from collections import defaultdict
-import random
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -530,6 +529,19 @@ class SpecAugmentLayer(nn.Module):
         self.time_mask_length = time_mask_length
         self.freq_mask_prob   = freq_mask_prob
         self.freq_mask_length = freq_mask_length
+        # Dedicated RNG makes mask sampling reproducible independent of Python random state.
+        self._rng = torch.Generator()
+        self._rng.manual_seed(torch.initial_seed())
+
+    def set_seed(self, seed: int) -> None:
+        """Set deterministic RNG seed for SpecAugment mask sampling."""
+        self._rng.manual_seed(int(seed))
+
+    def _randint_inclusive(self, low: int, high: int) -> int:
+        """Inclusive integer sampling helper backed by torch.Generator."""
+        if high <= low:
+            return int(low)
+        return int(torch.randint(low, high + 1, (1,), generator=self._rng).item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -548,16 +560,16 @@ class SpecAugmentLayer(nn.Module):
         n_time_masks = max(1, int(T * self.time_mask_prob))
         for b in range(B):
             for _ in range(n_time_masks):
-                t_len = random.randint(1, self.time_mask_length)
-                t0    = random.randint(0, max(0, T - t_len))
+                t_len = self._randint_inclusive(1, self.time_mask_length)
+                t0 = self._randint_inclusive(0, max(0, T - t_len))
                 x[b, t0:t0 + t_len, :] = 0.0
 
         # ─ Frequency masking — independent masks per sample ────────────────
         n_freq_masks = max(1, int(D * self.freq_mask_prob))
         for b in range(B):
             for _ in range(n_freq_masks):
-                f_len = random.randint(1, self.freq_mask_length)
-                f0    = random.randint(0, max(0, D - f_len))
+                f_len = self._randint_inclusive(1, self.freq_mask_length)
+                f0 = self._randint_inclusive(0, max(0, D - f_len))
                 x[b, :, f0:f0 + f_len] = 0.0
 
         return x

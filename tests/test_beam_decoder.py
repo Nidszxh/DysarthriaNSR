@@ -111,3 +111,23 @@ class TestBeamSearchDecoder:
         log_probs = _peaked_log_probs(4, 6, [3, 0, 4, 0])
         phonemes, _ = decoder.decode(log_probs, self.id_to_phn)
         assert isinstance(phonemes, list)
+
+    def test_pad_token_treated_as_non_emitting(self):
+        """PAD-dominant frames should not create emitted tokens in the beam path."""
+        # [PAD, P, PAD] should decode to ['P'] when PAD is handled blank-like.
+        log_probs = _peaked_log_probs(3, 6, [1, 3, 1])
+        phonemes, _ = self.decoder.decode(log_probs, self.id_to_phn)
+        assert phonemes == ['P'], f"Expected ['P'], got {phonemes}"
+
+    def test_pad_unk_mass_not_added_to_blank(self):
+        """Moderate PAD/UNK probabilities must not inflate blank transitions.
+
+        If PAD/UNK are incorrectly merged into the blank path, this setup tends
+        to collapse to an empty prediction (deletion-heavy failure mode).
+        """
+        probs = np.array([0.35, 0.125, 0.125, 0.40, 1e-8, 1e-8], dtype=np.float64)
+        probs = probs / probs.sum()
+        log_probs = np.log(np.tile(probs, (6, 1)).astype(np.float32))
+
+        phonemes, _ = self.decoder.decode(log_probs, self.id_to_phn)
+        assert phonemes == ['P'], f"Expected ['P'], got {phonemes}"

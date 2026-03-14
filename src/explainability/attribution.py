@@ -15,13 +15,13 @@ import torch
 
 # Map common articulatory feature substitution patterns to probable clinical causes
 _PROBABLE_CAUSE_MAP = {
-    ("stop", "stop", "bilabial", "alveolar"): "Fronting (bilabial → alveolar)",
-    ("stop", "stop", "velar", "alveolar"): "Fronting (velar → alveolar)",
-    ("voiced", "voiceless"): "Devoicing",
+    ("voice", "voiced", "voiceless"): "Devoicing (voiced → voiceless)",
     ("liquid", "glide"): "Liquid gliding (R/L → W/Y)",
     ("fricative", "stop"): "Stopping (fricative → stop)",
     ("fricative", "affricate"): "Affrication",
     ("vowel", "vowel"): "Vowel centralization",
+    ("place", "bilabial", "alveolar"): "Fronting (bilabial → alveolar)",
+    ("place", "velar", "alveolar"): "Fronting (velar → alveolar)",
 }
 
 
@@ -250,11 +250,28 @@ class PhonemeAttributor:
         pred_manner = feat_pred.get("manner", "")
         ref_voice = feat_ref.get("voice", "")
         pred_voice = feat_pred.get("voice", "")
+        ref_place = feat_ref.get("place", "")
+        pred_place = feat_pred.get("place", "")
+
+        if voice_diff:
+            mapped = _PROBABLE_CAUSE_MAP.get(("voice", ref_voice, pred_voice))
+            if mapped:
+                return mapped
 
         if voice_diff and not manner_diff and not place_diff:
             if ref_voice == "voiced" and pred_voice == "voiceless":
                 return "Devoicing (voiced → voiceless)"
             return "Voicing change"
+
+        mapped = _PROBABLE_CAUSE_MAP.get((ref_manner, pred_manner))
+        if mapped:
+            return mapped
+
+        if place_diff:
+            mapped = _PROBABLE_CAUSE_MAP.get(("place", ref_place, pred_place))
+            if mapped:
+                return mapped
+
         if manner_diff:
             if ref_manner == "liquid" and pred_manner == "glide":
                 return "Liquid gliding (R/L → W/Y)"

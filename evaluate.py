@@ -28,6 +28,11 @@ import seaborn as sns
 import torch
 from scipy import stats
 
+try:
+    from rapidfuzz.distance import Levenshtein as _RFLevenshtein
+except Exception:
+    _RFLevenshtein = None
+
 # Import project modules
 try:
     from src.utils.config import normalize_phoneme, get_project_root
@@ -50,13 +55,23 @@ try:
 except ImportError:
     # Inline fallback — should not happen in a correctly installed package
     def _align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
-        batch_size = labels.size(0)
-        t = labels.size(1)
-        if t < time_steps_logits:
-            pad = torch.full((batch_size, time_steps_logits - t), -100,
-                             dtype=labels.dtype, device=labels.device)
-            return torch.cat([labels, pad], dim=1)
-        return labels[:, :time_steps_logits]
+        batch_size, t = labels.shape
+        if t == time_steps_logits:
+            return labels
+        indices = (
+            torch.arange(time_steps_logits, device=labels.device, dtype=torch.float32)
+            * (t / float(time_steps_logits))
+        ).long().clamp(0, t - 1)
+        aligned = labels[:, indices]
+        pad_mask = (labels == -100)
+        if pad_mask.any():
+            pad_fraction = pad_mask.float().mean(dim=1)
+            n_pad = (pad_fraction * time_steps_logits).long()
+            for b in range(batch_size):
+                n = int(n_pad[b].item())
+                if n > 0:
+                    aligned[b, time_steps_logits - n:] = -100
+        return aligned
 
 
 # DECODING UTILITIES
@@ -163,7 +178,27 @@ class BeamSearchDecoder:
                 - Prune to top-k hypotheses by probability
             3. Return highest probability hypothesis
         """
+        # Use float64 in numpy beam arithmetic for stability (especially when
+        # model outputs come from AMP/bfloat16).  We keep CTC semantics strict:
+        # only BLANK contributes to p_blank, while PAD/UNK are excluded from
+        # search-space normalization entirely.
+        log_probs = np.asarray(log_probs, dtype=np.float64)
         T, num_classes = log_probs.shape
+
+        blank_id = int(self.blank_id)
+        special_ids = {
+            int(idx)
+            for idx, tok in id_to_phn.items()
+            if tok in ('<BLANK>', '<PAD>', '<UNK>')
+        }
+        if blank_id not in special_ids:
+            special_ids.add(blank_id)
+
+        emit_ids = [
+            i for i in range(num_classes)
+            if (i not in special_ids)
+        ]
+        allowed_ids = [blank_id] + emit_ids
 
         # Beam state: {prefix: (p_blank, p_non_blank, lm_cumulative_score)}
         # p_blank and p_non_blank are PURE acoustic log-probs (CTC semantics).
@@ -178,9 +213,16 @@ class BeamSearchDecoder:
                 lambda: (float('-inf'), float('-inf'), 0.0)
             )
 
+            # Renormalize each frame over CTC-valid IDs only:
+            # {BLANK + lexical phonemes}. This prevents PAD/UNK probability mass
+            # from artificially boosting blank transitions.
+            frame_allowed = log_probs[t, allowed_ids]
+            frame_log_z = np.logaddexp.reduce(frame_allowed)
+            blank_lp = log_probs[t, blank_id] - frame_log_z
+
             for prefix, (p_b, p_nb, lm_acc) in beam.items():
-                # --- Extend with blank (acoustic only; LM unchanged) ----------
-                new_p_b = np.logaddexp(p_b, p_nb) + log_probs[t, self.blank_id]
+                # --- Extend with true CTC blank only ---------------------------
+                new_p_b = np.logaddexp(p_b, p_nb) + blank_lp
                 prev_b, prev_nb, prev_lm = new_beam[prefix]
                 new_beam[prefix] = (
                     np.logaddexp(prev_b, new_p_b),
@@ -189,19 +231,21 @@ class BeamSearchDecoder:
                 )
 
                 # --- Extend with non-blank phonemes ---------------------------
-                for c in range(num_classes):
-                    if c == self.blank_id:
-                        continue
+                for c in emit_ids:
+                    c_lp = log_probs[t, c] - frame_log_z
 
                     if len(prefix) > 0 and prefix[-1] == c:
-                        # Repeated token → same prefix, extend from blank only
+                        # Repeated token (CTC collapse): same labeling prefix.
+                        # Include BOTH p_blank and p_non_blank predecessors.
+                        # Omitting p_non_blank underestimates long same-token
+                        # runs and can bias beam search toward blank/deletions.
                         new_prefix = prefix
-                        new_p_nb   = p_b + log_probs[t, c]
+                        new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
                         new_lm_acc = lm_acc   # no new token emitted
                     else:
                         # New token → extend prefix, update LM accumulator
                         new_prefix = prefix + (c,)
-                        new_p_nb   = np.logaddexp(p_b, p_nb) + log_probs[t, c]
+                        new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
                         if use_lm and len(prefix) > 0:
                             # Incremental bigram score for this single new token
                             new_lm_acc = lm_acc + self.lm_scorer.log_prob(prefix[-1], c)
@@ -404,6 +448,56 @@ def compute_per_with_ci(
     return mean_per, (ci_lower, ci_upper)
 
 
+def bootstrap_paired_per_delta(
+    constrained_per_scores: List[float],
+    neural_per_scores: List[float],
+    n_bootstrap: int = 10000,
+) -> Dict[str, float]:
+    """Estimate paired PER delta significance via bootstrap resampling.
+
+    Delta is defined as ``mean(constrained - neural)`` so positive values imply
+    constrained decoding is worse.
+
+    Returns:
+        Dict with ``delta_mean``, ``ci_95_low``, ``ci_95_high``, and
+        a two-sided empirical ``p_value_two_sided`` for H0: delta == 0.
+    """
+    if len(constrained_per_scores) == 0 or len(constrained_per_scores) != len(neural_per_scores):
+        return {
+            'delta_mean': float('nan'),
+            'ci_95_low': float('nan'),
+            'ci_95_high': float('nan'),
+            'p_value_two_sided': float('nan'),
+        }
+
+    c = np.asarray(constrained_per_scores, dtype=float)
+    n = np.asarray(neural_per_scores, dtype=float)
+    deltas = c - n
+    delta_mean = float(np.mean(deltas))
+
+    boot = []
+    m = len(deltas)
+    for _ in range(n_bootstrap):
+        idx = np.random.randint(0, m, size=m)
+        boot.append(float(np.mean(deltas[idx])))
+    boot_arr = np.asarray(boot, dtype=float)
+
+    ci_low = float(np.percentile(boot_arr, 2.5))
+    ci_high = float(np.percentile(boot_arr, 97.5))
+
+    # Two-sided empirical p-value around zero.
+    p_left = float(np.mean(boot_arr <= 0.0))
+    p_right = float(np.mean(boot_arr >= 0.0))
+    p_two_sided = float(min(1.0, 2.0 * min(p_left, p_right)))
+
+    return {
+        'delta_mean': delta_mean,
+        'ci_95_low': ci_low,
+        'ci_95_high': ci_high,
+        'p_value_two_sided': p_two_sided,
+    }
+
+
 def compute_wer_texts(
     predictions_text: List[str],
     references_text: List[str]
@@ -482,7 +576,7 @@ def decode_predictions(
                 else log_probs.size(1)
             )
             seq, _ = decoder.decode(
-                log_probs[i, :valid_len].cpu().numpy(),
+                log_probs[i, :valid_len].float().cpu().numpy(),
                 id_to_phn
             )
             predictions.append(seq)
@@ -512,6 +606,53 @@ def phoneme_alignment(
         Dynamic programming (Levenshtein distance) with backtracking.
     """
     m, n = len(pred), len(ref)
+
+    # O-5: Fast C-extension path via rapidfuzz (fallback to DP if unavailable).
+    if _RFLevenshtein is not None:
+        try:
+            ops = _RFLevenshtein.editops(pred, ref)
+            alignment: List[Tuple[str, Optional[str], Optional[str]]] = []
+            i = j = 0
+
+            for op in ops:
+                src = int(op.src_pos)
+                dst = int(op.dest_pos)
+
+                # Emit exact matches before the next edit operation.
+                while i < src and j < dst:
+                    alignment.append(('correct', pred[i], ref[j]))
+                    i += 1
+                    j += 1
+
+                if op.tag == 'replace':
+                    alignment.append(('substitute', pred[src], ref[dst]))
+                    i = src + 1
+                    j = dst + 1
+                elif op.tag == 'delete':
+                    alignment.append(('delete', pred[src], None))
+                    i = src + 1
+                    j = dst
+                elif op.tag == 'insert':
+                    alignment.append(('insert', None, ref[dst]))
+                    i = src
+                    j = dst + 1
+
+            # Flush trailing exact matches and residual tails.
+            while i < m and j < n:
+                alignment.append(('correct', pred[i], ref[j]))
+                i += 1
+                j += 1
+            while i < m:
+                alignment.append(('delete', pred[i], None))
+                i += 1
+            while j < n:
+                alignment.append(('insert', None, ref[j]))
+                j += 1
+
+            return alignment
+        except Exception:
+            # Safety-first: keep original pure-Python path on any unexpected error.
+            pass
     
     # DP matrix: dp[i][j] = min edit distance for pred[:i] and ref[:j]
     dp = [[0] * (n + 1) for _ in range(m + 1)]
@@ -880,38 +1021,47 @@ def stratify_by_phoneme_length(
 def compute_severity_stratified_per(
     per_by_speaker: Dict[str, float],
 ) -> Dict[str, Dict[str, float]]:
-    """Stratify per-speaker PER into clinical severity buckets (audit Phase 8).
+    """Stratify per-speaker PER into TORGO clinical severity buckets.
 
-    Buckets follow the standard TORGO intelligibility grouping:
-    - ``mild``     : severity ∈ [0, 2)  — controls + mild dysarthria
-    - ``moderate`` : severity ∈ [2, 4)  — moderate dysarthria
-    - ``severe``   : severity ∈ [4, 5]  — severe / profound dysarthria
+    Buckets are defined from continuous severity scores derived from TORGO
+    intelligibility estimates (Rudzicz et al., 2012):
+    - ``normal``   : severity = 0.0 (control speakers)
+    - ``mild``     : 0.0 < severity < 3.0
+    - ``moderate`` : 3.0 <= severity < 4.0
+    - ``severe``   : 4.0 <= severity < 4.7
+    - ``profound`` : severity >= 4.7
 
     Args:
-        per_by_speaker: Mapping of speaker_id → mean PER.
+        per_by_speaker: Mapping of speaker_id -> mean PER.
 
     Returns:
-        ``{'mild': {'mean_per': float, 'n_speakers': int, 'speakers': [...], 'ci': [lo, hi]},
-            'moderate': {...}, 'severe': {...}}``
+        Mapping bucket -> summary metrics.
     """
     from src.utils.config import get_speaker_severity
 
-    buckets: Dict[str, List[float]] = {'mild': [], 'moderate': [], 'severe': []}
-    bucket_speakers: Dict[str, List[str]] = {'mild': [], 'moderate': [], 'severe': []}
+    bucket_order = ('normal', 'mild', 'moderate', 'severe', 'profound')
+    buckets: Dict[str, List[float]] = {k: [] for k in bucket_order}
+    bucket_speakers: Dict[str, List[str]] = {k: [] for k in bucket_order}
+
+    def _bucket_from_severity(sev: float) -> str:
+        if sev <= 0.0:
+            return 'normal'
+        if sev < 3.0:
+            return 'mild'
+        if sev < 4.0:
+            return 'moderate'
+        if sev < 4.7:
+            return 'severe'
+        return 'profound'
 
     for spk, per in per_by_speaker.items():
         sev = get_speaker_severity(spk)
-        if sev < 2.0:
-            bucket = 'mild'
-        elif sev < 4.0:
-            bucket = 'moderate'
-        else:
-            bucket = 'severe'
+        bucket = _bucket_from_severity(sev)
         buckets[bucket].append(per)
         bucket_speakers[bucket].append(spk)
 
     result = {}
-    for b in ('mild', 'moderate', 'severe'):
+    for b in bucket_order:
         scores = buckets[b]
         if scores:
             mean_val, ci = compute_per_with_ci(scores)
@@ -1372,7 +1522,7 @@ def evaluate_model(
                         else log_probs_constrained.size(1)
                     )
                     seq, score = decoder.decode(
-                        log_probs_constrained[i, :valid_len].cpu().numpy(),
+                        log_probs_constrained[i, :valid_len].float().cpu().numpy(),
                         id_to_phn
                     )
                     predictions.append(seq)
@@ -1469,26 +1619,29 @@ def evaluate_model(
     # "Helpful" = per_constrained < per_neural for that utterance; metric is
     # analogous to rule precision without requiring per-frame forced alignment.
     constraint_precision: Optional[Dict[str, float]] = None
+    helpful_count = neutral_count = harmful_count = 0
     if all_predictions_neural and len(all_predictions_neural) == len(per_scores):
-        helpful = neutral = harmful = 0
         for p_c, p_n in zip(per_scores, neural_per_scores):
             if p_c < p_n - 1e-6:
-                helpful += 1
+                helpful_count += 1
             elif p_c > p_n + 1e-6:
-                harmful += 1
+                harmful_count += 1
             else:
-                neutral += 1
+                neutral_count += 1
         total = len(per_scores)
         constraint_precision = {
-            'helpful_rate':  helpful / total,
-            'neutral_rate':  neutral / total,
-            'harmful_rate':  harmful / total,
+            'helpful_rate':  helpful_count / total,
+            'neutral_rate':  neutral_count / total,
+            'harmful_rate':  harmful_count / total,
+            'rule_precision': helpful_count / total,
             'n_utterances':  total,
         }
         print(
-            f"   Constraint precision  — helpful: {helpful/total:.1%}  "
-            f"neutral: {neutral/total:.1%}  harmful: {harmful/total:.1%}"
+            f"   Constraint precision  — helpful: {helpful_count/total:.1%}  "
+            f"neutral: {neutral_count/total:.1%}  harmful: {harmful_count/total:.1%}"
         )
+
+    paired_delta_stats = bootstrap_paired_per_delta(per_scores, neural_per_scores)
 
     # Stratified by dysarthric status (sample-level for clinical reporting)
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
@@ -1589,8 +1742,11 @@ def evaluate_model(
 
     # I2: Blank probability histogram (always generated; key insertion-bias diagnostic)
     if all_blank_probs:
+        _blank_target = 0.75
+        if hasattr(model, "config") and hasattr(model.config, "training"):
+            _blank_target = float(getattr(model.config.training, "blank_target_prob", _blank_target))
         plot_blank_histogram(all_blank_probs, results_dir / 'blank_probability_histogram.png',
-                             target_prob=0.75)
+                             target_prob=_blank_target)
         print(f"✅ Blank probability histogram saved "
               f"(mean={float(np.mean(all_blank_probs)):.3f})")
 
@@ -1625,6 +1781,13 @@ def evaluate_model(
                     [list(pair), count] if isinstance(pair, tuple) else [pair, count]
                     for pair, count in rule_stats['top_rules']
                 ]
+            # N7: add utterance-level proxy for rule precision when paired
+            # constrained-vs-neural comparison is available.
+            if constraint_precision is not None:
+                total_utt = int(constraint_precision.get('n_utterances', 0))
+                if total_utt > 0:
+                    rule_stats['rule_precision_proxy'] = float(helpful_count / total_utt)
+                    rule_stats['rule_harm_rate_proxy'] = float(harmful_count / total_utt)
         plot_rule_impact(rule_stats, results_dir / 'rule_impact.png',
                          model=model, id_to_phn=id_to_phn)
 
@@ -1751,6 +1914,9 @@ def evaluate_model(
             'per_neural':     mean_per_neural,
             'per_constrained': mean_per,
             'delta_per':      (mean_per_neural - mean_per) if mean_per_neural is not None else None,
+            'paired_delta_constrained_minus_neural': paired_delta_stats,
+            'ci_95_delta_per': [paired_delta_stats.get('ci_95_low'), paired_delta_stats.get('ci_95_high')],
+            'p_value_neural_vs_constrained': paired_delta_stats.get('p_value_two_sided'),
         },
         'articulatory_accuracy': {
             key: float(np.mean(vals)) if vals else 0.0
@@ -1769,6 +1935,8 @@ def evaluate_model(
             'spearman_p_sev_per':  float(spearman_p),
             'correlation_n_speakers': n_speakers_eval,
             'correlation_valid':   correlation_valid,  # False when n<5 (treat as descriptive)
+            'p_value_neural_vs_constrained': paired_delta_stats.get('p_value_two_sided'),
+            'ci_95_delta_per': [paired_delta_stats.get('ci_95_low'), paired_delta_stats.get('ci_95_high')],
         },
         'rule_impact': rule_stats,
         'stratified': {

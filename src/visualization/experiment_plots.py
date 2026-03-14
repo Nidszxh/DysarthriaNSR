@@ -254,14 +254,15 @@ def plot_severity_vs_per(
         )
 
     # OLS regression (only if ≥2 unique x values)
-    annotation_text = "r = N/A  (≤ 1 unique severity)"
+    n_points = len(x)
+    annotation_text = f"r = N/A  (≤ 1 unique severity, n={n_points})"
     if len(set(x)) >= 2:
         slope, intercept, r, p_val, _ = sp_stats.linregress(x, y)
         x_line = np.linspace(x.min(), x.max(), 200)
         y_line = slope * x_line + intercept
         ax.plot(x_line, y_line, color="dimgrey", linewidth=1.2, linestyle="--", zorder=3)
         sig_star = "*" if p_val < 0.05 else " (n.s.)"
-        annotation_text = f"r = {r:.3f},  p = {p_val:.3f}{sig_star}"
+        annotation_text = f"r = {r:.3f},  p = {p_val:.3f}{sig_star},  n={n_points}"
 
     ax.text(
         0.97, 0.97, annotation_text,

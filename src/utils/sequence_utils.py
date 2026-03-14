@@ -12,8 +12,10 @@ def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torc
     """
     Align a label tensor's time dimension to match the logits time dimension.
 
-    Pads with -100 (CTC/CE ignore index) if labels are shorter, or truncates
-    if labels are longer than the logits sequence length.
+    Uses proportional nearest-neighbor interpolation rather than simple
+    pad/truncate so supervision is distributed across the full logit timeline.
+    This is still an approximation (not forced alignment), but it avoids
+    concentrating CE supervision in the earliest frames only.
 
     Args:
         labels:             Label tensor [batch, seq_len]
@@ -22,15 +24,26 @@ def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torc
     Returns:
         Aligned labels [batch, time_steps_logits]
     """
-    batch_size = labels.size(0)
-    time_steps_labels = labels.size(1)
+    batch_size, time_steps_labels = labels.shape
 
-    if time_steps_labels < time_steps_logits:
-        padding = torch.full(
-            (batch_size, time_steps_logits - time_steps_labels),
-            -100,
-            dtype=labels.dtype,
-            device=labels.device,
-        )
-        return torch.cat([labels, padding], dim=1)
-    return labels[:, :time_steps_logits]
+    if time_steps_labels == time_steps_logits:
+        return labels
+
+    # Map each logit frame to a proportional source-label index.
+    indices = (
+        torch.arange(time_steps_logits, device=labels.device, dtype=torch.float32)
+        * (time_steps_labels / float(time_steps_logits))
+    ).long().clamp(0, time_steps_labels - 1)
+    aligned = labels[:, indices]
+
+    # Preserve ignore-index tail semantics when source labels contain -100.
+    pad_mask = (labels == -100)
+    if pad_mask.any():
+        pad_fraction = pad_mask.float().mean(dim=1)
+        n_pad = (pad_fraction * time_steps_logits).long()
+        for b in range(batch_size):
+            n = int(n_pad[b].item())
+            if n > 0:
+                aligned[b, time_steps_logits - n:] = -100
+
+    return aligned

@@ -167,3 +167,13 @@ class SymbolicRuleTracker:
         """Reset all recorded activations (call between evaluation runs)."""
         self._activations.clear()
         self._total_frames = 0
+
+    def flush(self) -> Dict[str, Any]:
+        """Return current summary statistics and clear in-memory activations.
+
+        Useful for long multi-fold evaluations where callers want periodic
+        summaries without retaining all activation events.
+        """
+        summary = self.generate_explanation()
+        self.clear()
+        return summary

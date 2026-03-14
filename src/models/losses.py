@@ -103,7 +103,7 @@ class BlankPriorKLLoss(nn.Module):
     56× insertion/deletion ratio (21,290 insertions vs 376 deletions).
 
     Solution: Regularise the mean blank probability across all valid frames toward
-    a target that matches typical CTC blank-emission rates (default 0.85 — empirically
+    a target that matches typical CTC blank-emission rates (default 0.75 — empirically
     observed in HuBERT-based CTC systems; 0.30 would actively push blank probability
     DOWN and worsen insertion bias). Uses KL divergence
     from the posterior mean over the 2-class Bernoulli (blank / non-blank).
@@ -115,13 +115,13 @@ class BlankPriorKLLoss(nn.Module):
 
     Args:
         blank_id:    Index of the CTC blank token in the vocabulary.
-        target_prob: Target mean blank probability. Default 0.85
+        target_prob: Target mean blank probability. Default 0.75
             (empirically matches HuBERT-based CTC blank emission rates;
             lower values would push blank probability down and worsen
             insertion bias).
     """
 
-    def __init__(self, blank_id: int = 0, target_prob: float = 0.85):
+    def __init__(self, blank_id: int = 0, target_prob: float = 0.75):
         super().__init__()
         self.blank_id = blank_id
         self.register_buffer("target_prob", torch.tensor(target_prob, dtype=torch.float32))

@@ -71,7 +71,7 @@ class TestOrdinalContrastiveLoss:
 class TestBlankPriorKLLoss:
     def setup_method(self):
         self.V = 44
-        self.loss_fn = BlankPriorKLLoss(blank_id=0, target_prob=0.85)
+        self.loss_fn = BlankPriorKLLoss(blank_id=0, target_prob=0.75)
 
     def test_non_negative(self):
         log_probs = F.log_softmax(torch.randn(2, 50, self.V), dim=-1)

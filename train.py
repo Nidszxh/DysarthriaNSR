@@ -639,6 +639,11 @@ class DysarthriaASRLightning(pl.LightningModule):
         gives newly-active parameters the closest equivalent to a "fresh start":
         gradients are not polluted by stale momentum from pre-unfreeze noise.
         Called after each unfreeze event in on_train_epoch_start.
+
+        Important: Adam expects either a fully initialized state dict or an empty
+        one for each parameter. Removing only exp_avg / exp_avg_sq leaves a
+        partially initialized state that crashes on the next optimizer.step()
+        with KeyError('exp_avg').
         """
         optimizer = self.optimizers()
         if isinstance(optimizer, list):
@@ -647,11 +652,9 @@ class DysarthriaASRLightning(pl.LightningModule):
             if pg.get('name') == 'hubert_encoder':
                 for p in pg['params']:
                     if p.requires_grad and p in optimizer.state:
-                        state = optimizer.state[p]
-                        # Clear Adam momentum so newly-active params start fresh.
-                        state.pop('exp_avg', None)
-                        state.pop('exp_avg_sq', None)
-                        state.pop('max_exp_avg_sq', None)  # AMSGrad variant
+                        # Clear the whole per-parameter state so Adam fully
+                        # reinitializes exp_avg / exp_avg_sq / step on next use.
+                        optimizer.state[p].clear()
                 break
 
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
@@ -755,7 +758,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         )
         references = decode_references(labels, self.id_to_phn)
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
-        avg_per = np.mean(per_scores) if per_scores else 0.0
+        avg_per = float(np.mean(per_scores)) if per_scores else 0.0
 
         # Collect speakers aligned to valid_mask for macro-speaker PER (§2.6)
         all_speakers   = batch.get('speakers', [])
@@ -793,11 +796,10 @@ class DysarthriaASRLightning(pl.LightningModule):
             for spk, per in zip(output.get('speakers', []), output.get('per_scores', [output['per']])):
                 speaker_per_map[spk].append(per)
         if speaker_per_map:
-            macro_per = float(np.mean([np.mean(v) for v in speaker_per_map.values()]))
+            avg_per = float(np.mean([np.mean(v) for v in speaker_per_map.values()]))
         else:
             # Fallback when speaker info is unavailable
-            macro_per = float(np.mean([x['per'] for x in self.validation_step_outputs]))
-        avg_per = macro_per
+            avg_per = float(np.mean([x['per'] for x in self.validation_step_outputs]))
         
         # Stratified PER (dysarthric vs control)
         dysarthric_per, control_per = self._compute_stratified_per()
@@ -1608,7 +1610,7 @@ def run_loso(
         print(f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}")
 
         # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
-        del trainer, lm
+        del trainer, lm, model
         torch.cuda.empty_cache()
 
     # Bootstrap 95% CI over fold PERs
