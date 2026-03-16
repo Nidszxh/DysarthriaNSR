@@ -1,4 +1,7 @@
 import warnings
+import hashlib
+import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,7 +31,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
         manifest_path: str,
         processor_id: str = "facebook/hubert-base-ls960",
         sampling_rate: int = 16000,
-        max_audio_length: Optional[float] = None
+        max_audio_length: Optional[float] = None,
+        enable_feature_cache: bool = True,
+        feature_cache_dir: Optional[str] = None,
+        enable_memory_cache: bool = True,
+        memory_cache_size: int = 2048,
     ):
         # Validate manifest exists
         if not Path(manifest_path).exists():
@@ -42,6 +49,9 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.max_audio_samples = (
             int(max_audio_length * sampling_rate) if max_audio_length else None
         )
+        self.enable_feature_cache = enable_feature_cache
+        self.enable_memory_cache = enable_memory_cache
+        self.memory_cache_size = max(0, int(memory_cache_size))
         
         # Load manifest and validate
         self.df = pd.read_csv(manifest_path)
@@ -49,9 +59,25 @@ class TorgoNeuroSymbolicDataset(Dataset):
         
         # Load feature processor
         self.processor = self._load_processor(processor_id)
+        self.processor_id = processor_id
+
+        # Feature cache setup (safe optimization): caches post-processor
+        # input_values tensors so repeated folds/epochs avoid redundant
+        # torchaudio + processor work. Does not change model inputs.
+        cache_base = Path(feature_cache_dir) if feature_cache_dir else (ProjectPaths().processed_dir / "feature_cache")
+        self.feature_cache_dir = cache_base
+        self._cache_namespace = self._build_cache_namespace()
+        if self.enable_feature_cache:
+            (self.feature_cache_dir / self._cache_namespace).mkdir(parents=True, exist_ok=True)
+
+        self._memory_feature_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
         
         # Build vocabularies
         self._build_vocabularies()
+
+        # Precompute sequence encodings once (safe optimization): avoids
+        # repeated per-batch string split/token encoding for labels.
+        self._sequence_cache = self._build_sequence_cache()
         
         # Pre-calculate inverse-frequency phoneme weights
         self.phoneme_weights = self._calculate_phoneme_weights()
@@ -346,6 +372,73 @@ class TorgoNeuroSymbolicDataset(Dataset):
         waveform = waveform.squeeze(0)
         
         return waveform
+
+    def _build_cache_namespace(self) -> str:
+        """Build a cache namespace key tied to processor + audio settings."""
+        sig = (
+            f"processor={self.processor_id}|sr={self.sampling_rate}|"
+            f"max_samples={self.max_audio_samples}|manifest={Path(self.manifest_path).name}"
+        )
+        sig_hash = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12]
+        return f"hubert_{sig_hash}"
+
+    def _feature_cache_path(self, idx: int, audio_path: str) -> Path:
+        """Deterministic cache path for a sample's processed input_values."""
+        key = f"{idx}|{audio_path}|{self.sampling_rate}|{self.max_audio_samples}|{self.processor_id}"
+        h = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        return self.feature_cache_dir / self._cache_namespace / f"{h}.pt"
+
+    def _get_cached_features(self, idx: int, audio_path: str) -> Optional[torch.Tensor]:
+        """Return cached input_values if available, else None."""
+        if self.enable_memory_cache and idx in self._memory_feature_cache:
+            tensor = self._memory_feature_cache.pop(idx)
+            # Move key to end to maintain LRU ordering.
+            self._memory_feature_cache[idx] = tensor
+            return tensor
+
+        if not self.enable_feature_cache:
+            return None
+
+        cache_path = self._feature_cache_path(idx, audio_path)
+        if not cache_path.exists():
+            return None
+
+        try:
+            tensor = torch.load(cache_path, map_location="cpu")
+            if isinstance(tensor, torch.Tensor):
+                if self.enable_memory_cache and self.memory_cache_size > 0:
+                    self._memory_feature_cache[idx] = tensor
+                    if len(self._memory_feature_cache) > self.memory_cache_size:
+                        self._memory_feature_cache.popitem(last=False)
+                return tensor
+        except Exception:
+            # Corrupted cache files are treated as misses and overwritten below.
+            return None
+
+        return None
+
+    def _store_cached_features(self, idx: int, audio_path: str, features: torch.Tensor) -> None:
+        """Persist features to memory and optional disk cache."""
+        if self.enable_memory_cache and self.memory_cache_size > 0:
+            self._memory_feature_cache[idx] = features
+            if len(self._memory_feature_cache) > self.memory_cache_size:
+                self._memory_feature_cache.popitem(last=False)
+
+        if not self.enable_feature_cache:
+            return
+
+        cache_path = self._feature_cache_path(idx, audio_path)
+        tmp_path = cache_path.with_suffix(f".pt.tmp.{os.getpid()}")
+        try:
+            torch.save(features, tmp_path)
+            tmp_path.replace(cache_path)
+        except Exception:
+            # Cache write failures are non-fatal; training should continue.
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
     
     def _encode_phonemes(self, phonemes_str: str) -> List[int]:
         
@@ -353,8 +446,63 @@ class TorgoNeuroSymbolicDataset(Dataset):
             normalize_phoneme(phn) for phn in phonemes_str.split() if phn.strip()
         ]
         return [self.phn_to_id.get(phn, self.unk_id) for phn in phoneme_list]
+
     def _encode_articulatory_classes(self, art_list: List[str], vocab: Dict[str, int]) -> List[int]:
         return [vocab.get(art, self.art_unk_id) for art in art_list]
+
+    def _build_sequence_cache(self) -> List[Dict[str, torch.Tensor]]:
+        """
+        Precompute encoded label sequences for every manifest row.
+
+        This is deterministic and safe because it only transforms static
+        manifest strings into integer IDs. It does not alter training behavior.
+        """
+        cached_sequences: List[Dict[str, torch.Tensor]] = []
+
+        for idx in range(len(self.df)):
+            row = self.df.iloc[idx]
+
+            phonemes_str = str(row['phonemes'])
+            phoneme_ids = self._encode_phonemes(phonemes_str)
+
+            manner_tokens = self._get_articulatory_tokens(
+                row, "manner_classes", len(phoneme_ids), fallback_column="articulatory_classes"
+            )
+            place_tokens = self._get_articulatory_tokens(
+                row, "place_classes", len(phoneme_ids)
+            )
+            voice_tokens = self._get_articulatory_tokens(
+                row, "voice_classes", len(phoneme_ids)
+            )
+
+            manner_ids = self._encode_articulatory_classes(manner_tokens, self.manner_to_id)
+            place_ids = self._encode_articulatory_classes(place_tokens, self.place_to_id)
+            voice_ids = self._encode_articulatory_classes(voice_tokens, self.voice_to_id)
+
+            # Validate 1:1 alignment (phoneme ↔ articulatory class)
+            if len(phoneme_ids) != len(manner_ids):
+                min_len = min(len(phoneme_ids), len(manner_ids))
+                warnings.warn(
+                    f"Alignment mismatch for sample {idx} (speaker: {row['speaker']}): "
+                    f"phonemes={len(phoneme_ids)} vs manner={len(manner_ids)}. "
+                    "Truncating to min length.",
+                    UserWarning
+                )
+                phoneme_ids = phoneme_ids[:min_len]
+                manner_ids = manner_ids[:min_len]
+                place_ids = place_ids[:min_len]
+                voice_ids = voice_ids[:min_len]
+
+            cached_sequences.append(
+                {
+                    "labels": torch.tensor(phoneme_ids, dtype=torch.long),
+                    "manner": torch.tensor(manner_ids, dtype=torch.long),
+                    "place": torch.tensor(place_ids, dtype=torch.long),
+                    "voice": torch.tensor(voice_ids, dtype=torch.long),
+                }
+            )
+
+        return cached_sequences
 
     def _get_articulatory_tokens(
         self,
@@ -382,56 +530,30 @@ class TorgoNeuroSymbolicDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]: # Get dataset items by index
 
         row = self.df.iloc[idx]
-        
-        # Load and process audio
-        waveform = self._load_audio(row['path'])
-        audio_features = self.processor(
-            waveform,
-            sampling_rate=self.sampling_rate,
-            return_tensors="pt"
-        ).input_values.squeeze(0)
-        if self.max_audio_samples is not None and audio_features.numel() > self.max_audio_samples:
-            audio_features = audio_features[:self.max_audio_samples]
-        
-        # Encode phoneme and articulatory sequences
-        phonemes_str = str(row['phonemes'])
-        phoneme_ids = self._encode_phonemes(phonemes_str)
-        
-        manner_tokens = self._get_articulatory_tokens(
-            row, "manner_classes", len(phoneme_ids), fallback_column="articulatory_classes"
-        )
-        place_tokens = self._get_articulatory_tokens(
-            row, "place_classes", len(phoneme_ids)
-        )
-        voice_tokens = self._get_articulatory_tokens(
-            row, "voice_classes", len(phoneme_ids)
-        )
 
-        manner_ids = self._encode_articulatory_classes(manner_tokens, self.manner_to_id)
-        place_ids = self._encode_articulatory_classes(place_tokens, self.place_to_id)
-        voice_ids = self._encode_articulatory_classes(voice_tokens, self.voice_to_id)
+        audio_path = str(row['path'])
+        audio_features = self._get_cached_features(idx, audio_path)
+        if audio_features is None:
+            # Load and process audio on cache miss.
+            waveform = self._load_audio(audio_path)
+            audio_features = self.processor(
+                waveform,
+                sampling_rate=self.sampling_rate,
+                return_tensors="pt"
+            ).input_values.squeeze(0)
+            if self.max_audio_samples is not None and audio_features.numel() > self.max_audio_samples:
+                audio_features = audio_features[:self.max_audio_samples]
+            self._store_cached_features(idx, audio_path, audio_features)
         
-        # Validate 1:1 alignment (phoneme ↔ articulatory class)
-        if len(phoneme_ids) != len(manner_ids):
-            min_len = min(len(phoneme_ids), len(manner_ids))
-            warnings.warn(
-                f"Alignment mismatch for sample {idx} (speaker: {row['speaker']}): "
-                f"phonemes={len(phoneme_ids)} vs manner={len(manner_ids)}. "
-                "Truncating to min length.",
-                UserWarning
-            )
-            phoneme_ids = phoneme_ids[:min_len]
-            manner_ids = manner_ids[:min_len]
-            place_ids = place_ids[:min_len]
-            voice_ids = voice_ids[:min_len]
+        seq = self._sequence_cache[idx]
         
         return {
             "input_values": audio_features,
-            "labels": torch.tensor(phoneme_ids, dtype=torch.long),
+            "labels": seq["labels"],
             "articulatory_labels": {
-                "manner": torch.tensor(manner_ids, dtype=torch.long),
-                "place": torch.tensor(place_ids, dtype=torch.long),
-                "voice": torch.tensor(voice_ids, dtype=torch.long),
+                "manner": seq["manner"],
+                "place": seq["place"],
+                "voice": seq["voice"],
             },
             "metadata": {
                 "speaker": row['speaker'],

@@ -8,6 +8,7 @@ symbolic constraints, and comprehensive evaluation metrics.
 import sys
 from collections import defaultdict
 import warnings
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -1136,34 +1137,32 @@ def create_dataloaders(
     train_weights = [1.0 / speaker_counts[dataset.df.iloc[i]['speaker']] for i in train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    # Create dataloaders with shared worker/prefetch settings for throughput.
+    common_loader_kwargs = dict(
         batch_size=config.training.batch_size,
         shuffle=False,
-        sampler=sampler,
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
-        prefetch_factor=config.training.prefetch_factor
     )
-    
+    if config.training.num_workers > 0:
+        common_loader_kwargs["persistent_workers"] = True
+        common_loader_kwargs["prefetch_factor"] = config.training.prefetch_factor
+
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=sampler,
+        **common_loader_kwargs,
+    )
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory
+        **common_loader_kwargs,
     )
-    
+
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory
+        **common_loader_kwargs,
     )
     
     return train_loader, val_loader, test_loader
@@ -1500,14 +1499,22 @@ def create_loso_splits(
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
 
     def _make_loader(idx, shuffle_sampler=None):
-        return DataLoader(
-            Subset(dataset, idx),
+        loader_kwargs = dict(
             batch_size=config.training.batch_size,
             shuffle=False,
             sampler=shuffle_sampler,
             collate_fn=collator,
             num_workers=config.training.num_workers,
             pin_memory=config.training.pin_memory,
+        )
+        if config.training.num_workers > 0:
+            # Keep worker processes alive across epochs/folds to reduce startup
+            # overhead and improve I/O throughput for long LOSO runs.
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = config.training.prefetch_factor
+        return DataLoader(
+            Subset(dataset, idx),
+            **loader_kwargs,
         )
 
     return (
@@ -1520,6 +1527,7 @@ def create_loso_splits(
 def run_loso(
     config: Config,
     dataset: TorgoNeuroSymbolicDataset,
+    resume: bool = False,
 ) -> Dict:
     """
     Run Leave-One-Speaker-Out cross-validation.
@@ -1537,13 +1545,74 @@ def run_loso(
     # from the original name rather than accumulating across folds (Bug B6).
     base_run_name = config.experiment.run_name
 
-    per_per_fold = []
-    wer_per_fold = []
+    per_per_fold: List[float] = []
+    wer_per_fold: List[float] = []
     n_samples_per_fold: List[int] = []
+
+    # Crash-safe progress file: allows resuming LOSO from last completed fold
+    # (or continuing an interrupted fold from checkpoints/<fold>/last.ckpt).
+    summary_dir = get_project_root() / "results"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = summary_dir / f"{base_run_name}_loso_progress.json"
+
+    completed_folds: Dict[str, Dict] = {}
+    if resume and progress_path.exists():
+        try:
+            with open(progress_path, "r", encoding="utf-8") as _pf:
+                progress = json.load(_pf)
+            for fold in progress.get("folds", []):
+                if fold.get("status") == "completed" and "speaker" in fold:
+                    completed_folds[fold["speaker"]] = fold
+            if completed_folds:
+                print(
+                    f"♻️  Resuming LOSO from progress file: {progress_path} "
+                    f"({len(completed_folds)} completed fold(s) found)"
+                )
+        except Exception as exc:
+            print(f"⚠️  Failed to parse LOSO progress file ({progress_path}): {exc}")
+
+    def _write_progress() -> None:
+        """Persist fold-level progress atomically for crash-safe LOSO resume."""
+        progress_payload = {
+            "run_name": base_run_name,
+            "fold_speakers": speakers,
+            "max_epochs": config.training.max_epochs,
+            "folds": [
+                {
+                    "speaker": sp,
+                    "status": "completed",
+                    "per": float(completed_folds[sp].get("per", float("nan"))),
+                    "wer": float(completed_folds[sp].get("wer", float("nan"))),
+                    "n_samples": int(completed_folds[sp].get("n_samples", 0)),
+                    "checkpoint": completed_folds[sp].get("checkpoint"),
+                    "results_dir": completed_folds[sp].get("results_dir"),
+                }
+                for sp in speakers if sp in completed_folds
+            ],
+        }
+        tmp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as _tf:
+            json.dump(progress_payload, _tf, indent=2)
+        tmp_path.replace(progress_path)
+
     for i, spk in enumerate(speakers):
         print(f"\n── Fold {i+1}/{len(speakers)}: held-out speaker = {spk} ──")
         fold_run_name = f"{base_run_name}_loso_{spk}"
         config.experiment.run_name = fold_run_name
+
+        if spk in completed_folds:
+            cached = completed_folds[spk]
+            fold_per = float(cached.get('per', float('nan')))
+            fold_wer = float(cached.get('wer', float('nan')))
+            fold_n = int(cached.get('n_samples', 0))
+            per_per_fold.append(fold_per)
+            wer_per_fold.append(fold_wer)
+            n_samples_per_fold.append(fold_n)
+            print(
+                f"   ⏭️  Skipping completed fold {spk}: "
+                f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
+            )
+            continue
 
         train_loader, val_loader, test_loader = create_loso_splits(config, dataset, spk)
 
@@ -1568,7 +1637,7 @@ def run_loso(
         ckpt_cb = ModelCheckpoint(
             dirpath=str(ckpt_dir), monitor='val_per', mode='min',
             filename='{epoch:02d}-{val_per:.3f}',
-            save_top_k=1, save_last=False,
+            save_top_k=1, save_last=True,
         )
         # C-02: Create a per-fold MLFlowLogger so each fold's metrics are tracked
         # individually in MLflow under the same experiment.  The trainer is rebuilt
@@ -1585,12 +1654,24 @@ def run_loso(
             precision=config.training.precision,
             accumulate_grad_batches=config.training.gradient_accumulation_steps,
             gradient_clip_val=config.training.gradient_clip_val,
-            callbacks=[ckpt_cb, EarlyStopping(monitor='val_per', patience=5, mode='min')],
+            callbacks=[
+                ckpt_cb,
+                EarlyStopping(
+                    monitor='val_per',
+                    patience=config.training.early_stopping_patience,
+                    mode='min'
+                ),
+            ],
+            val_check_interval=config.training.val_check_interval,
             logger=fold_logger,
             enable_progress_bar=True,
             log_every_n_steps=50,
         )
-        trainer.fit(lm, train_loader, val_loader)
+        resume_ckpt = ckpt_dir / 'last.ckpt'
+        ckpt_path = str(resume_ckpt) if resume and resume_ckpt.exists() else None
+        if ckpt_path:
+            print(f"   ♻️  Resuming fold training from {resume_ckpt}")
+        trainer.fit(lm, train_loader, val_loader, ckpt_path=ckpt_path)
 
         # Evaluate on held-out speaker
         results_dir = get_project_root() / "results" / fold_run_name
@@ -1607,6 +1688,14 @@ def run_loso(
         per_per_fold.append(fold_per)
         wer_per_fold.append(fold_wer)
         n_samples_per_fold.append(fold_n)
+        completed_folds[spk] = {
+            'per': fold_per,
+            'wer': fold_wer,
+            'n_samples': fold_n,
+            'checkpoint': str(ckpt_cb.best_model_path) if ckpt_cb.best_model_path else str(ckpt_dir / 'last.ckpt'),
+            'results_dir': str(results_dir),
+        }
+        _write_progress()
         print(f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}")
 
         # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
@@ -1659,12 +1748,9 @@ def run_loso(
     }
 
     # Save aggregated LOSO summary to results/{base_run_name}_loso_summary.json (I3)
-    import json as _json
-    summary_dir = get_project_root() / "results"
-    summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / f"{base_run_name}_loso_summary.json"
-    with open(summary_path, 'w') as _sf:
-        _json.dump(loso_summary, _sf, indent=2)
+    with open(summary_path, 'w', encoding='utf-8') as _sf:
+        json.dump(loso_summary, _sf, indent=2)
     print(f"💾 LOSO summary saved to {summary_path}")
 
     return loso_summary
@@ -1683,6 +1769,8 @@ def main() -> None:
                         help='Ablation mode (default: full)')
     parser.add_argument('--loso',                action='store_true',
                         help='Run Leave-One-Speaker-Out cross-validation')
+    parser.add_argument('--resume-loso', '--resume_loso', dest='resume_loso', action='store_true',
+                        help='Resume LOSO from progress/checkpoints when available')
     parser.add_argument('--max_epochs',          type=int, help='Override max_epochs')
     parser.add_argument('--limit_train_batches', type=int,
                         help='Limit batches per epoch (smoke test)')
@@ -1707,7 +1795,7 @@ def main() -> None:
             sampling_rate=config.data.sampling_rate,
             max_audio_length=config.data.max_audio_length,
         )
-        run_loso(config, dataset)
+        run_loso(config, dataset, resume=args.resume_loso)
     else:
         train(config, limit_train_batches=args.limit_train_batches)
 

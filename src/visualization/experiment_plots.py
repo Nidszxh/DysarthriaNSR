@@ -599,6 +599,422 @@ def plot_experiment_comparison(
 
 
 # ---------------------------------------------------------------------------
+# 7. Neural vs Constrained PER (single run)
+# ---------------------------------------------------------------------------
+
+def plot_neural_vs_constrained(
+    symbolic_impact: Dict[str, float],
+    save_path: Path,
+) -> Path:
+    """
+    Paired bar chart: Neural PER vs Constrained PER with a delta annotation.
+
+    Args:
+        symbolic_impact:  Dict with keys ``per_neural``, ``per_constrained``,
+                          ``delta_per``.  All values are floats.
+        save_path:        Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not symbolic_impact:
+        warnings.warn("plot_neural_vs_constrained: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    per_neural = float(symbolic_impact.get("per_neural", 0.0))
+    per_const  = float(symbolic_impact.get("per_constrained", 0.0))
+    delta      = float(symbolic_impact.get("delta_per", per_const - per_neural))
+
+    labels  = ["Neural\n(HuBERT only)", "Constrained\n(Neuro-Symbolic)"]
+    values  = [per_neural, per_const]
+    colours = [_COLOUR_CONTROL, _COLOUR_DYSARTHRIC]
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE_SINGLE)
+    bars = ax.bar(labels, values, color=colours, edgecolor="white",
+                  linewidth=0.6, zorder=3, width=0.45)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.005,
+            f"{val:.3f}",
+            ha="center", va="bottom", fontsize=10, fontweight="bold",
+        )
+
+    sign      = "+" if delta >= 0 else ""
+    direction = "↑ worse" if delta > 0 else "↓ better"
+    ax.annotate(
+        "",
+        xy=(1, per_const), xycoords=("data", "data"),
+        xytext=(0, per_neural), textcoords=("data", "data"),
+        arrowprops=dict(arrowstyle="<->", color="dimgrey", lw=1.2),
+    )
+    ax.text(
+        1.35, (per_neural + per_const) / 2,
+        f"Δ = {sign}{delta:.3f}\n({direction})",
+        ha="left", va="center", fontsize=8, color="dimgrey",
+    )
+
+    ax.set_ylabel("Phoneme Error Rate (PER)")
+    ax.set_title("Neural vs Constrained PER")
+    ax.set_ylim(0, max(values) * 1.30)
+    ax.yaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
+# 7b. Neural vs Constrained PER — multi-run ablation comparison
+# ---------------------------------------------------------------------------
+
+def plot_neural_vs_constrained_comparison(
+    results: Dict[str, Dict],
+    save_path: Path,
+) -> Path:
+    """
+    Grouped bar chart: Neural PER vs Constrained PER per run.
+
+    Ideal for comparing the baseline run against ablations such as
+    ``neural_only`` and ``no_constraint_matrix``.  The delta (Δ) is annotated
+    above each run's bar group.
+
+    Args:
+        results:    Dict mapping run name → parsed ``evaluation_results.json``.
+        save_path:  Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not results:
+        warnings.warn("plot_neural_vs_constrained_comparison: empty — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    run_names   = list(results.keys())
+    neural_vals = []
+    const_vals  = []
+
+    for run in run_names:
+        si = results[run].get("symbolic_impact", {})
+        neural_vals.append(float(si.get("per_neural",
+                                        results[run].get("avg_per", 0.0))))
+        const_vals.append(float(si.get("per_constrained",
+                                       results[run].get("avg_per", 0.0))))
+
+    x     = np.arange(len(run_names))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE_WIDE)
+    bars_n = ax.bar(x - width / 2, neural_vals, width, label="Neural",
+                    color=_COLOUR_CONTROL, edgecolor="white", linewidth=0.6, zorder=3)
+    bars_c = ax.bar(x + width / 2, const_vals, width, label="Constrained",
+                    color=_COLOUR_DYSARTHRIC, edgecolor="white", linewidth=0.6, zorder=3)
+
+    all_vals = neural_vals + const_vals
+    top_val  = max(all_vals) if all_vals else 1.0
+    for bar, val in zip(list(bars_n) + list(bars_c), all_vals):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + top_val * 0.01,
+            f"{val:.3f}",
+            ha="center", va="bottom", fontsize=7,
+        )
+
+    # Δ annotations above each group
+    for idx, (n_val, c_val) in enumerate(zip(neural_vals, const_vals)):
+        delta = c_val - n_val
+        sign  = "+" if delta >= 0 else ""
+        ax.text(
+            x[idx], max(n_val, c_val) + top_val * 0.06,
+            f"Δ={sign}{delta:.3f}",
+            ha="center", va="bottom", fontsize=7.5,
+            color="dimgrey", style="italic",
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(run_names, rotation=20, ha="right")
+    ax.set_ylabel("Phoneme Error Rate (PER)")
+    ax.set_title("Neural vs Constrained PER — Ablation Comparison")
+    ax.set_ylim(0, top_val * 1.30)
+    ax.yaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
+# 8. Articulatory Accuracy (single run + multi-run comparison)
+# ---------------------------------------------------------------------------
+
+def plot_articulatory_accuracy(
+    articulatory_accuracy: Dict[str, float],
+    save_path: Path,
+) -> Path:
+    """
+    Horizontal bar chart: manner / place / voicing classification accuracy.
+
+    Args:
+        articulatory_accuracy:  Dict with keys ``manner``, ``place``, ``voice``.
+        save_path:              Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not articulatory_accuracy:
+        warnings.warn("plot_articulatory_accuracy: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    features = ["Manner", "Place", "Voicing"]
+    keys     = ["manner", "place", "voice"]
+    values   = [float(articulatory_accuracy.get(k, 0.0)) for k in keys]
+    colours  = sns.color_palette(_PALETTE, n_colors=3)
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE_SINGLE)
+    bars = ax.barh(features, values, color=colours, edgecolor="white",
+                   linewidth=0.6, zorder=3)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + 0.005,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.1%}",
+            ha="left", va="center", fontsize=9,
+        )
+
+    ax.set_xlabel("Classification Accuracy")
+    ax.set_title("Articulatory Feature Accuracy")
+    ax.set_xlim(0, 1.12)
+    ax.axvline(1.0, color="lightgrey", linestyle="--", linewidth=0.8)
+    ax.xaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+def plot_articulatory_accuracy_comparison(
+    results: Dict[str, Dict],
+    save_path: Path,
+) -> Path:
+    """
+    Grouped bar chart: manner / place / voicing accuracy across multiple runs.
+
+    Args:
+        results:    Dict mapping run name → parsed ``evaluation_results.json``.
+        save_path:  Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not results:
+        warnings.warn("plot_articulatory_accuracy_comparison: empty — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    run_names = list(results.keys())
+    features  = ["manner", "place", "voice"]
+    labels    = ["Manner", "Place", "Voicing"]
+
+    data: Dict[str, List[float]] = {feat: [] for feat in features}
+    for run in run_names:
+        aa = results[run].get("articulatory_accuracy", {})
+        for feat in features:
+            data[feat].append(float(aa.get(feat, 0.0)))
+
+    x       = np.arange(len(run_names))
+    width   = 0.22
+    offsets = [-width, 0.0, width]
+    colours = sns.color_palette(_PALETTE, n_colors=3)
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE_WIDE)
+
+    for feat, label, offset, colour in zip(features, labels, offsets, colours):
+        vals = data[feat]
+        bars = ax.bar(x + offset, vals, width, label=label, color=colour,
+                      edgecolor="white", linewidth=0.5, zorder=3)
+        for bar, val in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.005,
+                f"{val:.1%}",
+                ha="center", va="bottom", fontsize=6.5, rotation=45,
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(run_names, rotation=20, ha="right")
+    ax.set_ylabel("Classification Accuracy")
+    ax.set_title("Articulatory Feature Accuracy — Ablation Comparison")
+    ax.set_ylim(0, 1.20)
+    ax.axhline(1.0, color="lightgrey", linestyle="--", linewidth=0.8)
+    ax.yaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, loc="lower right")
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
+# 9. PER by Sequence Length
+# ---------------------------------------------------------------------------
+
+def plot_by_length(
+    by_length: Dict[str, Dict[str, Dict]],
+    save_path: Path,
+) -> Path:
+    """
+    Line plot of PER by utterance length bucket — dysarthric vs control cohorts.
+
+    Args:
+        by_length:   Dict ``{cohort: {bucket: {mean_per, n_samples}}}``.
+                     Expected buckets: ``"0-5"``, ``"6-10"``, ``"11-20"``, ``"21+"``.
+        save_path:   Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not by_length:
+        warnings.warn("plot_by_length: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    def _bucket_sort_key(bucket_label: str) -> int:
+        """Return the lower bound integer for sorting."""
+        return int(bucket_label.split("-")[0].replace("+", "0"))
+
+    cohort_colours = {
+        "dysarthric": _COLOUR_DYSARTHRIC,
+        "control":    _COLOUR_CONTROL,
+    }
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE_WIDE)
+
+    for cohort, buckets in by_length.items():
+        if not buckets:
+            continue
+        sorted_buckets = sorted(buckets.items(), key=lambda kv: _bucket_sort_key(kv[0]))
+        bucket_labels  = [b for b, _ in sorted_buckets]
+        pers           = [float(v.get("mean_per", 0.0)) for _, v in sorted_buckets]
+        ns             = [int(v.get("n_samples", 0)) for _, v in sorted_buckets]
+        colour         = cohort_colours.get(cohort.lower(), "dimgrey")
+        x_pos          = np.arange(len(bucket_labels))
+
+        ax.plot(x_pos, pers, marker="o", linewidth=1.8, markersize=6,
+                color=colour, label=cohort.capitalize(), zorder=3)
+
+        for xi, per, n in zip(x_pos, pers, ns):
+            ax.annotate(
+                f"{per:.2f}\n(n={n})",
+                xy=(xi, per),
+                textcoords="offset points", xytext=(3, 6),
+                fontsize=6.5, color=colour,
+            )
+
+    # Use bucket labels from the last cohort that had data
+    ax.set_xticks(np.arange(len(bucket_labels)))
+    ax.set_xticklabels(bucket_labels)
+    ax.set_xlabel("Utterance Length (phoneme count)")
+    ax.set_ylabel("Mean PER")
+    ax.set_title("PER by Sequence Length — Dysarthric vs Control")
+    ax.legend(frameon=False)
+    ax.yaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
+# 10. Per-Phoneme PER
+# ---------------------------------------------------------------------------
+
+def plot_phoneme_per(
+    per_phoneme: Dict[str, float],
+    save_path: Path,
+    top_n: int = 40,
+) -> Path:
+    """
+    Horizontal bar chart of per-phoneme PER, sorted descending (hardest first).
+
+    Bars are colour-coded by difficulty tier:
+      * Red   — PER ≥ 0.70 (high error)
+      * Orange — PER 0.40–0.69 (medium)
+      * Green — PER < 0.40 (low error)
+
+    Args:
+        per_phoneme:  Dict mapping ARPABET phoneme string → PER float.
+        save_path:    Destination PNG path.
+        top_n:        Maximum phonemes to show, sorted by PER descending (default 40).
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    _apply_style()
+
+    if not per_phoneme:
+        warnings.warn("plot_phoneme_per: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    sorted_items = sorted(
+        per_phoneme.items(),
+        key=lambda kv: float(kv[1]["per"]) if isinstance(kv[1], dict) else float(kv[1]),
+        reverse=True,
+    )[:top_n]
+    phonemes = [p for p, _ in sorted_items]
+    values   = [
+        float(v["per"]) if isinstance(v, dict) else float(v)
+        for _, v in sorted_items
+    ]
+
+    colours = []
+    for v in values:
+        if v >= 0.70:
+            colours.append("#d62728")   # red
+        elif v >= 0.40:
+            colours.append("#ff7f0e")   # orange
+        else:
+            colours.append("#2ca02c")   # green
+
+    fig, ax = plt.subplots(figsize=(6.5, max(4.0, 0.35 * len(phonemes) + 1.5)))
+    y_pos = np.arange(len(phonemes))
+
+    ax.barh(y_pos, values, color=colours, edgecolor="white", linewidth=0.5, zorder=3)
+
+    for idx, val in enumerate(values):
+        ax.text(val + 0.008, y_pos[idx], f"{val:.2f}",
+                va="center", ha="left", fontsize=6.5)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(phonemes, fontsize=8)
+    ax.set_xlabel("Phoneme Error Rate (PER)")
+    ax.set_title(f"Per-Phoneme PER  (top {len(phonemes)} hardest)")
+    ax.set_xlim(0, 1.15)
+    ax.xaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+
+    legend_handles = [
+        mpatches.Patch(color="#d62728", label="High  (≥ 0.70)"),
+        mpatches.Patch(color="#ff7f0e", label="Medium (0.40 – 0.69)"),
+        mpatches.Patch(color="#2ca02c", label="Low    (< 0.40)"),
+    ]
+    ax.legend(handles=legend_handles, frameon=False, fontsize=8, loc="lower right")
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
+# ---------------------------------------------------------------------------
 # Master entry point
 # ---------------------------------------------------------------------------
 
@@ -609,6 +1025,7 @@ def generate_all_plots(
     save_dir: Path,
     severity_map: Optional[Dict[str, float]] = None,
     comparison_results: Optional[Dict[str, Dict]] = None,
+    per_phoneme_per: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Path]:
     """
     Generate the full diagnostic visualization suite for one experiment run.
@@ -620,9 +1037,12 @@ def generate_all_plots(
         save_dir:             Directory where figures are saved.
         severity_map:         ``TORGO_SEVERITY_MAP`` dict.  Defaults to importing
                               from ``src.utils.config`` when ``None``.
-        comparison_results:   Optional dict of ``{run_name: eval_results}`` for the
-                              experiment comparison plot.  When supplied, the current
-                              run is automatically included.
+        comparison_results:   Optional dict of ``{run_name: eval_results}`` for
+                              multi-run comparison plots.  The primary run is
+                              automatically merged in as the first entry.
+        per_phoneme_per:      Optional dict mapping ARPABET phoneme → PER float,
+                              loaded from ``per_phoneme_per.json``.  When provided,
+                              a per-phoneme bar chart is generated.
 
     Returns:
         Dict mapping plot name → saved ``Path``.
@@ -641,8 +1061,11 @@ def generate_all_plots(
     if explanations and "utterances" in explanations:
         utterances = explanations["utterances"]
 
-    per_speaker: Dict = eval_results.get("per_speaker", {})
-    error_counts: Dict = eval_results.get("error_analysis", {}).get("error_counts", {})
+    per_speaker: Dict   = eval_results.get("per_speaker", {})
+    error_counts: Dict  = eval_results.get("error_analysis", {}).get("error_counts", {})
+    symbolic_impact     = eval_results.get("symbolic_impact", {})
+    articulatory_acc    = eval_results.get("articulatory_accuracy", {})
+    by_length           = eval_results.get("by_length", {})
 
     saved: Dict[str, Path] = {}
 
@@ -652,7 +1075,7 @@ def generate_all_plots(
     if error_counts:
         p = plot_error_distribution(error_counts, save_dir / "error_distribution.png")
         saved["error_distribution"] = p
-        print(f"  ✓ error_distribution       → {p.name}")
+        print(f"  ✓ error_distribution           → {p.name}")
     else:
         print("  ⚠  error_distribution skipped — error_counts missing")
 
@@ -663,7 +1086,7 @@ def generate_all_plots(
         p = plot_per_by_speaker(per_speaker, save_dir / "per_by_speaker.png",
                                 severity_map=severity_map)
         saved["per_by_speaker"] = p
-        print(f"  ✓ per_by_speaker            → {p.name}")
+        print(f"  ✓ per_by_speaker               → {p.name}")
     else:
         print("  ⚠  per_by_speaker skipped — per_speaker missing")
 
@@ -673,7 +1096,7 @@ def generate_all_plots(
     if per_speaker and severity_map:
         p = plot_severity_vs_per(per_speaker, severity_map, save_dir / "severity_vs_per.png")
         saved["severity_vs_per"] = p
-        print(f"  ✓ severity_vs_per           → {p.name}")
+        print(f"  ✓ severity_vs_per              → {p.name}")
     else:
         print("  ⚠  severity_vs_per skipped — per_speaker or severity_map missing")
 
@@ -682,39 +1105,106 @@ def generate_all_plots(
     # ------------------------------------------------------------------
     p = plot_uncertainty_vs_per(utterances, save_dir / "uncertainty_vs_per.png")
     saved["uncertainty_vs_per"] = p
-    print(f"  ✓ uncertainty_vs_per        → {p.name}")
+    print(f"  ✓ uncertainty_vs_per           → {p.name}")
 
     # ------------------------------------------------------------------
     # 5. Uncertainty Distribution
     # ------------------------------------------------------------------
-    p = plot_uncertainty_distribution(utterances, severity_map or {}, save_dir / "uncertainty_distribution.png")
+    p = plot_uncertainty_distribution(utterances, severity_map or {},
+                                      save_dir / "uncertainty_distribution.png")
     saved["uncertainty_distribution"] = p
-    print(f"  ✓ uncertainty_distribution  → {p.name}")
+    print(f"  ✓ uncertainty_distribution     → {p.name}")
 
     # ------------------------------------------------------------------
     # 5b. Rule-Pair Confusion
     # ------------------------------------------------------------------
     rule_pair_confusion: Dict = eval_results.get("rule_pair_confusion", {})
     if rule_pair_confusion:
-        p = plot_rule_pair_confusion(rule_pair_confusion, save_dir / "rule_pair_confusion.png")
+        p = plot_rule_pair_confusion(rule_pair_confusion,
+                                     save_dir / "rule_pair_confusion.png")
         saved["rule_pair_confusion"] = p
-        print(f"  ✓ rule_pair_confusion       → {p.name}")
+        print(f"  ✓ rule_pair_confusion          → {p.name}")
     else:
         print("  ⚠  rule_pair_confusion skipped — not present in eval_results")
 
     # ------------------------------------------------------------------
-    # 6. Experiment Comparison
+    # 6. Experiment Comparison (macro-PER bar chart, multi-run)
     # ------------------------------------------------------------------
     if comparison_results is not None:
         merged = {run_name: eval_results, **comparison_results}
         p = plot_experiment_comparison(merged, save_dir / "experiment_comparison.png")
         saved["experiment_comparison"] = p
-        print(f"  ✓ experiment_comparison     → {p.name}")
+        print(f"  ✓ experiment_comparison        → {p.name}")
     else:
-        # Emit single-bar comparison as baseline reference
-        p = plot_experiment_comparison({run_name: eval_results}, save_dir / "experiment_comparison.png")
+        p = plot_experiment_comparison(
+            {run_name: eval_results}, save_dir / "experiment_comparison.png"
+        )
         saved["experiment_comparison"] = p
-        print(f"  ✓ experiment_comparison     → {p.name}  (single run)")
+        print(f"  ✓ experiment_comparison        → {p.name}  (single run)")
+
+    # ------------------------------------------------------------------
+    # 7. Neural vs Constrained PER (single run)
+    # ------------------------------------------------------------------
+    if symbolic_impact:
+        p = plot_neural_vs_constrained(symbolic_impact,
+                                       save_dir / "neural_vs_constrained.png")
+        saved["neural_vs_constrained"] = p
+        print(f"  ✓ neural_vs_constrained        → {p.name}")
+    else:
+        print("  ⚠  neural_vs_constrained skipped — symbolic_impact missing")
+
+    # ------------------------------------------------------------------
+    # 7b. Neural vs Constrained PER — multi-run (when comparisons provided)
+    # ------------------------------------------------------------------
+    if comparison_results is not None:
+        merged_si = {run_name: eval_results, **comparison_results}
+        p = plot_neural_vs_constrained_comparison(
+            merged_si, save_dir / "neural_vs_constrained_comparison.png"
+        )
+        saved["neural_vs_constrained_comparison"] = p
+        print(f"  ✓ neural_vs_constrained_cmp    → {p.name}")
+
+    # ------------------------------------------------------------------
+    # 8. Articulatory Accuracy (single run)
+    # ------------------------------------------------------------------
+    if articulatory_acc:
+        p = plot_articulatory_accuracy(articulatory_acc,
+                                       save_dir / "articulatory_accuracy.png")
+        saved["articulatory_accuracy"] = p
+        print(f"  ✓ articulatory_accuracy        → {p.name}")
+    else:
+        print("  ⚠  articulatory_accuracy skipped — articulatory_accuracy missing")
+
+    # ------------------------------------------------------------------
+    # 8b. Articulatory Accuracy — multi-run (when comparisons provided)
+    # ------------------------------------------------------------------
+    if comparison_results is not None:
+        merged_aa = {run_name: eval_results, **comparison_results}
+        p = plot_articulatory_accuracy_comparison(
+            merged_aa, save_dir / "articulatory_accuracy_comparison.png"
+        )
+        saved["articulatory_accuracy_comparison"] = p
+        print(f"  ✓ articulatory_accuracy_cmp    → {p.name}")
+
+    # ------------------------------------------------------------------
+    # 9. PER by Sequence Length
+    # ------------------------------------------------------------------
+    if by_length:
+        p = plot_by_length(by_length, save_dir / "per_by_length.png")
+        saved["per_by_length"] = p
+        print(f"  ✓ per_by_length                → {p.name}")
+    else:
+        print("  ⚠  per_by_length skipped — by_length missing")
+
+    # ------------------------------------------------------------------
+    # 10. Per-Phoneme PER
+    # ------------------------------------------------------------------
+    if per_phoneme_per:
+        p = plot_phoneme_per(per_phoneme_per, save_dir / "per_phoneme_per.png")
+        saved["per_phoneme_per"] = p
+        print(f"  ✓ per_phoneme_per              → {p.name}")
+    else:
+        print("  ⚠  per_phoneme_per skipped — per_phoneme_per.json not loaded")
 
     print(f"\n  All figures saved to: {save_dir}")
     return saved

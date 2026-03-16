@@ -28,6 +28,9 @@ With explainability + uncertainty:
 
 LOSO cross-validation:
     python run_pipeline.py --run-name loso_v1 --loso --skip-eval
+
+Warm feature cache only:
+    python run_pipeline.py --run-name cache_warmup --warm-cache --warm-cache-only
 """
 
 from __future__ import annotations
@@ -41,15 +44,14 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-# ---------------------------------------------------------------------------
 # Project-root on sys.path (supports running from any CWD)
-# ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from src.utils.config import Config, get_default_config, get_project_root
 from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+from src.data.warm_feature_cache import warm_feature_cache
 from src.models.model import NeuroSymbolicASR
 from train import (
     DysarthriaASRLightning,
@@ -59,9 +61,7 @@ from train import (
 )
 from evaluate import evaluate_model, BigramLMScorer
 
-# ---------------------------------------------------------------------------
 # Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -70,9 +70,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Internal helpers
-# ---------------------------------------------------------------------------
 
 def _load_dataset(config: Config) -> TorgoNeuroSymbolicDataset:
     """Instantiate TorgoNeuroSymbolicDataset from config paths."""
@@ -181,13 +179,12 @@ def _load_lightning_model(
     return lightning_model
 
 
-# ---------------------------------------------------------------------------
 # Pipeline stages
-# ---------------------------------------------------------------------------
 
 def run_training(
     config: Config,
     loso: bool,
+    resume_loso: bool,
     limit_train_batches: Optional[int],
 ) -> Tuple[Optional[DysarthriaASRLightning], Optional[TorgoNeuroSymbolicDataset]]:
     """
@@ -218,7 +215,7 @@ def run_training(
         log.info("=== LOSO mode — loading dataset ===")
         dataset = _load_dataset(config)
         log.info("=== Starting LOSO cross-validation ===")
-        loso_results = run_loso(config, dataset)
+        loso_results = run_loso(config, dataset, resume=resume_loso)
         log.info(
             "LOSO complete: mean PER = %.4f [95%% CI: %.4f – %.4f] | weighted PER = %.4f | mean WER = %.4f",
             loso_results["macro_avg_per"],
@@ -321,9 +318,7 @@ def run_evaluation(
     return results
 
 
-# ---------------------------------------------------------------------------
 # Top-level orchestrator
-# ---------------------------------------------------------------------------
 
 def run_auto(args: argparse.Namespace) -> None:
     """
@@ -397,7 +392,21 @@ def run_auto(args: argparse.Namespace) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
     config.save(results_dir / "config.yaml")
 
-    # ── 3. Training stage ────────────────────────────────────────────────────
+    # Optional feature-cache warm-up stage (safe speed optimization).
+    if args.warm_cache:
+        log.info("=== Warming feature cache ===")
+        warm_feature_cache(
+            config=config,
+            workers=args.warm_cache_workers,
+            batch_size=args.warm_cache_batch_size,
+            enable_disk_cache=not args.warm_cache_disable_disk,
+            enable_memory_cache=not args.warm_cache_disable_memory,
+        )
+        if args.warm_cache_only:
+            log.info("--warm-cache-only set; exiting after cache warm-up.")
+            return
+
+    # ── 3. Training stage 
     trained_model: Optional[DysarthriaASRLightning] = None
     dataset: Optional[TorgoNeuroSymbolicDataset] = None
 
@@ -405,6 +414,7 @@ def run_auto(args: argparse.Namespace) -> None:
         trained_model, dataset = run_training(
             config=config,
             loso=args.loso,
+            resume_loso=args.resume_loso,
             limit_train_batches=limit_train_batches,
         )
         # LOSO mode does its own per-fold evaluation; pipeline ends here.
@@ -414,7 +424,7 @@ def run_auto(args: argparse.Namespace) -> None:
     else:
         log.info("--skip-train set; skipping training stage.")
 
-    # ── 4. Evaluation stage ──────────────────────────────────────────────────
+    # ── 4. Evaluation stage 
     if args.skip_eval:
         log.info("--skip-eval set; skipping evaluation stage.")
         return
@@ -482,9 +492,7 @@ def run_auto(args: argparse.Namespace) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -493,7 +501,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Orchestration-level flags (owned by run_pipeline.py) ────────────────
+    # ── Orchestration-level flags (owned by run_pipeline.py) 
     orch = parser.add_argument_group("Orchestration")
     orch.add_argument(
         "--run-name",
@@ -549,6 +557,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fast smoke-test mode: forces max_epochs=1 and caps batches to 5 "
              "per epoch. Intended for CI / pre-commit sanity checks.",
     )
+    orch.add_argument(
+        "--warm-cache",
+        action="store_true",
+        default=False,
+        help="Warm data/processed/feature_cache before training/evaluation.",
+    )
+    orch.add_argument(
+        "--warm-cache-only",
+        action="store_true",
+        default=False,
+        help="Run cache warm-up stage and exit without train/eval.",
+    )
+    orch.add_argument(
+        "--warm-cache-workers",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Override DataLoader worker count for cache warm-up.",
+    )
+    orch.add_argument(
+        "--warm-cache-batch-size",
+        type=int,
+        default=1,
+        metavar="INT",
+        help="Warm-up batch size (recommended: 1).",
+    )
+    orch.add_argument(
+        "--warm-cache-disable-disk",
+        action="store_true",
+        default=False,
+        help="Disable writing cache files to disk during warm-up.",
+    )
+    orch.add_argument(
+        "--warm-cache-disable-memory",
+        action="store_true",
+        default=False,
+        help="Disable in-process memory cache during warm-up.",
+    )
 
     # ── Forwarded verbatim to train() / run_loso() ───────────────────────────
     train_grp = parser.add_argument_group(
@@ -570,6 +616,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run Leave-One-Speaker-Out cross-validation. "
              "Evaluation is performed per-fold inside run_loso(); "
              "the post-training evaluation stage is skipped.",
+    )
+    train_grp.add_argument(
+        "--resume-loso",
+        action="store_true",
+        default=False,
+        help="Resume LOSO from results/{run_name}_loso_progress.json and "
+             "checkpoints/{run_name}_loso_<speaker>/last.ckpt when present.",
     )
     train_grp.add_argument(
         "--max_epochs",
@@ -633,7 +686,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Parse CLI and execute the pipeline."""
     parser = _build_parser()
     args = parser.parse_args()
 
