@@ -1,0 +1,140 @@
+{
+  "D->T": {
+    "neural_count": 45,
+    "constrained_count": 42,
+    "delta": 3,
+    "rule_weight": 0.82
+  },
+  "S->T": {
+    "neural_count": 9,
+    "constrained_count": 7,
+    "delta": 2,
+    "rule_weight": 0.55
+  },
+  "B->P": {
+    "neural_count": 3,
+    "constrained_count": 4,
+    "delta": -1,
+    "rule_weight": 0.85
+  },
+  "G->D": {
+    "neural_count": 4,
+    "constrained_count": 5,
+    "delta": -1,
+    "rule_weight": 0.65
+  },
+  "NG->N": {
+    "neural_count": 20,
+    "constrained_count": 21,
+    "delta": -1,
+    "rule_weight": 0.6
+  },
+  "SH->S": {
+    "neural_count": 0,
+    "constrained_count": 1,
+    "delta": -1,
+    "rule_weight": 0.6
+  },
+  "R->W": {
+    "neural_count": 4,
+    "constrained_count": 5,
+    "delta": -1,
+    "rule_weight": 0.7
+  },
+  "DH->D": {
+    "neural_count": 2,
+    "constrained_count": 1,
+    "delta": 1,
+    "rule_weight": 0.58
+  },
+  "IY->IH": {
+    "neural_count": 11,
+    "constrained_count": 10,
+    "delta": 1,
+    "rule_weight": 0.45
+  },
+  "EY->EH": {
+    "neural_count": 4,
+    "constrained_count": 3,
+    "delta": 1,
+    "rule_weight": 0.42
+  },
+  "G->K": {
+    "neural_count": 3,
+    "constrained_count": 3,
+    "delta": 0,
+    "rule_weight": 0.8
+  },
+  "V->F": {
+    "neural_count": 2,
+    "constrained_count": 2,
+    "delta": 0,
+    "rule_weight": 0.75
+  },
+  "Z->S": {
+    "neural_count": 8,
+    "constrained_count": 8,
+    "delta": 0,
+    "rule_weight": 0.78
+  },
+  "ZH->SH": {
+    "neural_count": 0,
+    "constrained_count": 0,
+    "delta": 0,
+    "rule_weight": 0.7
+  },
+  "JH->CH": {
+    "neural_count": 1,
+    "constrained_count": 1,
+    "delta": 0,
+    "rule_weight": 0.72
+  },
+  "K->T": {
+    "neural_count": 15,
+    "constrained_count": 15,
+    "delta": 0,
+    "rule_weight": 0.65
+  },
+  "L->W": {
+    "neural_count": 12,
+    "constrained_count": 12,
+    "delta": 0,
+    "rule_weight": 0.6
+  },
+  "L->Y": {
+    "neural_count": 0,
+    "constrained_count": 0,
+    "delta": 0,
+    "rule_weight": 0.55
+  },
+  "Z->D": {
+    "neural_count": 2,
+    "constrained_count": 2,
+    "delta": 0,
+    "rule_weight": 0.55
+  },
+  "F->P": {
+    "neural_count": 2,
+    "constrained_count": 2,
+    "delta": 0,
+    "rule_weight": 0.5
+  },
+  "V->B": {
+    "neural_count": 1,
+    "constrained_count": 1,
+    "delta": 0,
+    "rule_weight": 0.5
+  },
+  "TH->T": {
+    "neural_count": 6,
+    "constrained_count": 6,
+    "delta": 0,
+    "rule_weight": 0.58
+  },
+  "UW->UH": {
+    "neural_count": 0,
+    "constrained_count": 0,
+    "delta": 0,
+    "rule_weight": 0.45
+  }
+}

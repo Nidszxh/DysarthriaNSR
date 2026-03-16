@@ -1,0 +1,580 @@
+{
+  "avg_per": 0.1346160397946928,
+  "wer": 0.12738467137787754,
+  "overall": {
+    "per_macro_speaker": 0.1346160397946928,
+    "per_sample_mean": 0.13848257564303046,
+    "wer": 0.12738467137787754,
+    "ci": [
+      0.07378838344218729,
+      0.20592541375955142
+    ],
+    "std": 0.2455477186994042,
+    "n_samples": 3548,
+    "n_speakers": 3
+  },
+  "symbolic_impact": {
+    "per_neural": 0.13848257564303046,
+    "per_constrained": 0.1346160397946928,
+    "delta_per": 0.0038665358483376544,
+    "paired_delta_constrained_minus_neural": {
+      "delta_mean": 0.0,
+      "ci_95_low": 0.0,
+      "ci_95_high": 0.0,
+      "p_value_two_sided": 1.0
+    },
+    "ci_95_delta_per": [
+      0.0,
+      0.0
+    ],
+    "p_value_neural_vs_constrained": 1.0
+  },
+  "articulatory_accuracy": {
+    "manner": 0.0,
+    "place": 0.0,
+    "voice": 0.0
+  },
+  "stats": {
+    "welch_t": -9.112970979530392,
+    "welch_p": 2.598591003868892e-19,
+    "wilcox_u": 871469.0,
+    "wilcox_p": 2.3678674439212945e-24,
+    "p_holm_corrected": [
+      2.598591003868892e-19,
+      4.735734887842589e-24
+    ],
+    "significant": true,
+    "pearson_r_sev_per": -0.7899075258643999,
+    "pearson_p_sev_per": 0.420256994633084,
+    "spearman_r_sev_per": -0.8660254037844387,
+    "spearman_p_sev_per": 0.3333333333333332,
+    "correlation_n_speakers": 3,
+    "correlation_valid": false,
+    "p_value_neural_vs_constrained": 1.0,
+    "ci_95_delta_per": [
+      0.0,
+      0.0
+    ]
+  },
+  "rule_impact": {
+    "total_activations": 0,
+    "activation_rate": 0.0,
+    "high_confidence_corrections": [],
+    "rule_frequency": {},
+    "top_rules": [],
+    "per_speaker_activations": {},
+    "avg_blend_weight": 0.0,
+    "avg_prediction_confidence": null,
+    "rule_precision_proxy": 0.0,
+    "rule_harm_rate_proxy": 0.0
+  },
+  "stratified": {
+    "dysarthric": {
+      "per_sample": 0.07378838344218729,
+      "per_speaker": 0.07378838344218729,
+      "ci": [
+        0.05898209317030633,
+        0.0899946049272397
+      ],
+      "n": 810
+    },
+    "control": {
+      "per_sample": 0.15762147107132962,
+      "per_speaker": 0.16502986797094557,
+      "ci": [
+        0.14813841360448896,
+        0.16655983995753332
+      ],
+      "n": 2738
+    }
+  },
+  "by_length": {
+    "dysarthric": {
+      "0-5": {
+        "mean_per": 0.06697845804988663,
+        "n_samples": 588
+      },
+      "6-10": {
+        "mean_per": 0.04296875,
+        "n_samples": 32
+      },
+      "11-20": {
+        "mean_per": 0.06014758237978052,
+        "n_samples": 50
+      },
+      "21+": {
+        "mean_per": 0.11430627239892388,
+        "n_samples": 140
+      }
+    },
+    "control": {
+      "0-5": {
+        "mean_per": 0.17271729957805906,
+        "n_samples": 1975
+      },
+      "6-10": {
+        "mean_per": 0.12441421012849585,
+        "n_samples": 63
+      },
+      "11-20": {
+        "mean_per": 0.10400158230243826,
+        "n_samples": 187
+      },
+      "21+": {
+        "mean_per": 0.12312773878749048,
+        "n_samples": 513
+      }
+    }
+  },
+  "by_severity": {
+    "normal": {
+      "mean_per": 0.16502986797094557,
+      "ci": [
+        0.12413432218233972,
+        0.20592541375955142
+      ],
+      "n_speakers": 2,
+      "speakers": [
+        "MC02",
+        "MC04"
+      ]
+    },
+    "mild": {
+      "mean_per": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "n_speakers": 0,
+      "speakers": []
+    },
+    "moderate": {
+      "mean_per": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "n_speakers": 0,
+      "speakers": []
+    },
+    "severe": {
+      "mean_per": 0.07378838344218729,
+      "ci": [
+        0.07378838344218729,
+        0.07378838344218729
+      ],
+      "n_speakers": 1,
+      "speakers": [
+        "M03"
+      ]
+    },
+    "profound": {
+      "mean_per": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "n_speakers": 0,
+      "speakers": []
+    }
+  },
+  "per_by_manner": {
+    "vowel": {
+      "per": 0.1337,
+      "n_ref": 11520,
+      "n_sub": 827,
+      "n_del": 713
+    },
+    "stop": {
+      "per": 0.1102,
+      "n_ref": 6844,
+      "n_sub": 314,
+      "n_del": 440
+    },
+    "diphthong": {
+      "per": 0.0888,
+      "n_ref": 878,
+      "n_sub": 55,
+      "n_del": 23
+    },
+    "fricative": {
+      "per": 0.08,
+      "n_ref": 5490,
+      "n_sub": 188,
+      "n_del": 251
+    },
+    "nasal": {
+      "per": 0.0695,
+      "n_ref": 2991,
+      "n_sub": 111,
+      "n_del": 97
+    },
+    "liquid": {
+      "per": 0.0684,
+      "n_ref": 3714,
+      "n_sub": 164,
+      "n_del": 90
+    },
+    "glide": {
+      "per": 0.0657,
+      "n_ref": 1156,
+      "n_sub": 18,
+      "n_del": 58
+    },
+    "affricate": {
+      "per": 0.0423,
+      "n_ref": 378,
+      "n_sub": 13,
+      "n_del": 3
+    }
+  },
+  "rule_pair_confusion": {
+    "B->P": {
+      "neural_count": 5,
+      "constrained_count": 5,
+      "delta": 0,
+      "rule_weight": 0.85
+    },
+    "D->T": {
+      "neural_count": 42,
+      "constrained_count": 42,
+      "delta": 0,
+      "rule_weight": 0.82
+    },
+    "G->K": {
+      "neural_count": 4,
+      "constrained_count": 4,
+      "delta": 0,
+      "rule_weight": 0.8
+    },
+    "V->F": {
+      "neural_count": 1,
+      "constrained_count": 1,
+      "delta": 0,
+      "rule_weight": 0.75
+    },
+    "Z->S": {
+      "neural_count": 2,
+      "constrained_count": 2,
+      "delta": 0,
+      "rule_weight": 0.78
+    },
+    "ZH->SH": {
+      "neural_count": 0,
+      "constrained_count": 0,
+      "delta": 0,
+      "rule_weight": 0.7
+    },
+    "JH->CH": {
+      "neural_count": 1,
+      "constrained_count": 1,
+      "delta": 0,
+      "rule_weight": 0.72
+    },
+    "K->T": {
+      "neural_count": 12,
+      "constrained_count": 12,
+      "delta": 0,
+      "rule_weight": 0.65
+    },
+    "G->D": {
+      "neural_count": 6,
+      "constrained_count": 6,
+      "delta": 0,
+      "rule_weight": 0.65
+    },
+    "NG->N": {
+      "neural_count": 14,
+      "constrained_count": 14,
+      "delta": 0,
+      "rule_weight": 0.6
+    },
+    "SH->S": {
+      "neural_count": 1,
+      "constrained_count": 1,
+      "delta": 0,
+      "rule_weight": 0.6
+    },
+    "R->W": {
+      "neural_count": 5,
+      "constrained_count": 5,
+      "delta": 0,
+      "rule_weight": 0.7
+    },
+    "L->W": {
+      "neural_count": 15,
+      "constrained_count": 15,
+      "delta": 0,
+      "rule_weight": 0.6
+    },
+    "L->Y": {
+      "neural_count": 0,
+      "constrained_count": 0,
+      "delta": 0,
+      "rule_weight": 0.55
+    },
+    "S->T": {
+      "neural_count": 9,
+      "constrained_count": 9,
+      "delta": 0,
+      "rule_weight": 0.55
+    },
+    "Z->D": {
+      "neural_count": 1,
+      "constrained_count": 1,
+      "delta": 0,
+      "rule_weight": 0.55
+    },
+    "F->P": {
+      "neural_count": 0,
+      "constrained_count": 0,
+      "delta": 0,
+      "rule_weight": 0.5
+    },
+    "V->B": {
+      "neural_count": 2,
+      "constrained_count": 2,
+      "delta": 0,
+      "rule_weight": 0.5
+    },
+    "TH->T": {
+      "neural_count": 2,
+      "constrained_count": 2,
+      "delta": 0,
+      "rule_weight": 0.58
+    },
+    "DH->D": {
+      "neural_count": 3,
+      "constrained_count": 3,
+      "delta": 0,
+      "rule_weight": 0.58
+    },
+    "IY->IH": {
+      "neural_count": 4,
+      "constrained_count": 4,
+      "delta": 0,
+      "rule_weight": 0.45
+    },
+    "UW->UH": {
+      "neural_count": 0,
+      "constrained_count": 0,
+      "delta": 0,
+      "rule_weight": 0.45
+    },
+    "EY->EH": {
+      "neural_count": 2,
+      "constrained_count": 2,
+      "delta": 0,
+      "rule_weight": 0.42
+    }
+  },
+  "constraint_precision": {
+    "helpful_rate": 0.0,
+    "neutral_rate": 1.0,
+    "harmful_rate": 0.0,
+    "rule_precision": 0.0,
+    "n_utterances": 3548
+  },
+  "per_speaker": {
+    "MC02": {
+      "per": 0.20592541375955142,
+      "ci": [
+        0.19050713280778286,
+        0.22193842343545794
+      ],
+      "std": 0.2772982824359198,
+      "n_samples": 1121,
+      "status": 0
+    },
+    "MC04": {
+      "per": 0.12413432218233972,
+      "ci": [
+        0.1137994804766474,
+        0.13501953828647958
+      ],
+      "std": 0.2199252838215118,
+      "n_samples": 1617,
+      "status": 0
+    },
+    "M03": {
+      "per": 0.07378838344218729,
+      "ci": [
+        0.06152191620952858,
+        0.09125024850537337
+      ],
+      "std": 0.22413579692056523,
+      "n_samples": 810,
+      "status": 1
+    }
+  },
+  "error_analysis": {
+    "error_counts": {
+      "substitutions": 1690,
+      "deletions": 835,
+      "insertions": 1675,
+      "correct": 29606
+    },
+    "common_confusions": [
+      [
+        [
+          "IH",
+          "AH"
+        ],
+        74
+      ],
+      [
+        [
+          "AE",
+          "AH"
+        ],
+        53
+      ],
+      [
+        [
+          "EH",
+          "IH"
+        ],
+        52
+      ],
+      [
+        [
+          "IH",
+          "IY"
+        ],
+        46
+      ],
+      [
+        [
+          "R",
+          "ER"
+        ],
+        43
+      ],
+      [
+        [
+          "D",
+          "T"
+        ],
+        42
+      ],
+      [
+        [
+          "AH",
+          "IH"
+        ],
+        40
+      ],
+      [
+        [
+          "ER",
+          "R"
+        ],
+        37
+      ],
+      [
+        [
+          "AA",
+          "AO"
+        ],
+        37
+      ],
+      [
+        [
+          "EY",
+          "IY"
+        ],
+        30
+      ],
+      [
+        [
+          "AO",
+          "AA"
+        ],
+        30
+      ],
+      [
+        [
+          "P",
+          "T"
+        ],
+        26
+      ],
+      [
+        [
+          "EH",
+          "AE"
+        ],
+        23
+      ],
+      [
+        [
+          "AE",
+          "EH"
+        ],
+        22
+      ],
+      [
+        [
+          "IH",
+          "UW"
+        ],
+        21
+      ],
+      [
+        [
+          "S",
+          "SH"
+        ],
+        21
+      ],
+      [
+        [
+          "L",
+          "OW"
+        ],
+        21
+      ],
+      [
+        [
+          "T",
+          "D"
+        ],
+        20
+      ],
+      [
+        [
+          "N",
+          "M"
+        ],
+        19
+      ],
+      [
+        [
+          "OW",
+          "AH"
+        ],
+        19
+      ]
+    ],
+    "deletion_phonemes": [
+      [
+        null,
+        835
+      ]
+    ],
+    "insertion_phonemes": [
+      [
+        null,
+        1675
+      ]
+    ]
+  },
+  "uncertainty": {
+    "computed": false,
+    "n_samples": null,
+    "entropy_mean": null,
+    "entropy_std": null,
+    "confidence_mean": null,
+    "per_utterance": []
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "vowel": {
+    "per": 0.1337,
+    "n_ref": 11520,
+    "n_sub": 827,
+    "n_del": 713
+  },
+  "stop": {
+    "per": 0.1102,
+    "n_ref": 6844,
+    "n_sub": 314,
+    "n_del": 440
+  },
+  "diphthong": {
+    "per": 0.0888,
+    "n_ref": 878,
+    "n_sub": 55,
+    "n_del": 23
+  },
+  "fricative": {
+    "per": 0.08,
+    "n_ref": 5490,
+    "n_sub": 188,
+    "n_del": 251
+  },
+  "nasal": {
+    "per": 0.0695,
+    "n_ref": 2991,
+    "n_sub": 111,
+    "n_del": 97
+  },
+  "liquid": {
+    "per": 0.0684,
+    "n_ref": 3714,
+    "n_sub": 164,
+    "n_del": 90
+  },
+  "glide": {
+    "per": 0.0657,
+    "n_ref": 1156,
+    "n_sub": 18,
+    "n_del": 58
+  },
+  "affricate": {
+    "per": 0.0423,
+    "n_ref": 378,
+    "n_sub": 13,
+    "n_del": 3
+  }
+}
