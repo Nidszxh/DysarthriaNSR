@@ -3,6 +3,11 @@ src/utils/sequence_utils.py — Shared sequence-alignment utilities.
 
 Extracted from train.py and evaluate.py (Q1 deduplication fix) to provide
 a single canonical implementation that both modules import.
+
+# REFACTOR LOG
+# [PERF] Vectorized -100 tail propagation: replaced Python for-loop over batch
+#        items with a single broadcasted tensor mask operation — eliminates O(B)
+#        sequential Python iterations, merges into one CUDA kernel launch.
 """
 
 import torch
@@ -36,14 +41,21 @@ def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torc
     ).long().clamp(0, time_steps_labels - 1)
     aligned = labels[:, indices]
 
-    # Preserve ignore-index tail semantics when source labels contain -100.
+    # [PERF] Vectorized -100 tail propagation.
+    # Previous: Python for-loop over batch items (O(B) sequential tensor ops).
+    # Now: single broadcasted comparison — one CUDA kernel, no host-side loop.
     pad_mask = (labels == -100)
     if pad_mask.any():
+        # Fraction of -100 tokens per sample in the source label sequence [B]
         pad_fraction = pad_mask.float().mean(dim=1)
+        # Number of trailing positions to fill with -100 in the aligned tensor [B]
         n_pad = (pad_fraction * time_steps_logits).long()
-        for b in range(batch_size):
-            n = int(n_pad[b].item())
-            if n > 0:
-                aligned[b, time_steps_logits - n:] = -100
+        # Build a boolean mask: True where position >= (T - n_pad[b]) [B, T]
+        positions = torch.arange(
+            time_steps_logits, device=labels.device
+        ).unsqueeze(0)  # [1, T]
+        cutoffs = (time_steps_logits - n_pad).unsqueeze(1)  # [B, 1]
+        tail_mask = positions >= cutoffs  # [B, T] – broadcasted, no Python loop
+        aligned = aligned.masked_fill(tail_mask, -100)
 
     return aligned

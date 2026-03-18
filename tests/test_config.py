@@ -19,7 +19,7 @@ class TestConfigDefaults:
 
     def test_default_batch_size(self):
         cfg = Config()
-        assert cfg.training.batch_size == 8
+        assert cfg.training.batch_size == 12
 
     def test_default_learning_rate(self):
         cfg = Config()
@@ -35,6 +35,10 @@ class TestConfigDefaults:
         # The blank index is implicit in CTC loss; confirm PAD=1 and model expects [0,1,2,...]
         # Vocab offset starts at 3 for phonemes
         assert cfg.training.batch_size > 0  # sanity
+
+    def test_default_num_phonemes_includes_special_tokens(self):
+        cfg = Config()
+        assert cfg.model.num_phonemes == 47
 
     def test_symbolic_min_confidence(self):
         """C5 fix: min_rule_confidence should be 0.05 (lowered from 0.1)."""

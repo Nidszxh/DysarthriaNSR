@@ -1,5 +1,5 @@
 """
-Unit tests for the data collator.
+Unit tests for the data collator and dataloader helpers.
 
 Tests verify:
 - Label padding uses -100 sentinel (never 0 or 1)
@@ -8,9 +8,10 @@ Tests verify:
 - Articulatory labels are padded with -100
 """
 import pytest
+import pandas as pd
 import torch
 
-from src.data.dataloader import NeuroSymbolicCollator
+from src.data.dataloader import NeuroSymbolicCollator, _compute_sample_weights
 
 
 def _make_sample(audio_len: int, label_len: int, speaker: str = "M01", is_dysarthric: int = 1):
@@ -114,3 +115,28 @@ class TestNeuroSymbolicCollator:
         batch = self.collator(samples)
         assert batch["input_values"].shape[0] == 1
         assert batch["labels"].shape[0] == 1
+
+
+class TestSampleWeighting:
+    def test_compute_sample_weights_prefers_speaker_balancing(self):
+        df = pd.DataFrame(
+            {
+                "speaker": ["M01", "M01", "F01"],
+                "label": [1, 1, 0],
+            }
+        )
+
+        weights = _compute_sample_weights(df)
+
+        assert weights == pytest.approx([0.5, 0.5, 1.0])
+
+    def test_compute_sample_weights_falls_back_to_label_balancing(self):
+        df = pd.DataFrame(
+            {
+                "label": [1, 1, 0],
+            }
+        )
+
+        weights = _compute_sample_weights(df)
+
+        assert weights == pytest.approx([0.5, 0.5, 1.0])

@@ -3,14 +3,34 @@ Training Pipeline for Neuro-Symbolic Dysarthric Speech Recognition
 
 Orchestrates model training using PyTorch Lightning with multi-task learning,
 symbolic constraints, and comprehensive evaluation metrics.
+
+# REFACTOR LOG
+# [CLEAN] Added module-level logger = logging.getLogger(__name__); replaced
+#         print() calls in train(), _save_learning_curve(), and run_loso() with
+#         logger.info() / logger.warning() for structured log control.
+# [REPRO] Added _seed_worker() DataLoader worker_init_fn so each worker's
+#         NumPy / Python random states are seeded deterministically from the
+#         Lightning global seed, making augmentation reproducible across restarts.
+# [CONFIG] Extracted LOSO bootstrap iterations into LOSO_BOOTSTRAP_SAMPLES constant.
+# [CLEAN]  Moved matplotlib import to module level (was inside _save_learning_curve
+#          on every call, which is fragile if the backend changes mid-session).
 """
 
+import logging
+import os
 import sys
 from collections import defaultdict
 import warnings
 import json
+import time
+import re
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use('Agg')   # [CLEAN] Backend set at module level before any pyplot import
+import matplotlib.pyplot as plt
 
 import mlflow
 import numpy as np
@@ -29,7 +49,6 @@ sys.path.insert(2, str(project_root / "src"))
 from src.utils.config import Config, get_default_config, get_project_root, get_speaker_severity
 from src.utils.sequence_utils import align_labels_to_logits
 from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
-import os
 from src.models.model import NeuroSymbolicASR
 from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss
 
@@ -37,6 +56,47 @@ from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, Symbolic
 from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
 
 warnings.filterwarnings('ignore')
+
+logger = logging.getLogger(__name__)
+
+# [CONFIG] Named constant for LOSO bootstrap iterations — previously bare literal 2000.
+# Controls width of the 95% CI reported after LOSO-CV: higher = tighter CI, slower.
+LOSO_BOOTSTRAP_SAMPLES: int = 2000
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed each DataLoader worker deterministically from the Lightning global seed.
+
+    Called automatically by DataLoader on worker process start when set as
+    worker_init_fn.  Ensures augmentation and sampling are reproducible across
+    restarts and folds — important for multi-run LOSO-CV comparisons.
+    """
+    # [REPRO] torch.initial_seed() returns the initial seed set by pl.seed_everything();
+    # adding worker_id ensures distinct (but deterministic) sequences across workers.
+    import numpy as np  # noqa: PLC0415  (local import avoids top-level NumPy fork hazard)
+    import random       # noqa: PLC0415
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed + worker_id)
+    random.seed(worker_seed + worker_id)
+
+
+def _get_batch_severity(batch: Dict, device: torch.device) -> torch.Tensor:
+    """Return per-sample severity scores on the requested device.
+
+    Uses speaker IDs when available (continuous severity map), otherwise
+    falls back to binary status mapping 0->0.0, 1->5.0.
+    """
+    speakers = batch.get('speakers', [])
+    status = batch['status']
+    if speakers and isinstance(speakers[0], str):
+        return torch.tensor(
+            [get_speaker_severity(s) for s in speakers],
+            dtype=torch.float32,
+            device=device,
+        )
+    return status.float().to(device) * 5.0
+
+
 
 
 def flatten_config_for_mlflow(config: Config) -> Dict:
@@ -83,15 +143,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         class_weights: Optional[torch.Tensor] = None,
         articulatory_weights: Optional[Dict[str, torch.Tensor]] = None
     ):
-        """
-        Initialize Lightning module.
-        
-        Args:
-            model: Neuro-symbolic ASR model
-            config: Training configuration
-            phn_to_id: Phoneme to ID mapping
-            id_to_phn: ID to phoneme mapping
-        """
+
         super().__init__()
         self.model = model
         self.config = config
@@ -112,6 +164,11 @@ class DysarthriaASRLightning(pl.LightningModule):
         
         # Metrics tracking
         self.validation_step_outputs = []
+
+        # When LOSO must resume with weights-only (fresh optimizer/scheduler),
+        # this offset preserves epoch-aware behavior (staged unfreezing, KL ramp)
+        # as if training had continued from the checkpoint epoch.
+        self.resume_epoch_offset = 0
     
     def _init_loss_functions(self) -> None:
         """Initialize loss functions (simplified to 2 losses)."""
@@ -209,20 +266,7 @@ class DysarthriaASRLightning(pl.LightningModule):
                     pass
     
     def forward(self, batch: Dict) -> Dict:
-
-        speakers = batch.get('speakers', [])
-        status   = batch['status']
-
-        # Use per-speaker severity scores when speaker IDs are available
-        if speakers and isinstance(speakers[0], str):
-            severity = torch.tensor(
-                [get_speaker_severity(s) for s in speakers],
-                dtype=torch.float32,
-                device=status.device,
-            )
-        else:
-            # Fallback: binary mapping 0→0.0, 1→5.0
-            severity = status.float() * 5.0
+        severity = _get_batch_severity(batch, batch['status'].device)
 
         return self.model(
             input_values=batch['input_values'],
@@ -405,16 +449,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             return self.art_ce_losses[key](logits_flat, labels_flat)
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
-        """
-        Training step.
-        
-        Args:
-            batch: Training batch
-            batch_idx: Batch index
-            
-        Returns:
-            Loss tensor
-        """
+
         outputs = self(batch)
         
         # Compute lengths
@@ -492,15 +527,7 @@ class DysarthriaASRLightning(pl.LightningModule):
 
         # C7: Use per-speaker severity from TORGO_SEVERITY_MAP (continuous [0,5])
         # instead of the coarse binary status * 5.0 used previously.
-        speakers_batch = batch.get('speakers', [])
-        if speakers_batch and isinstance(speakers_batch[0], str):
-            severity = torch.tensor(
-                [get_speaker_severity(s) for s in speakers_batch],
-                dtype=torch.float32,
-                device=log_probs_constrained.device,
-            )
-        else:
-            severity = batch['status'].float().to(log_probs_constrained.device) * 5.0
+        severity = _get_batch_severity(batch, log_probs_constrained.device)
 
         attn_mask = batch.get('attention_mask')
         if attn_mask is not None:
@@ -579,39 +606,40 @@ class DysarthriaASRLightning(pl.LightningModule):
         the full target over training to avoid CTC collapse in early epochs when the
         phoneme head has not yet learned basic boundaries.
         """
-        epoch           = self.current_epoch
+        epoch           = self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0))
         warmup_ep       = self.config.training.encoder_warmup_epochs
         second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 6)
         third_unfreeze  = getattr(self.config.training, 'encoder_third_unfreeze_epoch', 12)
 
-        if not self.encoder_unfrozen and epoch >= warmup_ep:
+        # Resume-safe stage selection: choose the highest stage implied by the
+        # current epoch immediately. This avoids one-epoch lag when resuming at
+        # late epochs (e.g., epoch 21 must directly enter Stage 3).
+        if epoch >= third_unfreeze and not getattr(self, '_encoder_deeper_unfrozen', False):
+            self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
+            self.encoder_unfrozen = True
+            self._encoder_deep_unfrozen = True
+            self._encoder_deeper_unfrozen = True
+            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
+            print(f"🔥 Stage 3: Unfroze HuBERT layers 4-11 at epoch {epoch}")
+
+        elif epoch >= second_unfreeze and not getattr(self, '_encoder_deep_unfrozen', False):
+            # Stage 2: unfreeze layers 6-11 only (§2.4 fix: was calling
+            # unfreeze_after_warmup() which unfroze ALL layers 4-11, making
+            # Stage 3 a no-op)
+            self.model.unfreeze_encoder(layers=[6, 7, 8, 9, 10, 11])
+            self.encoder_unfrozen = True
+            self._encoder_deep_unfrozen = True
+            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
+            print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
+
+        elif epoch >= warmup_ep and not self.encoder_unfrozen:
             # Stage 1: unfreeze top 4 layers only
             self.model.unfreeze_encoder(layers=[8, 9, 10, 11])
             self.encoder_unfrozen = True
             self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 1: Unfroze HuBERT layers 8-11 at epoch {epoch}")
 
-        elif (self.encoder_unfrozen
-              and not getattr(self, '_encoder_deep_unfrozen', False)
-              and epoch >= second_unfreeze):
-            # Stage 2: unfreeze layers 6-11 only (§2.4 fix: was calling
-            # unfreeze_after_warmup() which unfroze ALL layers 4-11, making
-            # Stage 3 a no-op)
-            self.model.unfreeze_encoder(layers=[6, 7, 8, 9, 10, 11])
-            self._encoder_deep_unfrozen = True
-            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
-            print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
-
-        elif (getattr(self, '_encoder_deep_unfrozen', False)
-              and not getattr(self, '_encoder_deeper_unfrozen', False)
-              and epoch >= third_unfreeze):
-            # Stage 3: unfreeze layers 4-11 (deepest adaptation to dysarthric speech)
-            self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
-            self._encoder_deeper_unfrozen = True
-            self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
-            print(f"🔥 Stage 3: Unfroze HuBERT layers 4-11 at epoch {epoch}")
-
-        # I2: Staged lambda_blank_kl ramp ─────────────────────────────────────
+        # I2: Staged lambda_blank_kl ramp 
         tr = self.config.training
         stage1_end = getattr(tr, 'blank_kl_stage1_end',   5)
         stage2_end = getattr(tr, 'blank_kl_stage2_end',  15)
@@ -659,16 +687,7 @@ class DysarthriaASRLightning(pl.LightningModule):
                 break
 
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
-        """
-        Validation step with metrics computation.
-        
-        Args:
-            batch: Validation batch
-            batch_idx: Batch index
-            
-        Returns:
-            Loss dictionary
-        """
+
         outputs = self(batch)
         
         # Compute lengths
@@ -888,16 +907,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         return avg_dysarthric, avg_control
     
     def test_step(self, batch: Dict, batch_idx: int) -> Dict:
-        """
-        Test step.
-        
-        Args:
-            batch: Test batch
-            batch_idx: Batch index
-            
-        Returns:
-            Loss dictionary
-        """
+
         outputs = self(batch)
         
         # Compute lengths
@@ -1056,17 +1066,8 @@ def create_dataloaders(
     config: Config,
     dataset: TorgoNeuroSymbolicDataset
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    Create train/val/test dataloaders with stratified speaker splits.
-    
-    Args:
-        config: Configuration object
-        dataset: Full dataset
-        
-    Returns:
-        Tuple of (train_loader, val_loader, test_loader)
-    """
-    print("📊 Creating data splits...")
+
+    logger.info("Creating data splits...")
     
     # Speaker-stratified split
     df = dataset.df
@@ -1110,11 +1111,10 @@ def create_dataloaders(
         val_idx   = df[df['speaker'].isin(val_speakers)].index.tolist()
         test_idx  = df[df['speaker'].isin(test_speakers)].index.tolist()
 
-        print(
-            f"⚠️  Ratio-based split produced empty partition(s). "
-            f"Using round-robin speaker assignment: "
-            f"train={list(train_speakers)}, val={list(val_speakers)}, "
-            f"test={list(test_speakers)}"
+        logger.warning(
+            "Ratio-based split produced empty partition(s). Using round-robin speaker assignment: "
+            "train=%s, val=%s, test=%s",
+            list(train_speakers), list(val_speakers), list(test_speakers),
         )
     
     # Create subset datasets
@@ -1122,9 +1122,9 @@ def create_dataloaders(
     val_dataset = Subset(dataset, val_idx)
     test_dataset = Subset(dataset, test_idx)
     
-    print(f"Train: {len(train_dataset)} samples ({len(train_speakers)} speakers)")
-    print(f"Val: {len(val_dataset)} samples ({len(val_speakers)} speakers)")
-    print(f"Test: {len(test_dataset)} samples ({len(test_speakers)} speakers)")
+    logger.info("Train: %d samples (%d speakers)", len(train_dataset), len(train_speakers))
+    logger.info("Val: %d samples (%d speakers)", len(val_dataset), len(val_speakers))
+    logger.info("Test: %d samples (%d speakers)", len(test_dataset), len(test_speakers))
     
     # Create collator
     collator = NeuroSymbolicCollator(dataset.processor)
@@ -1144,6 +1144,7 @@ def create_dataloaders(
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=config.training.pin_memory,
+        worker_init_fn=_seed_worker,
     )
     if config.training.num_workers > 0:
         common_loader_kwargs["persistent_workers"] = True
@@ -1168,9 +1169,7 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-# ---------------------------------------------------------------------------
 # Training-curve helpers (E4)
-# ---------------------------------------------------------------------------
 
 class _MetricLoggerCallback(pl.Callback):
     """
@@ -1203,25 +1202,9 @@ def _save_learning_curve(
     val_pers: List[float],
     results_dir: Path,
 ) -> None:
-    """
-    Produce and save a two-axis learning-curve plot.
-
-    Left axis  : ``train/loss`` vs epoch.
-    Right axis : ``val/per``   vs epoch.
-
-    The plot is saved to ``results_dir/learning_curve.png``.
-
-    Args:
-        train_losses : Per-epoch training loss values.
-        val_pers     : Per-epoch validation PER values.
-        results_dir  : Directory in which to write the PNG.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
 
     if not train_losses and not val_pers:
-        print("\u26a0\ufe0f  No metric history available \u2014 skipping learning curve.")
+        logger.warning("No metric history available; skipping learning curve.")
         return
 
     results_dir = Path(results_dir)
@@ -1260,24 +1243,14 @@ def _save_learning_curve(
     save_path = results_dir / 'learning_curve.png'
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
-    print(f"\u2705 Learning curve saved to {save_path}")
+    logger.info("Learning curve saved to %s", save_path)
 
 
 def train(
     config: Optional[Config] = None,
     limit_train_batches: Optional[int] = None,
 ) -> Tuple[DysarthriaASRLightning, pl.Trainer]:
-    """
-    Main training function.
 
-    Args:
-        config: Configuration object, uses default if None
-        limit_train_batches: If set, cap batches per epoch (smoke/dev mode).
-            Passed directly to ``pl.Trainer(limit_train_batches=...)``.
-
-    Returns:
-        Tuple of (trained_model, trainer)
-    """
     # Mitigate memory fragmentation — critical for variable-length audio batches.
     # PyTorch ≥2.0 uses PYTORCH_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF is deprecated).
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -1318,7 +1291,7 @@ def train(
     mlflow_logger.log_hyperparams(config_dict)
     
     # Load dataset
-    print("📦 Loading dataset...")
+    logger.info("Loading dataset...")
     dataset = TorgoNeuroSymbolicDataset(
         manifest_path=str(config.data.manifest_path),
         processor_id=config.model.hubert_model_id,
@@ -1330,7 +1303,7 @@ def train(
     train_loader, val_loader, _ = create_dataloaders(config, dataset)
     
     # Initialize model
-    print("🧠 Initializing neuro-symbolic model...")
+    logger.info("Initializing neuro-symbolic model...")
     model = NeuroSymbolicASR(
         model_config=config.model,
         symbolic_config=config.symbolic,
@@ -1386,6 +1359,8 @@ def train(
         accumulate_grad_batches=config.training.gradient_accumulation_steps,
         gradient_clip_val=config.training.gradient_clip_val,
         val_check_interval=config.training.val_check_interval,
+        check_val_every_n_epoch=config.training.check_val_every_n_epoch,
+        num_sanity_val_steps=config.training.num_sanity_val_steps,
         logger=mlflow_logger,
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor, metric_logger_cb],
         deterministic=False,  # Handled manually above
@@ -1396,7 +1371,7 @@ def train(
     trainer = pl.Trainer(**trainer_kwargs)
     
     # Train
-    print("🚀 Starting training...")
+    logger.info("Starting training...")
     trainer.fit(lightning_model, train_loader, val_loader)
 
     # L5: Detect OneCycleLR step-count drift (>10% deviation raises a warning;
@@ -1426,16 +1401,16 @@ def train(
         last_ckpt = checkpoint_dir / "last.ckpt"
         if last_ckpt.exists():
             best_model_path = str(last_ckpt)
-            print(f"⚠️  No best checkpoint saved; using last.ckpt: {best_model_path}")
+            logger.warning("No best checkpoint saved; using last.ckpt: %s", best_model_path)
         else:
             raise FileNotFoundError(
                 f"No checkpoint found in {checkpoint_dir} after training."
             )
     else:
-        print(f"✅ Best checkpoint: {best_model_path}")
+        logger.info("Best checkpoint: %s", best_model_path)
 
     # Load best checkpoint and return
-    print("🔄 Loading best model from checkpoint...")
+    logger.info("Loading best model from checkpoint...")
     best_model = DysarthriaASRLightning.load_from_checkpoint(
         best_model_path,
         model=model,
@@ -1445,11 +1420,10 @@ def train(
         strict=False
     )
 
-    print("✅ Training complete!")
-    print(f"  Checkpoints: {checkpoint_dir}")
+    logger.info("Training complete.")
+    logger.info("Checkpoints: %s", checkpoint_dir)
 
     return best_model, trainer
-
 
 
 def create_loso_splits(
@@ -1457,20 +1431,7 @@ def create_loso_splits(
     dataset: TorgoNeuroSymbolicDataset,
     held_out_speaker: str,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    Create dataloaders for a single LOSO fold.
 
-    The held-out speaker is used exclusively for testing. The remaining speakers
-    are split 85/15 into train/val by speaker.
-
-    Args:
-        config:             Training configuration
-        dataset:            Full TorgoNeuroSymbolicDataset
-        held_out_speaker:   Speaker ID to hold out for this fold
-
-    Returns:
-        (train_loader, val_loader, test_loader)
-    """
     df = dataset.df
     # B5 fix: sort lexicographically before seeded shuffle so fold assignments
     # are independent of manifest row order (df['speaker'].unique() returns
@@ -1506,6 +1467,7 @@ def create_loso_splits(
             collate_fn=collator,
             num_workers=config.training.num_workers,
             pin_memory=config.training.pin_memory,
+            worker_init_fn=_seed_worker,
         )
         if config.training.num_workers > 0:
             # Keep worker processes alive across epochs/folds to reduce startup
@@ -1528,18 +1490,19 @@ def run_loso(
     config: Config,
     dataset: TorgoNeuroSymbolicDataset,
     resume: bool = False,
+    force_speakers: Optional[List[str]] = None,
 ) -> Dict:
-    """
-    Run Leave-One-Speaker-Out cross-validation.
 
-    Trains one model per speaker fold, aggregates macro-average PER and
-    95% bootstrap CIs across folds.
-
-    Returns:
-        Dict with per_per_fold, macro_avg_per, per_95ci, fold_speakers
-    """
     speakers = list(dataset.df['speaker'].unique())
+    force_set = {s.strip() for s in (force_speakers or []) if str(s).strip()}
     print(f"\n🔁 LOSO: {len(speakers)} folds ({speakers})")
+    if force_set:
+        unknown_force = sorted([s for s in force_set if s not in speakers])
+        if unknown_force:
+            print(f"⚠️  Unknown --loso-force-speakers ignored: {unknown_force}")
+        valid_force = sorted([s for s in force_set if s in speakers])
+        if valid_force:
+            print(f"🎯 Forcing clean re-run for folds: {valid_force}")
 
     # Snapshot the base run name before the loop so that fold names are derived
     # from the original name rather than accumulating across folds (Bug B6).
@@ -1584,6 +1547,8 @@ def run_loso(
                     "per": float(completed_folds[sp].get("per", float("nan"))),
                     "wer": float(completed_folds[sp].get("wer", float("nan"))),
                     "n_samples": int(completed_folds[sp].get("n_samples", 0)),
+                    "trained_epochs": int(completed_folds[sp].get("trained_epochs", 0)),
+                    "elapsed_sec": float(completed_folds[sp].get("elapsed_sec", 0.0)),
                     "checkpoint": completed_folds[sp].get("checkpoint"),
                     "results_dir": completed_folds[sp].get("results_dir"),
                 }
@@ -1595,24 +1560,109 @@ def run_loso(
             json.dump(progress_payload, _tf, indent=2)
         tmp_path.replace(progress_path)
 
+    def _resolve_best_fold_checkpoint(ckpt_dir: Path) -> Optional[Path]:
+        """Return checkpoint with lowest val_per in filename for this fold.
+
+        Falls back to last.ckpt when no score-tagged checkpoints exist.
+        """
+        if not ckpt_dir.exists():
+            return None
+
+        scored = list(ckpt_dir.glob("epoch=*-val_per=*.ckpt"))
+        if scored:
+            pattern = re.compile(r"val_per=([0-9]+(?:\.[0-9]+)?)")
+            best = None
+            best_score = float("inf")
+            for p in scored:
+                m = pattern.search(p.name)
+                if not m:
+                    continue
+                score = float(m.group(1))
+                if score < best_score:
+                    best_score = score
+                    best = p
+            if best is not None:
+                return best
+
+        last_ckpt = ckpt_dir / "last.ckpt"
+        return last_ckpt if last_ckpt.exists() else None
+
     for i, spk in enumerate(speakers):
         print(f"\n── Fold {i+1}/{len(speakers)}: held-out speaker = {spk} ──")
         fold_run_name = f"{base_run_name}_loso_{spk}"
         config.experiment.run_name = fold_run_name
 
+        if spk in force_set:
+            # Explicitly invalidate this fold so it is retrained with the latest
+            # code path (used for recovering from prior resume/stage bugs).
+            completed_folds.pop(spk, None)
+            force_ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
+            force_results_dir = get_project_root() / "results" / fold_run_name
+            if force_ckpt_dir.exists():
+                shutil.rmtree(force_ckpt_dir)
+            if force_results_dir.exists():
+                shutil.rmtree(force_results_dir)
+            print(f"   🔄 Forced clean rerun: cleared {force_ckpt_dir.name} and {force_results_dir.name}")
+
         if spk in completed_folds:
-            cached = completed_folds[spk]
-            fold_per = float(cached.get('per', float('nan')))
-            fold_wer = float(cached.get('wer', float('nan')))
-            fold_n = int(cached.get('n_samples', 0))
-            per_per_fold.append(fold_per)
-            wer_per_fold.append(fold_wer)
-            n_samples_per_fold.append(fold_n)
-            print(
-                f"   ⏭️  Skipping completed fold {spk}: "
-                f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
-            )
-            continue
+            # If max_epochs increased after a prior run, allow a previously
+            # completed fold to continue from last.ckpt instead of being
+            # permanently skipped by the progress file.
+            ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
+            resume_ckpt = ckpt_dir / 'last.ckpt'
+            if resume and resume_ckpt.exists():
+                try:
+                    ckpt_meta = torch.load(resume_ckpt, map_location='cpu')
+                    resumed_epoch = int(ckpt_meta.get('epoch', -1))
+                    # Checkpoint stores zero-based epoch index (epoch=24 means
+                    # 25 epochs have already been completed). Re-open only when
+                    # there are truly epochs remaining.
+                    if resumed_epoch < (int(config.training.max_epochs) - 1):
+                        print(
+                            f"   🔁 Re-opening completed fold {spk}: "
+                            f"checkpoint epoch={resumed_epoch} < final_epoch={int(config.training.max_epochs) - 1}"
+                        )
+                        completed_folds.pop(spk, None)
+                    else:
+                        cached = completed_folds[spk]
+                        fold_per = float(cached.get('per', float('nan')))
+                        fold_wer = float(cached.get('wer', float('nan')))
+                        fold_n = int(cached.get('n_samples', 0))
+                        per_per_fold.append(fold_per)
+                        wer_per_fold.append(fold_wer)
+                        n_samples_per_fold.append(fold_n)
+                        print(
+                            f"   ⏭️  Skipping completed fold {spk}: "
+                            f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
+                        )
+                        continue
+                except Exception as exc:
+                    print(
+                        f"   ⚠️  Could not inspect {resume_ckpt}; keeping completed status for {spk}: {exc}"
+                    )
+                    cached = completed_folds[spk]
+                    fold_per = float(cached.get('per', float('nan')))
+                    fold_wer = float(cached.get('wer', float('nan')))
+                    fold_n = int(cached.get('n_samples', 0))
+                    per_per_fold.append(fold_per)
+                    wer_per_fold.append(fold_wer)
+                    n_samples_per_fold.append(fold_n)
+                    continue
+            else:
+                cached = completed_folds[spk]
+                fold_per = float(cached.get('per', float('nan')))
+                fold_wer = float(cached.get('wer', float('nan')))
+                fold_n = int(cached.get('n_samples', 0))
+                per_per_fold.append(fold_per)
+                wer_per_fold.append(fold_wer)
+                n_samples_per_fold.append(fold_n)
+                print(
+                    f"   ⏭️  Skipping completed fold {spk}: "
+                    f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
+                )
+                continue
+
+        fold_start_time = time.time()
 
         train_loader, val_loader, test_loader = create_loso_splits(config, dataset, spk)
 
@@ -1647,8 +1697,96 @@ def run_loso(
             run_name=fold_run_name,
             tracking_uri=config.experiment.tracking_uri,
         )
+        trainer_max_epochs = int(config.training.max_epochs)
+        weights_only_resume = False
+        resumed_epoch = -1
+        resume_ckpt = ckpt_dir / 'last.ckpt'
+        ckpt_path = str(resume_ckpt) if resume and resume_ckpt.exists() else None
+        skip_fit = False
+        if ckpt_path:
+            # Lightning cannot restore a checkpoint whose current_epoch is
+            # >= Trainer(max_epochs). In deadline-driven runs we may reduce
+            # max_epochs after some folds have progressed further; when that
+            # happens, skip training for this fold and evaluate the checkpoint.
+            ckpt_meta = torch.load(resume_ckpt, map_location='cpu')
+            resumed_epoch = int(ckpt_meta.get('epoch', -1))
+            # Zero-based epoch indexing: if resumed_epoch >= max_epochs-1, the
+            # target training budget is already fully consumed.
+            if resumed_epoch >= (int(config.training.max_epochs) - 1):
+                print(
+                    f"   ⏭️  Resume checkpoint epoch={resumed_epoch} is already >= "
+                    f"final_epoch={int(config.training.max_epochs) - 1}; skipping fit and "
+                    f"evaluating checkpoint directly."
+                )
+                lm = DysarthriaASRLightning.load_from_checkpoint(
+                    str(resume_ckpt),
+                    model=model,
+                    config=config,
+                    phn_to_id=dataset.phn_to_id,
+                    id_to_phn=dataset.id_to_phn,
+                    class_weights=dataset.get_loss_weights(),
+                    articulatory_weights=dataset.get_articulatory_loss_weights(),
+                    strict=False,
+                )
+                skip_fit = True
+                ckpt_path = None
+            else:
+                # Guard against OneCycleLR exhaustion when extending runs or
+                # changing batch/accum settings between resumed launches.
+                # If scheduler state is already at/over total_steps, Lightning
+                # resume will fail with: "Tried to step X times... total steps Y".
+                # In that case, resume model weights only (fresh optimizer/scheduler).
+                sched_exhausted = False
+                sched_total_steps = None
+                sched_last_epoch = None
+                lr_states = ckpt_meta.get('lr_schedulers', [])
+                if isinstance(lr_states, list) and lr_states:
+                    s0 = lr_states[0] if isinstance(lr_states[0], dict) else {}
+                    sched_total_steps = s0.get('total_steps')
+                    sched_last_epoch = s0.get('last_epoch', s0.get('_step_count'))
+                    if sched_total_steps is not None and sched_last_epoch is not None:
+                        sched_exhausted = int(sched_last_epoch) >= int(sched_total_steps)
+
+                # Also treat an undersized total_steps as exhausted for the new run.
+                if sched_total_steps is not None:
+                    steps_per_epoch = int(np.ceil(len(train_loader) / max(config.training.gradient_accumulation_steps, 1)))
+                    required_total_steps = int(config.training.max_epochs) * steps_per_epoch
+                    if int(sched_total_steps) < required_total_steps:
+                        sched_exhausted = True
+
+                if sched_exhausted:
+                    print(
+                        f"   ⚠️  Scheduler state in {resume_ckpt.name} is exhausted/undersized "
+                        f"(last_epoch={sched_last_epoch}, total_steps={sched_total_steps}); "
+                        f"resuming weights-only with fresh optimizer/scheduler."
+                    )
+                    lm = DysarthriaASRLightning.load_from_checkpoint(
+                        str(resume_ckpt),
+                        model=model,
+                        config=config,
+                        phn_to_id=dataset.phn_to_id,
+                        id_to_phn=dataset.id_to_phn,
+                        class_weights=dataset.get_loss_weights(),
+                        articulatory_weights=dataset.get_articulatory_loss_weights(),
+                        strict=False,
+                    )
+                    # Continue only the remaining epochs, not a full fresh run.
+                    # Example: resumed_epoch=21, max_epochs=25 -> run 3 epochs (22,23,24).
+                    start_epoch = resumed_epoch + 1
+                    remaining_epochs = max(1, int(config.training.max_epochs) - start_epoch)
+                    lm.resume_epoch_offset = start_epoch
+                    trainer_max_epochs = remaining_epochs
+                    weights_only_resume = True
+                    ckpt_path = None
+                    print(
+                        f"   ↪️  Weights-only continuation: start_epoch={start_epoch}, "
+                        f"remaining_epochs={remaining_epochs}"
+                    )
+                else:
+                    print(f"   ♻️  Resuming fold training from {resume_ckpt}")
+
         trainer = pl.Trainer(
-            max_epochs=config.training.max_epochs,
+            max_epochs=trainer_max_epochs,
             accelerator='gpu' if config.device == 'cuda' else 'cpu',
             devices=1,
             precision=config.training.precision,
@@ -1663,21 +1801,43 @@ def run_loso(
                 ),
             ],
             val_check_interval=config.training.val_check_interval,
+            check_val_every_n_epoch=config.training.check_val_every_n_epoch,
+            num_sanity_val_steps=config.training.num_sanity_val_steps,
             logger=fold_logger,
             enable_progress_bar=True,
-            log_every_n_steps=50,
+            log_every_n_steps=config.experiment.log_every_n_steps,
         )
-        resume_ckpt = ckpt_dir / 'last.ckpt'
-        ckpt_path = str(resume_ckpt) if resume and resume_ckpt.exists() else None
-        if ckpt_path:
-            print(f"   ♻️  Resuming fold training from {resume_ckpt}")
-        trainer.fit(lm, train_loader, val_loader, ckpt_path=ckpt_path)
 
-        # Evaluate on held-out speaker
+        if not skip_fit:
+            trainer.fit(lm, train_loader, val_loader, ckpt_path=ckpt_path)
+
+        # Evaluate on held-out speaker using the best checkpoint available for
+        # this fold (across prior + newly resumed epochs), not just the last
+        # in-memory epoch state.
         results_dir = get_project_root() / "results" / fold_run_name
         results_dir.mkdir(parents=True, exist_ok=True)
+
+        best_eval_ckpt = _resolve_best_fold_checkpoint(ckpt_dir)
+        eval_model_obj = lm.model
+        if best_eval_ckpt is not None:
+            try:
+                eval_lm = DysarthriaASRLightning.load_from_checkpoint(
+                    str(best_eval_ckpt),
+                    model=model,
+                    config=config,
+                    phn_to_id=dataset.phn_to_id,
+                    id_to_phn=dataset.id_to_phn,
+                    class_weights=dataset.get_loss_weights(),
+                    articulatory_weights=dataset.get_articulatory_loss_weights(),
+                    strict=False,
+                )
+                eval_model_obj = eval_lm.model
+                print(f"   🎯 Evaluating best fold checkpoint: {best_eval_ckpt.name}")
+            except Exception as exc:
+                print(f"   ⚠️  Failed to load best checkpoint for eval ({best_eval_ckpt}): {exc}")
+
         eval_results = evaluate_model(
-            model=lm.model, dataloader=test_loader,
+            model=eval_model_obj, dataloader=test_loader,
             device=config.device,
             phn_to_id=dataset.phn_to_id, id_to_phn=dataset.id_to_phn,
             results_dir=results_dir,
@@ -1685,6 +1845,13 @@ def run_loso(
         fold_per = eval_results.get('avg_per', float('nan'))
         fold_wer = eval_results.get('wer', float('nan'))
         fold_n   = eval_results.get('overall', {}).get('n_samples', 0)
+        fold_elapsed_sec = max(0.0, time.time() - fold_start_time)
+        if skip_fit:
+            trained_epochs = resumed_epoch
+        elif weights_only_resume:
+            trained_epochs = int(getattr(lm, 'resume_epoch_offset', 0) + getattr(trainer, 'current_epoch', 0))
+        else:
+            trained_epochs = int(getattr(trainer, 'current_epoch', 0))
         per_per_fold.append(fold_per)
         wer_per_fold.append(fold_wer)
         n_samples_per_fold.append(fold_n)
@@ -1692,11 +1859,29 @@ def run_loso(
             'per': fold_per,
             'wer': fold_wer,
             'n_samples': fold_n,
-            'checkpoint': str(ckpt_cb.best_model_path) if ckpt_cb.best_model_path else str(ckpt_dir / 'last.ckpt'),
+            'trained_epochs': trained_epochs,
+            'elapsed_sec': fold_elapsed_sec,
+            'checkpoint': str(best_eval_ckpt) if best_eval_ckpt is not None else str(ckpt_dir / 'last.ckpt'),
             'results_dir': str(results_dir),
         }
         _write_progress()
-        print(f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}")
+        elapsed_min = fold_elapsed_sec / 60.0
+        done_folds = len(completed_folds)
+        remaining_folds = len(speakers) - done_folds
+        avg_elapsed_sec = np.mean([float(v.get('elapsed_sec', 0.0)) for v in completed_folds.values()])
+        eta_total_sec = max(0.0, avg_elapsed_sec * remaining_folds)
+        eta_h = int(eta_total_sec // 3600)
+        eta_m = int((eta_total_sec % 3600) // 60)
+        print(
+            f"   Fold PER ({spk}): {fold_per:.4f}  |  WER: {fold_wer:.4f}  |  n={fold_n}"
+            f"  |  epochs={trained_epochs}  |  time={elapsed_min:.1f} min"
+        )
+        if done_folds > 0:
+            print(
+                f"   Progress: {done_folds}/{len(speakers)} folds complete"
+                f"  |  avg/fold={avg_elapsed_sec/60.0:.1f} min"
+                f"  |  ETA remaining≈{eta_h}h {eta_m}m"
+            )
 
         # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
         del trainer, lm, model
@@ -1706,8 +1891,9 @@ def run_loso(
     per_arr = np.array(per_per_fold)
     macro_per = float(np.nanmean(per_arr))
     rng = np.random.default_rng(42)
+    n_bootstrap = int(getattr(config.training, 'loso_bootstrap_samples', LOSO_BOOTSTRAP_SAMPLES))
     boot = np.array([rng.choice(per_arr, size=len(per_arr), replace=True).mean()
-                     for _ in range(2000)])
+                     for _ in range(n_bootstrap)])
     ci_lo, ci_hi = float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
 
     # Weighted-average PER (weighted by number of test samples per fold)
@@ -1771,7 +1957,10 @@ def main() -> None:
                         help='Run Leave-One-Speaker-Out cross-validation')
     parser.add_argument('--resume-loso', '--resume_loso', dest='resume_loso', action='store_true',
                         help='Resume LOSO from progress/checkpoints when available')
-    parser.add_argument('--max_epochs',          type=int, help='Override max_epochs')
+    parser.add_argument('--max_epochs', '--max-epochs', type=int,
+                        help='Override max_epochs')
+    parser.add_argument('--early_stopping_patience', type=int,
+                        help='Override early_stopping_patience')
     parser.add_argument('--limit_train_batches', type=int,
                         help='Limit batches per epoch (smoke test)')
     args = parser.parse_args()
@@ -1785,6 +1974,8 @@ def main() -> None:
     config.training.use_loso = args.loso
     if args.max_epochs:
         config.training.max_epochs = args.max_epochs
+    if args.early_stopping_patience is not None:
+        config.training.early_stopping_patience = args.early_stopping_patience
 
     if args.loso:
         # LOSO mode: load full dataset then run CV

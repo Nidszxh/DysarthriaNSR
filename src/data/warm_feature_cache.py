@@ -1,9 +1,23 @@
+"""
+warm_feature_cache.py — Pre-materialize HuBERT input feature cache from manifest.
+
+Run once before training to avoid repeated preprocessing overhead on each epoch.
+
+# REFACTOR LOG
+# [CLEAN] Replaced print() with logging.getLogger(__name__) calls so output
+#         respects the caller's logging configuration and is silent under
+#         logging.disable(logging.INFO) (e.g., during pytest runs).
+"""
+
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 import sys
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,6 +27,7 @@ from torch.utils.data import DataLoader
 
 from src.data.dataloader import TorgoNeuroSymbolicDataset
 from src.utils.config import Config, get_default_config
+
 
 def warm_feature_cache(
     config: Config,
@@ -68,20 +83,25 @@ def warm_feature_cache(
         _ = batch
         if (batch_idx + 1) % 500 == 0:
             elapsed = time.time() - start
-            print(f"Warmed {batch_idx + 1}/{n_samples} samples in {elapsed:.1f}s")
+            logger.info("Warmed %d/%d samples in %.1fs", batch_idx + 1, n_samples, elapsed)
 
     elapsed = time.time() - start
-    print(f"Done. Warmed {n_samples} samples in {elapsed:.1f}s")
+    logger.info("Done. Warmed %d samples in %.1fs", n_samples, elapsed)
 
     if dataset.enable_feature_cache:
         cache_dir = dataset.feature_cache_dir / dataset._cache_namespace
-        print(f"Feature cache dir: {cache_dir.resolve()}")
+        logger.info("Feature cache dir: %s", cache_dir.resolve())
         return cache_dir
 
     return None
 
 
 def main() -> None:
+    """CLI entry point for feature cache warm-up."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(description="Warm HuBERT input feature cache from manifest")
     parser.add_argument("--manifest", type=str, default=None, help="Path to manifest CSV")
     parser.add_argument("--workers", type=int, default=None, help="DataLoader workers for warm-up")

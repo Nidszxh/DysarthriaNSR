@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Tuple, Any
 import torch
 import yaml
 
-# --- Utilities ---
 
 def get_project_root() -> Path:
     """Detects project root even if running in Notebooks or as a script."""
@@ -22,8 +21,9 @@ def normalize_phoneme(phoneme: str) -> str:
 # Severity = (1 - intelligibility/100) * 5.0  → range [0.0 (control), 5.0 (most severe)]
 #
 # Raw intelligibility (approx.):  F01≈2%, F03≈7%, F04≈39%, F05≈73%
-#                                  M01≈2%, M02≈4.5%, M03≈8.2%, M04≈43%, M05≈58%
-#                                  FC01-FC03, MC01-MC04: controls ≈ 100%
+#                                 M01≈2%, M02≈4.5%, M03≈8.2%, M04≈43%, M05≈58%
+#                                 FC01-FC03, MC01-MC04: controls ≈ 100%
+
 TORGO_SEVERITY_MAP: Dict[str, float] = {
     # Dysarthric speakers — converted to severity score in [0, 5]
     "F01": 4.90,   # ~2% intelligibility   (severe)
@@ -91,6 +91,9 @@ class ModelConfig:
     # Override to None only for development / CI where offline access is required.
     hubert_model_revision: Optional[str] = "dba3bb02fda4248b6e082697eee756de8fe8aa8a"
     freeze_feature_extractor: bool = True
+    # Memory-vs-speed tradeoff: checkpointing reduces VRAM but adds compute.
+    # Disable for faster training/eval when VRAM headroom allows.
+    use_gradient_checkpointing: bool = True
     
     # Permanently freeze only the bottom 4 layers (robust generic acoustic features).
     # Layers 4-11 are fine-tuned progressively via the two-stage warmup schedule in
@@ -99,7 +102,9 @@ class ModelConfig:
     freeze_encoder_layers: List[int] = field(default_factory=lambda: list(range(0, 4)))
 
     hidden_dim: int = 512
-    num_phonemes: int = 44
+    # Runtime vocab is rebuilt from the manifest and includes 3 special tokens
+    # (<BLANK>, <PAD>, <UNK>) plus the observed ARPABET phonemes.
+    num_phonemes: int = 47
     classifier_dropout: float = 0.1
     
     # Symbolic Neural-Fusion
@@ -144,13 +149,15 @@ class TrainingConfig:
     warmup_steps: int = 250
     warmup_ratio: float = 0.05
     
-    batch_size: int = 8   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 32
-    gradient_accumulation_steps: int = 4   # Effective batch=32 (8×4)
+    batch_size: int = 12   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 36 with gradient accumulation
+    gradient_accumulation_steps: int = 3   # Effective batch=36 (12×3)
     max_epochs: int = 40
     encoder_warmup_epochs: int = 1          # Unfreeze top layers after 1 epoch (was 3) — spend less time VRAM-idle
     encoder_second_unfreeze_epoch: int = 6  # Stage 2: unfreeze layers 6-11 at epoch 6
     encoder_third_unfreeze_epoch: int = 12  # Stage 3: unfreeze layers 4-11 at epoch 12 (deepest adaptation)
     val_check_interval: float = 1.0        # Validate once per epoch (was 0.5) — halves eval overhead
+    check_val_every_n_epoch: int = 1        # Evaluate every N epochs (set 2 to halve val overhead)
+    num_sanity_val_steps: int = 0           # Skip startup sanity-validation for faster fold startup
     
     # Regularization & Loss
     dropout: float = 0.1
@@ -200,6 +207,7 @@ class TrainingConfig:
     # --- Phase 4: Training infrastructure (audit G2, ablations) ---
     # Leave-One-Speaker-Out cross-validation (opt-in, keeps fast single-split default)
     use_loso: bool = False
+    loso_bootstrap_samples: int = 2000  # LOSO PER CI bootstrap draws
     # Ablation mode: "full" | "neural_only" | "symbolic_only" | "no_art_heads"
     ablation_mode: str = "full"
 
@@ -296,25 +304,62 @@ class Config:
         self._print_vram_status()
 
     def _print_vram_status(self):
-        """Prints a safety report for the 4060's 8GB limit."""
+        """Prints a rough VRAM safety report for the 4060's 8GB limit.
+
+        This is an estimate, not runtime telemetry. It intentionally reports a
+        conservative peak budget for later-stage fine-tuning.
+        """
         if self.device == "cuda":
             total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-            # Refined VRAM estimate (BF16):
-            #   params     ≈ 94M × 2B  = 0.19 GB (frozen params kept in bf16)
-            #   optimizer  ≈ trainable × 8B fp32 (AdamW m+v) — scales with unfrozen layers
-            #   activations ≈ batch × T_frames × 768 × active_layers × 2B × overhead_factor(4)
-            n_active_layers = 12 - len(self.model.freeze_encoder_layers)
+            # Conservative upper-bound estimate (BF16/FP16):
+            # - Full parameters kept resident in low precision
+            # - Gradients + AdamW optimizer states only for trainable params
+            # - Activation memory scales with batch/time/active layers
+            # - Add fixed runtime reserve for CUDA workspaces/caching allocator
+            # These are intentionally approximate to avoid false confidence.
+            bytes_per_param = 2 if "16" in str(self.training.precision) or "bf16" in str(self.training.precision).lower() else 4
             T_frames = self.data.max_audio_length * 50  # ~50 Hz HuBERT output
-            act_gb = (self.training.batch_size * T_frames * 768 * n_active_layers * 2 * 4) / 1e9
-            est_vram = 0.19 + act_gb + 0.4  # params + activations + misc overhead
-            margin = total_vram - est_vram
+            hidden = 768
+
+            # Architecture constants for HuBERT-base + task heads.
+            total_params = 99_000_000
+            trainable_warmup = 4_600_000
+            trainable_peak = 66_400_000
+
+            # Stage-dependent activation proxies.
+            active_layers_warmup = 0   # encoder frozen warmup
+            active_layers_peak = max(1, 12 - len(self.model.freeze_encoder_layers))
+            activation_factor = 16.0   # conservative multiplier for saved intermediates
+
+            def _estimate(trainable_params: int, active_layers: int) -> float:
+                param_gb = (total_params * bytes_per_param) / 1e9
+                grad_gb = (trainable_params * bytes_per_param) / 1e9
+                optim_gb = (trainable_params * 8) / 1e9  # AdamW m+v in fp32
+                act_gb = (
+                    self.training.batch_size * T_frames * hidden * max(1, active_layers) *
+                    bytes_per_param * activation_factor
+                ) / 1e9
+                runtime_reserve_gb = 1.2
+                return param_gb + grad_gb + optim_gb + act_gb + runtime_reserve_gb
+
+            est_warmup = _estimate(trainable_warmup, active_layers_warmup)
+            est_peak = _estimate(trainable_peak, active_layers_peak)
+            margin = total_vram - est_peak
             print(f"--- ⚡ RTX 4060 OPTIMIZATION ---")
-            print(f"Est. Peak VRAM: {est_vram:.2f}GB / {total_vram:.2f}GB (Margin: {margin:.2f}GB) "
-                  f"[batch={self.training.batch_size}, T={int(T_frames)}, active_layers={n_active_layers}]")
+            print(
+                f"Est. VRAM (warmup→peak): {est_warmup:.2f}GB → {est_peak:.2f}GB / {total_vram:.2f}GB "
+                f"(peak margin: {margin:.2f}GB) "
+                f"[batch={self.training.batch_size}, T={int(T_frames)}, peak_active_layers={active_layers_peak}]"
+            )
+            # Show factual instantaneous allocator usage for context.
+            allocated = torch.cuda.memory_allocated(0) / 1e9
+            reserved = torch.cuda.memory_reserved(0) / 1e9
+            print(f"CUDA now (allocated/reserved): {allocated:.2f}GB / {reserved:.2f}GB")
             print(f"Precision: {self.training.precision} | Batch Size: {self.training.batch_size}")
             print(f"SeverityAdapter: {self.model.use_severity_adapter} | "
                   f"LearnableC: {self.model.use_learnable_constraint} | "
                   f"Ablation: {self.training.ablation_mode}")
+            print("Note: estimate is conservative and not a direct profiler reading.")
             print(f"----------------------------------")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -395,15 +440,7 @@ _default_config: Optional["Config"] = None
 
 
 def get_default_config() -> "Config":
-    """Return the shared default Config instance, creating it lazily on first call.
 
-    Lazy construction avoids the VRAM check and directory creation side-effects
-    that ``Config.__init__`` triggers running at import time (which happens every
-    time any module does ``from src.utils.config import ...``).  Callers that
-    need the default configuration should always go through this function; code
-    that wants a fresh config (e.g., tests or the LOSO loop) should call
-    ``Config()`` directly.
-    """
     global _default_config
     if _default_config is None:
         _default_config = Config()

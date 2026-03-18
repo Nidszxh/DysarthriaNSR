@@ -23,6 +23,26 @@ except ImportError:
     from src.utils.config import ProjectPaths, normalize_phoneme
 
 
+def _compute_sample_weights(df: pd.DataFrame) -> List[float]:
+    """Build inverse-frequency sample weights with speaker priority.
+
+    Training uses speaker-balanced sampling to avoid overweighting speakers with
+    more utterances. Mirror that behavior here when speaker metadata exists,
+    and only fall back to class-label balancing for older manifests or utility
+    paths that do not include speakers.
+    """
+    if 'speaker' in df.columns:
+        speaker_counts = df['speaker'].value_counts().to_dict()
+        return [1.0 / max(speaker_counts.get(speaker, 1), 1) for speaker in df['speaker']]
+
+    label_series = df['label']
+    class_counts = label_series.value_counts().to_dict()
+    class_weights = {
+        label: 1.0 / count for label, count in class_counts.items()
+    }
+    return [class_weights[label] for label in label_series]
+
+
 
 class TorgoNeuroSymbolicDataset(Dataset):
     
@@ -658,12 +678,7 @@ def create_single_dataloader(
     
     collator = NeuroSymbolicCollator(dataset.processor)
     
-    label_series = dataset.df['label']
-    class_counts = label_series.value_counts().to_dict()
-    class_weights = {
-        label: 1.0 / count for label, count in class_counts.items()
-    }
-    sample_weights = [class_weights[label] for label in label_series]
+    sample_weights = _compute_sample_weights(dataset.df)
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(sample_weights),

@@ -1279,7 +1279,14 @@ def plot_clinical_gap(
     values = [dysarthric_mean, control_mean]
 
     plt.figure(figsize=(6, 4))
-    sns.barplot(x=labels, y=values, palette=["#e74c3c", "#3498db"])
+    # Seaborn 0.14+ requires hue when passing a palette.
+    sns.barplot(
+        x=labels,
+        y=values,
+        hue=labels,
+        palette=["#e74c3c", "#3498db"],
+        legend=False,
+    )
     plt.ylabel("PER")
     plt.title("Clinical Diagnostic: Dysarthric vs Control")
     plt.ylim(0.0, max(values) * 1.1 if values else 1.0)
@@ -1395,7 +1402,13 @@ def evaluate_model(
         results_dir = get_project_root() / "results"
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Ensure model parameters and input tensors live on the same device.
+    # This is critical for LOSO resume paths where checkpoints may be loaded
+    # on CPU and evaluated directly without a Trainer.fit() call.
+    device = torch.device(device)
+    model = model.to(device)
+
     model.eval()
 
     # Initialize decoder

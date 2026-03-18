@@ -185,6 +185,7 @@ def run_training(
     config: Config,
     loso: bool,
     resume_loso: bool,
+    loso_force_speakers: Optional[list[str]],
     limit_train_batches: Optional[int],
 ) -> Tuple[Optional[DysarthriaASRLightning], Optional[TorgoNeuroSymbolicDataset]]:
     """
@@ -211,11 +212,28 @@ def run_training(
 
     pl.seed_everything(config.experiment.seed, workers=True)
 
+    # Runtime throughput configuration: LOSO bypasses train(), so set these
+    # here to ensure both single-run and LOSO paths use fast CUDA defaults.
+    torch.set_float32_matmul_precision('high')
+    if torch.cuda.is_available() and str(config.device).startswith("cuda"):
+        # TF32 accelerates matmul/conv on Ampere+ with negligible quality impact
+        # for this ASR workload.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # For variable-length audio, cuDNN benchmarking usually helps; keep
+        # deterministic behavior if explicitly requested.
+        torch.backends.cudnn.benchmark = not bool(config.experiment.deterministic)
+
     if loso:
         log.info("=== LOSO mode — loading dataset ===")
         dataset = _load_dataset(config)
         log.info("=== Starting LOSO cross-validation ===")
-        loso_results = run_loso(config, dataset, resume=resume_loso)
+        loso_results = run_loso(
+            config,
+            dataset,
+            resume=resume_loso,
+            force_speakers=loso_force_speakers,
+        )
         log.info(
             "LOSO complete: mean PER = %.4f [95%% CI: %.4f – %.4f] | weighted PER = %.4f | mean WER = %.4f",
             loso_results["macro_avg_per"],
@@ -356,11 +374,21 @@ def run_auto(args: argparse.Namespace) -> None:
     # Forwarded training overrides
     config.training.ablation_mode = args.ablation
     config.training.use_loso = args.loso
+    if args.no_gradient_checkpointing:
+        config.model.use_gradient_checkpointing = False
+    if args.batch_size is not None:
+        config.training.batch_size = args.batch_size
+    if args.grad_accum is not None:
+        config.training.gradient_accumulation_steps = args.grad_accum
+    if args.check_val_every_n_epoch is not None:
+        config.training.check_val_every_n_epoch = args.check_val_every_n_epoch
 
     # Print VRAM banner AFTER all overrides are applied so ablation mode is correct.
     config.print_vram_status()
     if args.max_epochs is not None:
         config.training.max_epochs = args.max_epochs
+    if args.early_stopping_patience is not None:
+        config.training.early_stopping_patience = args.early_stopping_patience
 
     # Smoke mode: cap batches and epochs; never surfaced as a public flag
     limit_train_batches: Optional[int] = None
@@ -411,10 +439,16 @@ def run_auto(args: argparse.Namespace) -> None:
     dataset: Optional[TorgoNeuroSymbolicDataset] = None
 
     if not args.skip_train:
+        loso_force_speakers = None
+        if getattr(args, "loso_force_speakers", None):
+            loso_force_speakers = [
+                s.strip() for s in str(args.loso_force_speakers).split(",") if s.strip()
+            ]
         trained_model, dataset = run_training(
             config=config,
             loso=args.loso,
             resume_loso=args.resume_loso,
+            loso_force_speakers=loso_force_speakers,
             limit_train_batches=limit_train_batches,
         )
         # LOSO mode does its own per-fold evaluation; pipeline ends here.
@@ -625,11 +659,55 @@ def _build_parser() -> argparse.ArgumentParser:
              "checkpoints/{run_name}_loso_<speaker>/last.ckpt when present.",
     )
     train_grp.add_argument(
+        "--loso-force-speakers",
+        type=str,
+        default=None,
+        metavar="CSV",
+        help="Force re-run specific LOSO held-out speakers (comma-separated). "
+             "Their old fold checkpoints/results are cleared first. "
+             "Example: MC02,MC03",
+    )
+    train_grp.add_argument(
         "--max_epochs",
+        "--max-epochs",
         type=int,
         default=None,
         metavar="INT",
         help="Override config.training.max_epochs.",
+    )
+    train_grp.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Override config.training.early_stopping_patience.",
+    )
+    train_grp.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        default=False,
+        help="Disable HuBERT gradient checkpointing (faster, uses more VRAM).",
+    )
+    train_grp.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Override config.training.batch_size.",
+    )
+    train_grp.add_argument(
+        "--grad-accum",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Override config.training.gradient_accumulation_steps.",
+    )
+    train_grp.add_argument(
+        "--check-val-every-n-epoch",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Override config.training.check_val_every_n_epoch (e.g., 2 for faster LOSO).",
     )
 
     # ── Forwarded as kwargs to evaluate_model() ──────────────────────────────
