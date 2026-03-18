@@ -35,13 +35,14 @@ model:
   hidden_dim: 512
   hubert_model_id: facebook/hubert-base-ls960
   hubert_model_revision: dba3bb02fda4248b6e082697eee756de8fe8aa8a
-  num_phonemes: 44
+  num_phonemes: 47
   severity_adapter_dim: 64
   spec_freq_mask_length: 8
   spec_freq_mask_prob: 0.05
   spec_time_mask_length: 10
   spec_time_mask_prob: 0.05
   use_articulatory_distance: true
+  use_gradient_checkpointing: false
   use_learnable_constraint: true
   use_severity_adapter: true
   use_spec_augment: true
@@ -100,7 +101,7 @@ symbolic:
   voice_weight: 0.25
 training:
   ablation_mode: full
-  batch_size: 8
+  batch_size: 12
   beam_length_norm_alpha: 0.6
   beam_lm_weight: 0.0
   blank_kl_stage1_end: 10
@@ -109,12 +110,13 @@ training:
   blank_kl_stage2_value: 0.15
   blank_priority_weight: 1.0
   blank_target_prob: 0.75
+  check_val_every_n_epoch: 2
   dropout: 0.1
-  early_stopping_patience: 8
+  early_stopping_patience: 5
   encoder_second_unfreeze_epoch: 6
   encoder_third_unfreeze_epoch: 12
   encoder_warmup_epochs: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 3
   gradient_clip_val: 1.0
   label_smoothing: 0.1
   lambda_articulatory: 0.08
@@ -125,10 +127,12 @@ training:
   lambda_symbolic_kl: 0.5
   layer_dropout: 0.05
   learning_rate: 3.0e-05
+  loso_bootstrap_samples: 2000
   lr_scheduler: onecycle
-  max_epochs: 40
+  max_epochs: 25
   monitor_metric: val/per
   monitor_mode: min
+  num_sanity_val_steps: 0
   num_workers: 8
   optimizer: AdamW
   pin_memory: true
