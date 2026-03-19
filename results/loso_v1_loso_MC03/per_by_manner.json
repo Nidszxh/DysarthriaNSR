@@ -1,50 +1,50 @@
 {
   "vowel": {
-    "per": 0.1751,
+    "per": 0.1763,
     "n_ref": 5424,
-    "n_sub": 543,
-    "n_del": 407
+    "n_sub": 529,
+    "n_del": 427
   },
   "fricative": {
     "per": 0.1289,
     "n_ref": 2530,
-    "n_sub": 102,
-    "n_del": 224
+    "n_sub": 109,
+    "n_del": 217
   },
   "glide": {
     "per": 0.1195,
     "n_ref": 502,
-    "n_sub": 26,
-    "n_del": 34
-  },
-  "diphthong": {
-    "per": 0.1178,
-    "n_ref": 399,
-    "n_sub": 25,
-    "n_del": 22
+    "n_sub": 27,
+    "n_del": 33
   },
   "stop": {
-    "per": 0.1166,
+    "per": 0.1175,
     "n_ref": 3345,
-    "n_sub": 163,
-    "n_del": 227
+    "n_sub": 167,
+    "n_del": 226
   },
-  "nasal": {
-    "per": 0.1027,
-    "n_ref": 1382,
-    "n_sub": 69,
-    "n_del": 73
+  "diphthong": {
+    "per": 0.1103,
+    "n_ref": 399,
+    "n_sub": 25,
+    "n_del": 19
   },
   "affricate": {
-    "per": 0.0884,
+    "per": 0.0994,
     "n_ref": 181,
-    "n_sub": 9,
+    "n_sub": 11,
     "n_del": 7
   },
+  "nasal": {
+    "per": 0.0941,
+    "n_ref": 1382,
+    "n_sub": 62,
+    "n_del": 68
+  },
   "liquid": {
-    "per": 0.0628,
+    "per": 0.0622,
     "n_ref": 1689,
-    "n_sub": 57,
-    "n_del": 49
+    "n_sub": 50,
+    "n_del": 55
   }
 }

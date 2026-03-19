@@ -607,6 +607,15 @@ class DysarthriaASRLightning(pl.LightningModule):
         phoneme head has not yet learned basic boundaries.
         """
         epoch           = self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0))
+        effective_final = max(0, int(self.config.training.max_epochs) - 1)
+        local_final = max(0, int(getattr(self.trainer, 'max_epochs', 1)) - 1)
+        # Make resumed epoch numbering explicit for logs: when continuing from
+        # epoch 21, logs should show effective epochs 22/23/24 even if the
+        # local Trainer loop is 0/1/2.
+        print(
+            f"🧭 Effective epoch {epoch}/{effective_final} "
+            f"(local {self.current_epoch}/{local_final})"
+        )
         warmup_ep       = self.config.training.encoder_warmup_epochs
         second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 6)
         third_unfreeze  = getattr(self.config.training, 'encoder_third_unfreeze_epoch', 12)
@@ -1197,6 +1206,38 @@ class _MetricLoggerCallback(pl.Callback):
             self.val_per.append(float(per))
 
 
+class _CompactFoldProgressCallback(pl.Callback):
+    """Compact, one-line epoch progress for LOSO folds (no tqdm/model table)."""
+
+    @staticmethod
+    def _fmt_metric(value: Optional[torch.Tensor]) -> str:
+        if value is None:
+            return "n/a"
+        try:
+            return f"{float(value):.3f}"
+        except Exception:
+            return "n/a"
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.sanity_checking:
+            return
+
+        metrics = trainer.callback_metrics
+        effective_epoch = int(pl_module.current_epoch + int(getattr(pl_module, 'resume_epoch_offset', 0)))
+        effective_final = max(0, int(getattr(pl_module.config.training, 'max_epochs', trainer.max_epochs)) - 1)
+
+        train_loss = self._fmt_metric(metrics.get('train/loss_epoch') or metrics.get('train/loss'))
+        val_loss = self._fmt_metric(metrics.get('val/loss'))
+        val_per = self._fmt_metric(metrics.get('val/per'))
+        blank_mean = self._fmt_metric(metrics.get('train/blank_prob_mean_epoch') or metrics.get('train/blank_prob_mean'))
+
+        print(
+            f"   📈 Epoch {effective_epoch}/{effective_final} | "
+            f"train/loss={train_loss} | val/loss={val_loss} | "
+            f"val/per={val_per} | blank={blank_mean}"
+        )
+
+
 def _save_learning_curve(
     train_losses: List[float],
     val_pers: List[float],
@@ -1493,7 +1534,27 @@ def run_loso(
     force_speakers: Optional[List[str]] = None,
 ) -> Dict:
 
-    speakers = list(dataset.df['speaker'].unique())
+    # Deterministic speaker order for LOSO folds:
+    # 1) Preserve group order by first appearance in the manifest (e.g. FC, MC, M, F)
+    # 2) Sort numerically within each group so MC01 comes before MC02.
+    raw_speakers = list(dataset.df['speaker'].unique())
+
+    def _split_speaker_id(spk: str) -> Tuple[str, int]:
+        m = re.match(r"([A-Za-z]+)(\d+)$", str(spk))
+        if not m:
+            return str(spk), 10**9
+        return m.group(1), int(m.group(2))
+
+    prefix_order: Dict[str, int] = {}
+    for spk in raw_speakers:
+        prefix, _ = _split_speaker_id(spk)
+        if prefix not in prefix_order:
+            prefix_order[prefix] = len(prefix_order)
+
+    speakers = sorted(
+        raw_speakers,
+        key=lambda s: (prefix_order.get(_split_speaker_id(s)[0], 10**9), _split_speaker_id(s)[1], str(s)),
+    )
     force_set = {s.strip() for s in (force_speakers or []) if str(s).strip()}
     print(f"\n🔁 LOSO: {len(speakers)} folds ({speakers})")
     if force_set:
@@ -1605,62 +1666,21 @@ def run_loso(
             print(f"   🔄 Forced clean rerun: cleared {force_ckpt_dir.name} and {force_results_dir.name}")
 
         if spk in completed_folds:
-            # If max_epochs increased after a prior run, allow a previously
-            # completed fold to continue from last.ckpt instead of being
-            # permanently skipped by the progress file.
-            ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
-            resume_ckpt = ckpt_dir / 'last.ckpt'
-            if resume and resume_ckpt.exists():
-                try:
-                    ckpt_meta = torch.load(resume_ckpt, map_location='cpu')
-                    resumed_epoch = int(ckpt_meta.get('epoch', -1))
-                    # Checkpoint stores zero-based epoch index (epoch=24 means
-                    # 25 epochs have already been completed). Re-open only when
-                    # there are truly epochs remaining.
-                    if resumed_epoch < (int(config.training.max_epochs) - 1):
-                        print(
-                            f"   🔁 Re-opening completed fold {spk}: "
-                            f"checkpoint epoch={resumed_epoch} < final_epoch={int(config.training.max_epochs) - 1}"
-                        )
-                        completed_folds.pop(spk, None)
-                    else:
-                        cached = completed_folds[spk]
-                        fold_per = float(cached.get('per', float('nan')))
-                        fold_wer = float(cached.get('wer', float('nan')))
-                        fold_n = int(cached.get('n_samples', 0))
-                        per_per_fold.append(fold_per)
-                        wer_per_fold.append(fold_wer)
-                        n_samples_per_fold.append(fold_n)
-                        print(
-                            f"   ⏭️  Skipping completed fold {spk}: "
-                            f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
-                        )
-                        continue
-                except Exception as exc:
-                    print(
-                        f"   ⚠️  Could not inspect {resume_ckpt}; keeping completed status for {spk}: {exc}"
-                    )
-                    cached = completed_folds[spk]
-                    fold_per = float(cached.get('per', float('nan')))
-                    fold_wer = float(cached.get('wer', float('nan')))
-                    fold_n = int(cached.get('n_samples', 0))
-                    per_per_fold.append(fold_per)
-                    wer_per_fold.append(fold_wer)
-                    n_samples_per_fold.append(fold_n)
-                    continue
-            else:
-                cached = completed_folds[spk]
-                fold_per = float(cached.get('per', float('nan')))
-                fold_wer = float(cached.get('wer', float('nan')))
-                fold_n = int(cached.get('n_samples', 0))
-                per_per_fold.append(fold_per)
-                wer_per_fold.append(fold_wer)
-                n_samples_per_fold.append(fold_n)
-                print(
-                    f"   ⏭️  Skipping completed fold {spk}: "
-                    f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
-                )
-                continue
+            # Trust crash-safe progress file as source-of-truth for completed folds.
+            # Re-opening based on checkpoint epoch causes completed folds to be
+            # retrained repeatedly after weights-only continuation flows.
+            cached = completed_folds[spk]
+            fold_per = float(cached.get('per', float('nan')))
+            fold_wer = float(cached.get('wer', float('nan')))
+            fold_n = int(cached.get('n_samples', 0))
+            per_per_fold.append(fold_per)
+            wer_per_fold.append(fold_wer)
+            n_samples_per_fold.append(fold_n)
+            print(
+                f"   ⏭️  Skipping completed fold {spk}: "
+                f"PER={fold_per:.4f} | WER={fold_wer:.4f} | n={fold_n}"
+            )
+            continue
 
         fold_start_time = time.time()
 
@@ -1683,6 +1703,14 @@ def run_loso(
             articulatory_weights=dataset.get_articulatory_loss_weights(),
         )
 
+        total_params = sum(p.numel() for p in lm.model.parameters())
+        trainable_params = sum(p.numel() for p in lm.model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        print(
+            f"   🧠 Params: total={total_params/1e6:.1f}M | "
+            f"trainable={trainable_params/1e6:.1f}M | frozen={frozen_params/1e6:.1f}M"
+        )
+
         ckpt_dir = get_project_root() / "checkpoints" / fold_run_name
         ckpt_cb = ModelCheckpoint(
             dirpath=str(ckpt_dir), monitor='val_per', mode='min',
@@ -1701,8 +1729,37 @@ def run_loso(
         weights_only_resume = False
         resumed_epoch = -1
         resume_ckpt = ckpt_dir / 'last.ckpt'
+        # Persisted marker for interrupted weights-only resumes. This avoids
+        # repeatedly re-entering scheduler-exhausted detection on every rerun
+        # when last.ckpt has not advanced yet.
+        weights_only_marker = ckpt_dir / 'weights_only_resume.pt'
         ckpt_path = str(resume_ckpt) if resume and resume_ckpt.exists() else None
         skip_fit = False
+
+        # If a prior run already switched this fold to weights-only continuation,
+        # continue directly from the persisted model state + epoch offset.
+        if resume and weights_only_marker.exists() and not skip_fit:
+            try:
+                marker = torch.load(weights_only_marker, map_location='cpu')
+                marker_start_epoch = int(marker.get('start_epoch', 0))
+                marker_state = marker.get('state_dict')
+                if marker_state is not None and marker_start_epoch < int(config.training.max_epochs):
+                    lm.load_state_dict(marker_state, strict=False)
+                    lm.resume_epoch_offset = marker_start_epoch
+                    trainer_max_epochs = max(1, int(config.training.max_epochs) - marker_start_epoch)
+                    resumed_epoch = marker_start_epoch - 1
+                    weights_only_resume = True
+                    ckpt_path = None
+                    print(
+                        f"   ♻️  Continuing existing weights-only resume "
+                        f"(start_epoch={marker_start_epoch}, remaining_epochs={trainer_max_epochs})"
+                    )
+                elif marker_start_epoch >= int(config.training.max_epochs):
+                    # Stale marker from an older run target; drop it.
+                    weights_only_marker.unlink(missing_ok=True)
+            except Exception as exc:
+                print(f"   ⚠️  Could not load weights-only marker {weights_only_marker.name}: {exc}")
+
         if ckpt_path:
             # Lightning cannot restore a checkpoint whose current_epoch is
             # >= Trainer(max_epochs). In deadline-driven runs we may reduce
@@ -1778,6 +1835,20 @@ def run_loso(
                     trainer_max_epochs = remaining_epochs
                     weights_only_resume = True
                     ckpt_path = None
+                    # Persist lightweight resume intent + model weights so if
+                    # this run is interrupted before a new last.ckpt is written,
+                    # subsequent reruns continue directly without repeating this
+                    # scheduler-exhausted path.
+                    try:
+                        torch.save(
+                            {
+                                'start_epoch': start_epoch,
+                                'state_dict': lm.state_dict(),
+                            },
+                            weights_only_marker,
+                        )
+                    except Exception as exc:
+                        print(f"   ⚠️  Could not write weights-only marker {weights_only_marker.name}: {exc}")
                     print(
                         f"   ↪️  Weights-only continuation: start_epoch={start_epoch}, "
                         f"remaining_epochs={remaining_epochs}"
@@ -1799,12 +1870,14 @@ def run_loso(
                     patience=config.training.early_stopping_patience,
                     mode='min'
                 ),
+                _CompactFoldProgressCallback(),
             ],
             val_check_interval=config.training.val_check_interval,
             check_val_every_n_epoch=config.training.check_val_every_n_epoch,
             num_sanity_val_steps=config.training.num_sanity_val_steps,
             logger=fold_logger,
-            enable_progress_bar=True,
+            enable_progress_bar=False,
+            enable_model_summary=False,
             log_every_n_steps=config.experiment.log_every_n_steps,
         )
 
@@ -1882,6 +1955,13 @@ def run_loso(
                 f"  |  avg/fold={avg_elapsed_sec/60.0:.1f} min"
                 f"  |  ETA remaining≈{eta_h}h {eta_m}m"
             )
+
+        # Fold finished successfully; cleanup any persisted weights-only marker.
+        if weights_only_marker.exists():
+            try:
+                weights_only_marker.unlink()
+            except Exception:
+                pass
 
         # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
         del trainer, lm, model

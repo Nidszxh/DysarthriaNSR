@@ -57,98 +57,111 @@
     ]
   },
   "rule_impact": {
-    "total_activations": 475,
+    "total_activations": 1380,
     "activation_rate": 0.0,
     "high_confidence_corrections": [],
     "rule_frequency": {
-      "T-><BLANK>": 16,
-      "IY-><BLANK>": 7,
-      "L-><BLANK>": 64,
-      "D-><BLANK>": 10,
+      "M->N": 1,
+      "T-><BLANK>": 135,
+      "CH-><BLANK>": 4,
+      "R-><BLANK>": 181,
+      "D-><BLANK>": 113,
       "Z-><BLANK>": 2,
-      "AY-><BLANK>": 1,
-      "R-><BLANK>": 115,
-      "AH-><BLANK>": 14,
-      "UW-><BLANK>": 8,
-      "AO-><BLANK>": 9,
-      "W-><BLANK>": 6,
-      "AE-><BLANK>": 3,
-      "AA-><BLANK>": 5,
+      "AY-><BLANK>": 7,
+      "IY-><BLANK>": 27,
+      "DH-><BLANK>": 9,
+      "B-><BLANK>": 23,
+      "N-><BLANK>": 187,
+      "L-><BLANK>": 116,
+      "W-><BLANK>": 62,
+      "AH-><BLANK>": 44,
+      "AE-><BLANK>": 10,
+      "ER-><BLANK>": 8,
+      "Y-><BLANK>": 7,
+      "G-><BLANK>": 15,
+      "AO-><BLANK>": 79,
+      "AO->R": 30,
+      "EY-><BLANK>": 10,
+      "EH-><BLANK>": 12,
+      "M-><BLANK>": 10,
+      "HH-><BLANK>": 5,
+      "UW-><BLANK>": 97,
+      "IH-><BLANK>": 97,
+      "L->T": 1,
+      "OW-><BLANK>": 10,
+      "AH->L": 1,
+      "AA-><BLANK>": 9,
+      "S-><BLANK>": 15,
+      "K-><BLANK>": 10,
+      "AE->AH": 2,
       "G->K": 1,
-      "OW-><BLANK>": 72,
-      "N-><BLANK>": 72,
-      "IH->IY": 1,
-      "AO->R": 3,
-      "HH-><BLANK>": 3,
-      "F-><BLANK>": 2,
-      "AH->B": 2,
-      "B-><BLANK>": 10,
-      "IH-><BLANK>": 11,
-      "B->M": 1,
-      "M-><BLANK>": 5,
-      "AW-><BLANK>": 1,
-      "Y-><BLANK>": 3,
-      "AH->L": 2,
-      "ER-><BLANK>": 3,
-      "JH-><BLANK>": 2,
-      "EY-><BLANK>": 2,
-      "V-><BLANK>": 1,
-      "EH-><BLANK>": 1,
-      "AH->N": 1,
-      "S-><BLANK>": 7,
-      "NG-><BLANK>": 1,
-      "IH->S": 2,
-      "B->P": 1,
-      "P-><BLANK>": 2,
-      "EY->R": 1,
+      "R->W": 1,
+      "IH->P": 1,
+      "SH-><BLANK>": 5,
+      "JH-><BLANK>": 3,
       "D->JH": 1,
-      "AH->P": 1
+      "V-><BLANK>": 1,
+      "AW-><BLANK>": 4,
+      "R->T": 4,
+      "AA->AO": 1,
+      "B->S": 1,
+      "AH->G": 1,
+      "S->T": 1,
+      "AH->N": 1,
+      "P-><BLANK>": 4,
+      "D->T": 2,
+      "DH->T": 1,
+      "TH-><BLANK>": 1,
+      "AH->M": 1,
+      "NG-><BLANK>": 1,
+      "F-><BLANK>": 4,
+      "IH->L": 1
     },
     "top_rules": [
       [
-        "R-><BLANK>",
-        115
-      ],
-      [
-        "OW-><BLANK>",
-        72
-      ],
-      [
         "N-><BLANK>",
-        72
+        187
       ],
       [
-        "L-><BLANK>",
-        64
+        "R-><BLANK>",
+        181
       ],
       [
         "T-><BLANK>",
-        16
+        135
       ],
       [
-        "AH-><BLANK>",
-        14
-      ],
-      [
-        "IH-><BLANK>",
-        11
+        "L-><BLANK>",
+        116
       ],
       [
         "D-><BLANK>",
-        10
+        113
       ],
       [
-        "B-><BLANK>",
-        10
+        "UW-><BLANK>",
+        97
+      ],
+      [
+        "IH-><BLANK>",
+        97
       ],
       [
         "AO-><BLANK>",
-        9
+        79
+      ],
+      [
+        "W-><BLANK>",
+        62
+      ],
+      [
+        "AH-><BLANK>",
+        44
       ]
     ],
     "per_speaker_activations": {},
-    "avg_blend_weight": 0.0884,
-    "avg_prediction_confidence": 0.4088,
+    "avg_blend_weight": 0.0894,
+    "avg_prediction_confidence": 0.3873,
     "rule_precision_proxy": 0.0,
     "rule_harm_rate_proxy": 0.0
   },

@@ -1193,7 +1193,7 @@ def plot_rule_impact(
         plt.close()
         return
 
-    # E6 fallback: constraint matrix heatmap ─────────────────────────────────
+    # E6 fallback: constraint matrix heatmap 
     if model is None:
         return  # Nothing to show
     try:
@@ -1804,7 +1804,7 @@ def evaluate_model(
         plot_rule_impact(rule_stats, results_dir / 'rule_impact.png',
                          model=model, id_to_phn=id_to_phn)
 
-    # ── Statistical tests (audit Phase 6 / ROADMAP §8) ───────────────────────
+    # ── Statistical tests (audit Phase 6 / ROADMAP §8) 
     # Welch t-test dysarthric vs. control (sample-level)
     t_stat, p_val_welch = (
         stats.ttest_ind(dysarthric_per, control_per, equal_var=False)

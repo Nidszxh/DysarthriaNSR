@@ -1,21 +1,21 @@
 {
-  "avg_per": 0.14040670186808923,
-  "wer": 0.1556432824229873,
+  "avg_per": 0.1392369046006119,
+  "wer": 0.1542842350504789,
   "overall": {
-    "per_macro_speaker": 0.14040670186808923,
-    "per_sample_mean": 0.14040670186808923,
-    "wer": 0.1556432824229873,
+    "per_macro_speaker": 0.1392369046006119,
+    "per_sample_mean": 0.1392369046006119,
+    "wer": 0.1542842350504789,
     "ci": [
-      0.14040670186808923,
-      0.14040670186808923
+      0.1392369046006119,
+      0.1392369046006119
     ],
-    "std": 0.21042156559295097,
+    "std": 0.2048581007610827,
     "n_samples": 1666,
     "n_speakers": 1
   },
   "symbolic_impact": {
-    "per_neural": 0.14040670186808923,
-    "per_constrained": 0.14040670186808923,
+    "per_neural": 0.1392369046006119,
+    "per_constrained": 0.1392369046006119,
     "delta_per": 0.0,
     "paired_delta_constrained_minus_neural": {
       "delta_mean": 0.0,
@@ -30,9 +30,9 @@
     "p_value_neural_vs_constrained": 1.0
   },
   "articulatory_accuracy": {
-    "manner": 0.7178657277882527,
-    "place": 0.8667865901542224,
-    "voice": 0.9015587692638095
+    "manner": 0.7273381506796364,
+    "place": 0.8679856302069245,
+    "voice": 0.9129496551246095
   },
   "stats": {
     "welch_t": 0.0,
@@ -57,90 +57,103 @@
     ]
   },
   "rule_impact": {
-    "total_activations": 497,
+    "total_activations": 1266,
     "activation_rate": 0.0,
     "high_confidence_corrections": [],
     "rule_frequency": {
-      "T-><BLANK>": 11,
-      "R-><BLANK>": 116,
-      "ER-><BLANK>": 11,
-      "S-><BLANK>": 3,
-      "IH-><BLANK>": 10,
-      "W-><BLANK>": 7,
-      "AH-><BLANK>": 92,
-      "AA-><BLANK>": 3,
-      "G-><BLANK>": 4,
-      "K-><BLANK>": 3,
-      "L-><BLANK>": 13,
-      "P-><BLANK>": 2,
-      "Y-><BLANK>": 3,
-      "N-><BLANK>": 18,
-      "D-><BLANK>": 8,
-      "UW-><BLANK>": 69,
-      "AH->N": 2,
-      "V-><BLANK>": 3,
-      "ER->R": 64,
-      "Z-><BLANK>": 2,
-      "AO-><BLANK>": 5,
-      "EY-><BLANK>": 3,
-      "B->P": 3,
-      "IY-><BLANK>": 7,
-      "B-><BLANK>": 11,
-      "EH-><BLANK>": 3,
-      "AO->R": 1,
-      "AY-><BLANK>": 3,
-      "B->M": 1,
-      "AE-><BLANK>": 7,
+      "T-><BLANK>": 38,
+      "R-><BLANK>": 210,
+      "AO->R": 3,
+      "AH-><BLANK>": 49,
+      "AO->L": 2,
+      "IH-><BLANK>": 114,
+      "IY-><BLANK>": 34,
+      "AO-><BLANK>": 17,
+      "N-><BLANK>": 123,
+      "UW-><BLANK>": 129,
+      "OW-><BLANK>": 13,
+      "AA-><BLANK>": 9,
+      "AH->B": 3,
+      "AE-><BLANK>": 13,
+      "AY-><BLANK>": 71,
+      "L-><BLANK>": 99,
+      "UW->P": 1,
+      "EH-><BLANK>": 17,
+      "M-><BLANK>": 16,
+      "HH-><BLANK>": 3,
+      "G-><BLANK>": 10,
+      "JH-><BLANK>": 5,
       "DH-><BLANK>": 2,
-      "M-><BLANK>": 4,
+      "W-><BLANK>": 15,
+      "EY-><BLANK>": 8,
+      "K-><BLANK>": 10,
+      "B-><BLANK>": 106,
+      "ER-><BLANK>": 10,
+      "S-><BLANK>": 6,
+      "P-><BLANK>": 12,
+      "D-><BLANK>": 79,
+      "Y-><BLANK>": 1,
+      "AA->AH": 2,
+      "NG-><BLANK>": 5,
+      "IH->T": 1,
+      "EH->R": 1,
+      "V-><BLANK>": 4,
+      "D->T": 2,
+      "AW-><BLANK>": 3,
       "F-><BLANK>": 2,
-      "SH-><BLANK>": 1
+      "B->P": 8,
+      "R->W": 1,
+      "AH->N": 2,
+      "B->M": 1,
+      "Z-><BLANK>": 4,
+      "AA->AO": 1,
+      "D->JH": 1
     },
     "top_rules": [
       [
         "R-><BLANK>",
-        116
-      ],
-      [
-        "AH-><BLANK>",
-        92
+        210
       ],
       [
         "UW-><BLANK>",
-        69
-      ],
-      [
-        "ER->R",
-        64
+        129
       ],
       [
         "N-><BLANK>",
-        18
-      ],
-      [
-        "L-><BLANK>",
-        13
-      ],
-      [
-        "T-><BLANK>",
-        11
-      ],
-      [
-        "ER-><BLANK>",
-        11
-      ],
-      [
-        "B-><BLANK>",
-        11
+        123
       ],
       [
         "IH-><BLANK>",
-        10
+        114
+      ],
+      [
+        "B-><BLANK>",
+        106
+      ],
+      [
+        "L-><BLANK>",
+        99
+      ],
+      [
+        "D-><BLANK>",
+        79
+      ],
+      [
+        "AY-><BLANK>",
+        71
+      ],
+      [
+        "AH-><BLANK>",
+        49
+      ],
+      [
+        "T-><BLANK>",
+        38
       ]
     ],
     "per_speaker_activations": {},
-    "avg_blend_weight": 0.0901,
-    "avg_prediction_confidence": 0.3925,
+    "avg_blend_weight": 0.0907,
+    "avg_prediction_confidence": 0.3959,
     "rule_precision_proxy": 0.0,
     "rule_harm_rate_proxy": 0.0
   },
@@ -155,11 +168,11 @@
       "n": 0
     },
     "control": {
-      "per_sample": 0.14040670186808923,
-      "per_speaker": 0.14040670186808923,
+      "per_sample": 0.1392369046006119,
+      "per_speaker": 0.1392369046006119,
       "ci": [
-        0.13027687604321245,
-        0.15080723436551385
+        0.12952514762208553,
+        0.14895138983748246
       ],
       "n": 1666
     }
@@ -185,29 +198,29 @@
     },
     "control": {
       "0-5": {
-        "mean_per": 0.13197306952459464,
+        "mean_per": 0.1305715856004397,
         "n_samples": 1213
       },
       "6-10": {
-        "mean_per": 0.12760416666666666,
+        "mean_per": 0.12444196428571427,
         "n_samples": 32
       },
       "11-20": {
-        "mean_per": 0.17465511508247022,
+        "mean_per": 0.17858264341499083,
         "n_samples": 112
       },
       "21+": {
-        "mean_per": 0.1624256496968717,
+        "mean_per": 0.16052411265910757,
         "n_samples": 309
       }
     }
   },
   "by_severity": {
     "normal": {
-      "mean_per": 0.14040670186808923,
+      "mean_per": 0.1392369046006119,
       "ci": [
-        0.14040670186808923,
-        0.14040670186808923
+        0.1392369046006119,
+        0.1392369046006119
       ],
       "n_speakers": 1,
       "speakers": [
@@ -253,52 +266,52 @@
   },
   "per_by_manner": {
     "vowel": {
-      "per": 0.1751,
+      "per": 0.1763,
       "n_ref": 5424,
-      "n_sub": 543,
-      "n_del": 407
+      "n_sub": 529,
+      "n_del": 427
     },
     "fricative": {
       "per": 0.1289,
       "n_ref": 2530,
-      "n_sub": 102,
-      "n_del": 224
+      "n_sub": 109,
+      "n_del": 217
     },
     "glide": {
       "per": 0.1195,
       "n_ref": 502,
-      "n_sub": 26,
-      "n_del": 34
-    },
-    "diphthong": {
-      "per": 0.1178,
-      "n_ref": 399,
-      "n_sub": 25,
-      "n_del": 22
+      "n_sub": 27,
+      "n_del": 33
     },
     "stop": {
-      "per": 0.1166,
+      "per": 0.1175,
       "n_ref": 3345,
-      "n_sub": 163,
-      "n_del": 227
+      "n_sub": 167,
+      "n_del": 226
     },
-    "nasal": {
-      "per": 0.1027,
-      "n_ref": 1382,
-      "n_sub": 69,
-      "n_del": 73
+    "diphthong": {
+      "per": 0.1103,
+      "n_ref": 399,
+      "n_sub": 25,
+      "n_del": 19
     },
     "affricate": {
-      "per": 0.0884,
+      "per": 0.0994,
       "n_ref": 181,
-      "n_sub": 9,
+      "n_sub": 11,
       "n_del": 7
     },
+    "nasal": {
+      "per": 0.0941,
+      "n_ref": 1382,
+      "n_sub": 62,
+      "n_del": 68
+    },
     "liquid": {
-      "per": 0.0628,
+      "per": 0.0622,
       "n_ref": 1689,
-      "n_sub": 57,
-      "n_del": 49
+      "n_sub": 50,
+      "n_del": 55
     }
   },
   "rule_pair_confusion": {},
@@ -311,22 +324,22 @@
   },
   "per_speaker": {
     "MC03": {
-      "per": 0.14040670186808923,
+      "per": 0.1392369046006119,
       "ci": [
-        0.13017387702351127,
-        0.15048278599212056
+        0.128930785979267,
+        0.15014743962602103
       ],
-      "std": 0.21042156559295097,
+      "std": 0.2048581007610827,
       "n_samples": 1666,
       "status": 0
     }
   },
   "error_analysis": {
     "error_counts": {
-      "substitutions": 994,
-      "deletions": 368,
-      "insertions": 1043,
-      "correct": 13415
+      "substitutions": 980,
+      "deletions": 352,
+      "insertions": 1052,
+      "correct": 13420
     },
     "common_confusions": [
       [
@@ -334,49 +347,49 @@
           "IH",
           "AH"
         ],
-        63
+        58
       ],
       [
         [
           "D",
           "T"
         ],
-        51
+        48
       ],
       [
         [
           "AE",
           "EH"
         ],
-        44
+        46
       ],
       [
         [
           "AO",
           "AA"
         ],
-        37
-      ],
-      [
-        [
-          "AE",
-          "AH"
-        ],
-        31
+        35
       ],
       [
         [
           "AH",
           "IH"
         ],
-        30
+        35
+      ],
+      [
+        [
+          "AE",
+          "AH"
+        ],
+        32
       ],
       [
         [
           "EH",
           "IH"
         ],
-        28
+        26
       ],
       [
         [
@@ -394,43 +407,43 @@
       ],
       [
         [
-          "R",
-          "ER"
+          "G",
+          "K"
         ],
         21
       ],
       [
         [
-          "AA",
-          "AH"
+          "R",
+          "ER"
         ],
-        16
+        20
       ],
       [
         [
           "T",
           "D"
         ],
-        16
+        18
+      ],
+      [
+        [
+          "AA",
+          "AH"
+        ],
+        17
       ],
       [
         [
           "IH",
           "IY"
         ],
-        14
+        13
       ],
       [
         [
-          "G",
-          "K"
-        ],
-        14
-      ],
-      [
-        [
-          "UH",
-          "AH"
+          "IY",
+          "IH"
         ],
         13
       ],
@@ -439,26 +452,19 @@
           "AA",
           "AO"
         ],
-        11
-      ],
-      [
-        [
-          "IY",
-          "IH"
-        ],
-        10
+        12
       ],
       [
         [
           "F",
           "S"
         ],
-        10
+        9
       ],
       [
         [
-          "N",
-          "T"
+          "UH",
+          "AH"
         ],
         9
       ],
@@ -468,18 +474,25 @@
           "T"
         ],
         8
+      ],
+      [
+        [
+          "UH",
+          "IH"
+        ],
+        8
       ]
     ],
     "deletion_phonemes": [
       [
         null,
-        368
+        352
       ]
     ],
     "insertion_phonemes": [
       [
         null,
-        1043
+        1052
       ]
     ]
   },

@@ -110,7 +110,7 @@ training:
   blank_kl_stage2_value: 0.15
   blank_priority_weight: 1.0
   blank_target_prob: 0.75
-  check_val_every_n_epoch: 2
+  check_val_every_n_epoch: 1
   dropout: 0.1
   early_stopping_patience: 5
   encoder_second_unfreeze_epoch: 6

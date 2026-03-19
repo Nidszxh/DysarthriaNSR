@@ -1,21 +1,21 @@
 {
-  "avg_per": 0.13290119246268448,
-  "wer": 0.13575175690388994,
+  "avg_per": 0.13610458943610695,
+  "wer": 0.13664258141146193,
   "overall": {
-    "per_macro_speaker": 0.13290119246268448,
-    "per_sample_mean": 0.13290119246268448,
-    "wer": 0.13575175690388994,
+    "per_macro_speaker": 0.13610458943610695,
+    "per_sample_mean": 0.13610458943610695,
+    "wer": 0.13664258141146193,
     "ci": [
-      0.13290119246268448,
-      0.13290119246268448
+      0.13610458943610695,
+      0.13610458943610695
     ],
-    "std": 0.2788373835794268,
+    "std": 0.2834291686945947,
     "n_samples": 2151,
     "n_speakers": 1
   },
   "symbolic_impact": {
-    "per_neural": 0.13290119246268448,
-    "per_constrained": 0.13290119246268448,
+    "per_neural": 0.13610458943610695,
+    "per_constrained": 0.13610458943610695,
     "delta_per": 0.0,
     "paired_delta_constrained_minus_neural": {
       "delta_mean": 0.0,
@@ -30,9 +30,9 @@
     "p_value_neural_vs_constrained": 1.0
   },
   "articulatory_accuracy": {
-    "manner": 0.7199074279930856,
-    "place": 0.8722222417593002,
-    "voice": 0.9375000125832028
+    "manner": 0.7222222425871425,
+    "place": 0.8731481671333313,
+    "voice": 0.9333333459165362
   },
   "stats": {
     "welch_t": 0.0,
@@ -57,96 +57,103 @@
     ]
   },
   "rule_impact": {
-    "total_activations": 531,
+    "total_activations": 1689,
     "activation_rate": 0.0,
     "high_confidence_corrections": [],
     "rule_frequency": {
-      "EY-><BLANK>": 1,
-      "IY-><BLANK>": 139,
-      "L-><BLANK>": 94,
-      "R-><BLANK>": 21,
-      "F-><BLANK>": 2,
-      "AO-><BLANK>": 5,
-      "S-><BLANK>": 2,
-      "Z-><BLANK>": 3,
-      "M-><BLANK>": 5,
-      "AH-><BLANK>": 84,
-      "ER-><BLANK>": 7,
+      "IY-><BLANK>": 80,
+      "K-><BLANK>": 10,
+      "F-><BLANK>": 6,
+      "B-><BLANK>": 31,
+      "T-><BLANK>": 312,
+      "AH-><BLANK>": 58,
+      "W-><BLANK>": 17,
+      "D-><BLANK>": 182,
+      "OW-><BLANK>": 10,
+      "Z-><BLANK>": 4,
+      "R-><BLANK>": 385,
+      "EY-><BLANK>": 9,
+      "AO-><BLANK>": 25,
+      "AE-><BLANK>": 13,
+      "N-><BLANK>": 116,
+      "UW-><BLANK>": 28,
+      "G-><BLANK>": 81,
+      "L-><BLANK>": 87,
+      "AA-><BLANK>": 13,
+      "AA->AO": 1,
+      "AW-><BLANK>": 6,
+      "IH-><BLANK>": 68,
+      "AY-><BLANK>": 7,
       "N->T": 1,
-      "T-><BLANK>": 12,
-      "UW-><BLANK>": 9,
-      "G-><BLANK>": 4,
-      "IH->N": 1,
-      "HH-><BLANK>": 2,
-      "D-><BLANK>": 14,
-      "IH-><BLANK>": 66,
-      "B-><BLANK>": 7,
-      "W-><BLANK>": 3,
-      "V-><BLANK>": 1,
-      "AH->D": 1,
-      "AH->B": 1,
-      "AY-><BLANK>": 2,
-      "AW-><BLANK>": 1,
-      "N-><BLANK>": 11,
-      "OW-><BLANK>": 1,
-      "AE-><BLANK>": 4,
-      "K-><BLANK>": 6,
-      "JH-><BLANK>": 7,
-      "CH-><BLANK>": 1,
-      "Y-><BLANK>": 3,
+      "DH-><BLANK>": 9,
+      "P-><BLANK>": 4,
+      "M-><BLANK>": 11,
       "AH->N": 1,
-      "AA-><BLANK>": 1,
-      "EH-><BLANK>": 3,
-      "P-><BLANK>": 1,
-      "D->T": 2,
-      "D->JH": 1,
-      "SH-><BLANK>": 1
+      "EH-><BLANK>": 16,
+      "IH->NG": 1,
+      "S-><BLANK>": 7,
+      "V-><BLANK>": 3,
+      "CH-><BLANK>": 5,
+      "Y-><BLANK>": 3,
+      "IH->D": 1,
+      "JH-><BLANK>": 56,
+      "ER-><BLANK>": 10,
+      "G->N": 1,
+      "D->N": 1,
+      "SH-><BLANK>": 3,
+      "B->P": 1,
+      "HH-><BLANK>": 1,
+      "NG-><BLANK>": 1,
+      "AH->L": 1,
+      "F->P": 1,
+      "AE->AH": 1,
+      "D->T": 1
     },
     "top_rules": [
       [
-        "IY-><BLANK>",
-        139
-      ],
-      [
-        "L-><BLANK>",
-        94
-      ],
-      [
-        "AH-><BLANK>",
-        84
-      ],
-      [
-        "IH-><BLANK>",
-        66
-      ],
-      [
         "R-><BLANK>",
-        21
-      ],
-      [
-        "D-><BLANK>",
-        14
+        385
       ],
       [
         "T-><BLANK>",
-        12
+        312
+      ],
+      [
+        "D-><BLANK>",
+        182
       ],
       [
         "N-><BLANK>",
-        11
+        116
       ],
       [
-        "UW-><BLANK>",
-        9
+        "L-><BLANK>",
+        87
       ],
       [
-        "ER-><BLANK>",
-        7
+        "G-><BLANK>",
+        81
+      ],
+      [
+        "IY-><BLANK>",
+        80
+      ],
+      [
+        "IH-><BLANK>",
+        68
+      ],
+      [
+        "AH-><BLANK>",
+        58
+      ],
+      [
+        "JH-><BLANK>",
+        56
       ]
     ],
     "per_speaker_activations": {},
-    "avg_blend_weight": 0.0898,
-    "avg_prediction_confidence": 0.4018,
+    "avg_blend_weight": 0.0906,
+    "avg_prediction_confidence": 0.3799,
     "rule_precision_proxy": 0.0,
     "rule_harm_rate_proxy": 0.0
   },
@@ -161,11 +168,11 @@
       "n": 0
     },
     "control": {
-      "per_sample": 0.13290119246268448,
-      "per_speaker": 0.13290119246268448,
+      "per_sample": 0.13610458943610695,
+      "per_speaker": 0.13610458943610695,
       "ci": [
-        0.12243331250053975,
-        0.14558601708976712
+        0.12600132675134035,
+        0.14857482583054687
       ],
       "n": 2151
     }
@@ -191,29 +198,29 @@
     },
     "control": {
       "0-5": {
-        "mean_per": 0.1339247311827957,
+        "mean_per": 0.13827956989247311,
         "n_samples": 1550
       },
       "6-10": {
-        "mean_per": 0.07336860670194002,
+        "mean_per": 0.07892416225749559,
         "n_samples": 36
       },
       "11-20": {
-        "mean_per": 0.12503590305017892,
+        "mean_per": 0.1252265902779032,
         "n_samples": 162
       },
       "21+": {
-        "mean_per": 0.13744428168362827,
+        "mean_per": 0.13722000267355483,
         "n_samples": 403
       }
     }
   },
   "by_severity": {
     "normal": {
-      "mean_per": 0.13290119246268448,
+      "mean_per": 0.13610458943610695,
       "ci": [
-        0.13290119246268448,
-        0.13290119246268448
+        0.13610458943610695,
+        0.13610458943610695
       ],
       "n_speakers": 1,
       "speakers": [
@@ -259,28 +266,22 @@
   },
   "per_by_manner": {
     "vowel": {
-      "per": 0.1401,
+      "per": 0.1411,
       "n_ref": 7045,
-      "n_sub": 652,
-      "n_del": 335
+      "n_sub": 663,
+      "n_del": 331
     },
     "fricative": {
-      "per": 0.1226,
+      "per": 0.1202,
       "n_ref": 3294,
-      "n_sub": 160,
-      "n_del": 244
+      "n_sub": 164,
+      "n_del": 232
     },
     "stop": {
-      "per": 0.113,
+      "per": 0.1157,
       "n_ref": 4391,
-      "n_sub": 172,
-      "n_del": 324
-    },
-    "affricate": {
-      "per": 0.0866,
-      "n_ref": 254,
-      "n_sub": 16,
-      "n_del": 6
+      "n_sub": 173,
+      "n_del": 335
     },
     "diphthong": {
       "per": 0.0853,
@@ -288,23 +289,29 @@
       "n_sub": 33,
       "n_del": 11
     },
+    "affricate": {
+      "per": 0.0827,
+      "n_ref": 254,
+      "n_sub": 15,
+      "n_del": 6
+    },
     "liquid": {
-      "per": 0.0546,
+      "per": 0.0555,
       "n_ref": 2233,
-      "n_sub": 70,
-      "n_del": 52
+      "n_sub": 73,
+      "n_del": 51
     },
     "glide": {
       "per": 0.0505,
       "n_ref": 673,
-      "n_sub": 10,
-      "n_del": 24
+      "n_sub": 11,
+      "n_del": 23
     },
     "nasal": {
-      "per": 0.0389,
+      "per": 0.0367,
       "n_ref": 1800,
-      "n_sub": 38,
-      "n_del": 32
+      "n_sub": 36,
+      "n_del": 30
     }
   },
   "rule_pair_confusion": {},
@@ -317,37 +324,37 @@
   },
   "per_speaker": {
     "MC01": {
-      "per": 0.13290119246268448,
+      "per": 0.13610458943610695,
       "ci": [
-        0.12252357633610209,
-        0.1465719900537238
+        0.12499943760859152,
+        0.15026707478022555
       ],
-      "std": 0.2788373835794268,
+      "std": 0.2834291686945947,
       "n_samples": 2151,
       "status": 0
     }
   },
   "error_analysis": {
     "error_counts": {
-      "substitutions": 1151,
-      "deletions": 564,
-      "insertions": 1028,
-      "correct": 18027
+      "substitutions": 1168,
+      "deletions": 574,
+      "insertions": 1019,
+      "correct": 18019
     },
     "common_confusions": [
-      [
-        [
-          "AH",
-          "IH"
-        ],
-        61
-      ],
       [
         [
           "IH",
           "AH"
         ],
-        59
+        63
+      ],
+      [
+        [
+          "AH",
+          "IH"
+        ],
+        56
       ],
       [
         [
@@ -361,21 +368,21 @@
           "R",
           "ER"
         ],
-        38
+        39
       ],
       [
         [
           "ER",
           "R"
         ],
-        31
+        28
       ],
       [
         [
           "D",
           "T"
         ],
-        29
+        27
       ],
       [
         [
@@ -386,10 +393,10 @@
       ],
       [
         [
-          "AH",
-          "UW"
+          "AO",
+          "AA"
         ],
-        22
+        21
       ],
       [
         [
@@ -400,43 +407,43 @@
       ],
       [
         [
-          "IY",
-          "IH"
+          "AH",
+          "UW"
         ],
         19
       ],
       [
         [
-          "AO",
-          "AA"
+          "IY",
+          "IH"
         ],
         18
+      ],
+      [
+        [
+          "AE",
+          "EH"
+        ],
+        17
       ],
       [
         [
           "UH",
           "AH"
         ],
-        17
+        16
       ],
       [
         [
           "IY",
           "UW"
         ],
-        16
+        15
       ],
       [
         [
           "EH",
           "IH"
-        ],
-        16
-      ],
-      [
-        [
-          "AE",
-          "EH"
         ],
         15
       ],
@@ -456,36 +463,36 @@
       ],
       [
         [
-          "IH",
-          "IY"
-        ],
-        14
-      ],
-      [
-        [
           "EH",
           "AH"
         ],
-        13
+        14
       ],
       [
         [
           "AH",
           "AA"
         ],
-        13
+        14
+      ],
+      [
+        [
+          "AO",
+          "OW"
+        ],
+        14
       ]
     ],
     "deletion_phonemes": [
       [
         null,
-        564
+        574
       ]
     ],
     "insertion_phonemes": [
       [
         null,
-        1028
+        1019
       ]
     ]
   },

@@ -8,8 +8,8 @@
   },
   "UH": {
     "n_ref": 42,
-    "n_sub": 32,
-    "n_del": 10,
+    "n_sub": 27,
+    "n_del": 15,
     "n_ins": 0,
     "per": 1.0
   },
@@ -22,254 +22,254 @@
   },
   "TH": {
     "n_ref": 57,
-    "n_sub": 34,
-    "n_del": 17,
+    "n_sub": 35,
+    "n_del": 15,
     "n_ins": 0,
-    "per": 0.8947
+    "per": 0.8772
   },
   "DH": {
     "n_ref": 267,
-    "n_sub": 8,
-    "n_del": 72,
-    "n_ins": 16,
-    "per": 0.2996
-  },
-  "AO": {
-    "n_ref": 304,
-    "n_sub": 57,
-    "n_del": 31,
-    "n_ins": 33,
-    "per": 0.2895
+    "n_sub": 10,
+    "n_del": 75,
+    "n_ins": 15,
+    "per": 0.3184
   },
   "AE": {
     "n_ref": 374,
-    "n_sub": 83,
-    "n_del": 25,
-    "n_ins": 14,
-    "per": 0.2888
+    "n_sub": 84,
+    "n_del": 23,
+    "n_ins": 13,
+    "per": 0.2861
+  },
+  "AO": {
+    "n_ref": 304,
+    "n_sub": 53,
+    "n_del": 33,
+    "n_ins": 35,
+    "per": 0.2829
   },
   "AA": {
     "n_ref": 295,
-    "n_sub": 38,
-    "n_del": 42,
-    "n_ins": 51,
-    "per": 0.2712
+    "n_sub": 41,
+    "n_del": 41,
+    "n_ins": 46,
+    "per": 0.278
   },
   "G": {
     "n_ref": 205,
-    "n_sub": 27,
-    "n_del": 18,
-    "n_ins": 8,
-    "per": 0.2195
+    "n_sub": 34,
+    "n_del": 21,
+    "n_ins": 6,
+    "per": 0.2683
   },
   "D": {
     "n_ref": 618,
-    "n_sub": 67,
-    "n_del": 64,
-    "n_ins": 44,
-    "per": 0.212
+    "n_sub": 65,
+    "n_del": 63,
+    "n_ins": 49,
+    "per": 0.2071
   },
   "IH": {
     "n_ref": 884,
-    "n_sub": 95,
-    "n_del": 90,
-    "n_ins": 113,
-    "per": 0.2093
+    "n_sub": 89,
+    "n_del": 91,
+    "n_ins": 119,
+    "per": 0.2036
+  },
+  "AH": {
+    "n_ref": 1177,
+    "n_sub": 96,
+    "n_del": 121,
+    "n_ins": 182,
+    "per": 0.1844
   },
   "HH": {
     "n_ref": 234,
     "n_sub": 5,
-    "n_del": 37,
-    "n_ins": 20,
-    "per": 0.1795
-  },
-  "AH": {
-    "n_ref": 1177,
-    "n_sub": 90,
-    "n_del": 114,
-    "n_ins": 198,
-    "per": 0.1733
+    "n_del": 36,
+    "n_ins": 27,
+    "per": 0.1752
   },
   "Y": {
     "n_ref": 141,
-    "n_sub": 7,
-    "n_del": 16,
-    "n_ins": 16,
+    "n_sub": 8,
+    "n_del": 15,
+    "n_ins": 18,
     "per": 0.1631
   },
   "AW": {
     "n_ref": 74,
     "n_sub": 7,
     "n_del": 5,
-    "n_ins": 9,
+    "n_ins": 8,
     "per": 0.1622
   },
   "EH": {
     "n_ref": 539,
-    "n_sub": 58,
-    "n_del": 29,
-    "n_ins": 84,
-    "per": 0.1614
+    "n_sub": 52,
+    "n_del": 31,
+    "n_ins": 80,
+    "per": 0.154
   },
   "CH": {
     "n_ref": 98,
-    "n_sub": 9,
-    "n_del": 4,
+    "n_sub": 11,
+    "n_del": 3,
     "n_ins": 3,
-    "per": 0.1327
+    "per": 0.1429
   },
   "ER": {
     "n_ref": 354,
     "n_sub": 28,
     "n_del": 13,
-    "n_ins": 59,
+    "n_ins": 55,
     "per": 0.1158
   },
   "UW": {
     "n_ref": 256,
-    "n_sub": 12,
-    "n_del": 17,
-    "n_ins": 27,
+    "n_sub": 13,
+    "n_del": 16,
+    "n_ins": 22,
     "per": 0.1133
-  },
-  "NG": {
-    "n_ref": 132,
-    "n_sub": 5,
-    "n_del": 9,
-    "n_ins": 3,
-    "per": 0.1061
-  },
-  "N": {
-    "n_ref": 829,
-    "n_sub": 41,
-    "n_del": 46,
-    "n_ins": 26,
-    "per": 0.1049
   },
   "W": {
     "n_ref": 361,
     "n_sub": 19,
     "n_del": 18,
-    "n_ins": 28,
+    "n_ins": 29,
     "per": 0.1025
   },
-  "M": {
-    "n_ref": 421,
-    "n_sub": 23,
-    "n_del": 18,
-    "n_ins": 7,
-    "per": 0.0974
+  "N": {
+    "n_ref": 829,
+    "n_sub": 39,
+    "n_del": 43,
+    "n_ins": 22,
+    "per": 0.0989
   },
-  "T": {
-    "n_ref": 1123,
-    "n_sub": 33,
-    "n_del": 73,
-    "n_ins": 138,
-    "per": 0.0944
+  "NG": {
+    "n_ref": 132,
+    "n_sub": 5,
+    "n_del": 8,
+    "n_ins": 4,
+    "per": 0.0985
   },
   "P": {
     "n_ref": 430,
-    "n_sub": 10,
-    "n_del": 30,
-    "n_ins": 31,
-    "per": 0.093
+    "n_sub": 13,
+    "n_del": 29,
+    "n_ins": 26,
+    "per": 0.0977
+  },
+  "T": {
+    "n_ref": 1123,
+    "n_sub": 36,
+    "n_del": 73,
+    "n_ins": 129,
+    "per": 0.0971
   },
   "F": {
     "n_ref": 323,
-    "n_sub": 17,
-    "n_del": 11,
+    "n_sub": 16,
+    "n_del": 12,
     "n_ins": 25,
     "per": 0.0867
   },
-  "B": {
-    "n_ref": 338,
-    "n_sub": 12,
-    "n_del": 17,
-    "n_ins": 29,
-    "per": 0.0858
-  },
   "IY": {
     "n_ref": 615,
-    "n_sub": 27,
-    "n_del": 24,
-    "n_ins": 66,
-    "per": 0.0829
+    "n_sub": 26,
+    "n_del": 26,
+    "n_ins": 62,
+    "per": 0.0846
+  },
+  "M": {
+    "n_ref": 421,
+    "n_sub": 18,
+    "n_del": 17,
+    "n_ins": 8,
+    "per": 0.0831
   },
   "Z": {
     "n_ref": 408,
-    "n_sub": 10,
-    "n_del": 23,
-    "n_ins": 21,
-    "per": 0.0809
+    "n_sub": 12,
+    "n_del": 20,
+    "n_ins": 23,
+    "per": 0.0784
   },
   "S": {
     "n_ref": 847,
-    "n_sub": 13,
-    "n_del": 50,
-    "n_ins": 52,
+    "n_sub": 16,
+    "n_del": 47,
+    "n_ins": 58,
     "per": 0.0744
   },
   "OW": {
     "n_ref": 268,
-    "n_sub": 10,
-    "n_del": 8,
-    "n_ins": 13,
-    "per": 0.0672
+    "n_sub": 9,
+    "n_del": 10,
+    "n_ins": 14,
+    "per": 0.0709
+  },
+  "B": {
+    "n_ref": 338,
+    "n_sub": 8,
+    "n_del": 15,
+    "n_ins": 33,
+    "per": 0.068
   },
   "R": {
     "n_ref": 887,
-    "n_sub": 34,
-    "n_del": 25,
-    "n_ins": 104,
-    "per": 0.0665
+    "n_sub": 33,
+    "n_del": 23,
+    "n_ins": 91,
+    "per": 0.0631
+  },
+  "L": {
+    "n_ref": 802,
+    "n_sub": 17,
+    "n_del": 32,
+    "n_ins": 35,
+    "per": 0.0611
   },
   "K": {
     "n_ref": 631,
-    "n_sub": 14,
+    "n_sub": 11,
     "n_del": 25,
-    "n_ins": 30,
-    "per": 0.0618
+    "n_ins": 36,
+    "per": 0.0571
   },
-  "AY": {
-    "n_ref": 309,
-    "n_sub": 5,
-    "n_del": 14,
-    "n_ins": 17,
-    "per": 0.0615
+  "EY": {
+    "n_ref": 316,
+    "n_sub": 11,
+    "n_del": 7,
+    "n_ins": 23,
+    "per": 0.057
   },
   "V": {
     "n_ref": 230,
     "n_sub": 6,
-    "n_del": 8,
+    "n_del": 6,
     "n_ins": 4,
-    "per": 0.0609
+    "per": 0.0522
   },
-  "L": {
-    "n_ref": 802,
-    "n_sub": 23,
-    "n_del": 24,
-    "n_ins": 33,
-    "per": 0.0586
-  },
-  "EY": {
-    "n_ref": 316,
-    "n_sub": 13,
-    "n_del": 4,
-    "n_ins": 29,
-    "per": 0.0538
+  "AY": {
+    "n_ref": 309,
+    "n_sub": 5,
+    "n_del": 11,
+    "n_ins": 17,
+    "per": 0.0518
   },
   "JH": {
     "n_ref": 83,
     "n_sub": 0,
-    "n_del": 3,
-    "n_ins": 2,
-    "per": 0.0361
+    "n_del": 4,
+    "n_ins": 3,
+    "per": 0.0482
   },
   "SH": {
     "n_ref": 154,
     "n_sub": 3,
     "n_del": 2,
-    "n_ins": 9,
+    "n_ins": 12,
     "per": 0.0325
   }
 }

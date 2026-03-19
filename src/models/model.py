@@ -803,9 +803,7 @@ class NeuroSymbolicASR(nn.Module):
             f"{total:,}", f"{trainable:,}", trainable / total * 100
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
     # Layer freezing
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _configure_frozen_layers(self) -> None:
         """Freeze feature extractor and configured encoder layers."""
@@ -854,9 +852,7 @@ class NeuroSymbolicASR(nn.Module):
         self._configure_frozen_layers()
         logger.info("Unfroze HuBERT encoder (keeping configured frozen layers)")
 
-    # ──────────────────────────────────────────────────────────────────────────
     # Forward pass
-    # ──────────────────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -1048,9 +1044,7 @@ class NeuroSymbolicASR(nn.Module):
 
         return result
 
-    # ──────────────────────────────────────────────────────────────────────────
     # Helpers
-    # ──────────────────────────────────────────────────────────────────────────
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
