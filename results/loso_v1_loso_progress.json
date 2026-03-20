@@ -4,18 +4,18 @@
     "FC01",
     "FC02",
     "FC03",
-    "MC02",
     "MC01",
+    "MC02",
     "MC03",
     "MC04",
-    "M05",
-    "M02",
-    "M04",
     "M01",
-    "F01",
+    "M02",
     "M03",
-    "F04",
-    "F03"
+    "M04",
+    "M05",
+    "F01",
+    "F03",
+    "F04"
   ],
   "max_epochs": 25,
   "folds": [
@@ -53,37 +53,136 @@
       "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_FC03"
     },
     {
+      "speaker": "MC01",
+      "status": "completed",
+      "per": 0.13610458943610695,
+      "wer": 0.13664258141146193,
+      "n_samples": 2151,
+      "trained_epochs": 25,
+      "elapsed_sec": 707.3054254055023,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC01/epoch=01-val_per=0.406.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_MC01"
+    },
+    {
       "speaker": "MC02",
       "status": "completed",
       "per": 0.2486944655813159,
       "wer": 0.21864003804089396,
       "n_samples": 1121,
       "trained_epochs": 25,
-      "elapsed_sec": 631.2644557952881,
+      "elapsed_sec": 740.0707693099976,
       "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC02/epoch=01-val_per=0.359.ckpt",
       "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_MC02"
     },
     {
-      "speaker": "MC01",
-      "status": "completed",
-      "per": 0.13290119246268448,
-      "wer": 0.13575175690388994,
-      "n_samples": 2151,
-      "trained_epochs": 25,
-      "elapsed_sec": 653.209370136261,
-      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC01/epoch=01-val_per=0.408.ckpt",
-      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_MC01"
-    },
-    {
       "speaker": "MC03",
       "status": "completed",
-      "per": 0.14040670186808923,
-      "wer": 0.1556432824229873,
+      "per": 0.1392369046006119,
+      "wer": 0.1542842350504789,
       "n_samples": 1666,
       "trained_epochs": 25,
-      "elapsed_sec": 631.0235238075256,
-      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC03/epoch=01-val_per=0.357.ckpt",
+      "elapsed_sec": 721.606683254242,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC03/epoch=01-val_per=0.356.ckpt",
       "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_MC03"
+    },
+    {
+      "speaker": "MC04",
+      "status": "completed",
+      "per": 0.15318894943584907,
+      "wer": 0.17407113579267486,
+      "n_samples": 1617,
+      "trained_epochs": 25,
+      "elapsed_sec": 5547.368830680847,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_MC04/epoch=21-val_per=0.361.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_MC04"
+    },
+    {
+      "speaker": "M01",
+      "status": "completed",
+      "per": 0.5281577982330027,
+      "wer": 0.6871794871794872,
+      "n_samples": 743,
+      "trained_epochs": 25,
+      "elapsed_sec": 2422.470600128174,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_M01/epoch=19-val_per=0.375.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_M01"
+    },
+    {
+      "speaker": "M02",
+      "status": "completed",
+      "per": 0.5769942434680508,
+      "wer": 0.66583504549457,
+      "n_samples": 770,
+      "trained_epochs": 25,
+      "elapsed_sec": 6313.879278421402,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_M02/epoch=22-val_per=0.372.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_M02"
+    },
+    {
+      "speaker": "M03",
+      "status": "completed",
+      "per": 0.10159129609251608,
+      "wer": 0.1407912687585266,
+      "n_samples": 810,
+      "trained_epochs": 25,
+      "elapsed_sec": 5878.973260402679,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_M03/epoch=21-val_per=0.369.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_M03"
+    },
+    {
+      "speaker": "M04",
+      "status": "completed",
+      "per": 0.5805538983738376,
+      "wer": 0.7014128187456926,
+      "n_samples": 666,
+      "trained_epochs": 21,
+      "elapsed_sec": 5055.969932079315,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_M04/epoch=15-val_per=0.362.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_M04"
+    },
+    {
+      "speaker": "M05",
+      "status": "completed",
+      "per": 0.49675030048092267,
+      "wer": 0.6593979158626013,
+      "n_samples": 586,
+      "trained_epochs": 24,
+      "elapsed_sec": 5843.246298313141,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_M05/epoch=18-val_per=0.397.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_M05"
+    },
+    {
+      "speaker": "F01",
+      "status": "completed",
+      "per": 0.4877561876730347,
+      "wer": 0.5934959349593496,
+      "n_samples": 236,
+      "trained_epochs": 25,
+      "elapsed_sec": 6379.21476149559,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_F01/epoch=24-val_per=0.373.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_F01"
+    },
+    {
+      "speaker": "F03",
+      "status": "completed",
+      "per": 0.34384063144737625,
+      "wer": 0.36513061344291164,
+      "n_samples": 1087,
+      "trained_epochs": 25,
+      "elapsed_sec": 6098.197840213776,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_F03/epoch=20-val_per=0.375.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_F03"
+    },
+    {
+      "speaker": "F04",
+      "status": "completed",
+      "per": 0.1272423211711577,
+      "wer": 0.16747026679524268,
+      "n_samples": 673,
+      "trained_epochs": 25,
+      "elapsed_sec": 5964.827189445496,
+      "checkpoint": "/home/nidszxh/Projects/DysarthriaNSR/checkpoints/loso_v1_loso_F04/epoch=24-val_per=0.374.ckpt",
+      "results_dir": "/home/nidszxh/Projects/DysarthriaNSR/results/loso_v1_loso_F04"
     }
   ]
 }
