@@ -320,7 +320,7 @@ python run_pipeline.py --run-name experiment_v1 --skip-train \
 ### Running LOSO (Required for Publication)
 
 ```bash
-# Full 15-fold sweep (~32h on RTX 4060)
+# Full 15-fold sweep
 python run_pipeline.py --run-name loso_v1 --loso
 
 # Resume from last completed fold
@@ -328,6 +328,12 @@ python run_pipeline.py --run-name loso_v1 --loso --resume-loso
 ```
 
 Progress is saved after each fold to `results/loso_v1_loso_progress.json`. Per-fold checkpoints are in `checkpoints/loso_v1_loso_{speaker}/`.
+
+Latest completed aggregate is in `results/loso_v1_loso_summary.json`:
+- macro PER: 0.2848 (95% CI: [0.1921, 0.3801])
+- weighted PER: 0.2299
+- macro WER: 0.3362
+- weighted WER: 0.2631
 
 ### Aggregating LOSO Results
 
@@ -365,7 +371,7 @@ Epoch 1: val/per=0.65 (expected range for early training)
 
 After epoch ~20+:
 ```
-Epoch 28: val/per=0.505  (example from baseline_v5)
+Epoch 20: val/per≈0.36–0.40  (typical range on recent LOSO folds)
 train/blank_prob_mean ≈ 0.75  (target met by blank KL loss)
 train/avg_beta ≈ 0.05–0.25
 ```

@@ -309,7 +309,7 @@ For each test_speaker in sorted(all_speakers):
 
 Resume support: if `--resume-loso` is set, completed folds (present in `loso_progress.json`) are skipped. Aggregated results (`macro_avg_per`, `per_95ci`, `weighted_avg_per`, `macro_avg_wer`) are printed after all folds complete.
 
-**Total folds:** 15 (one per TORGO speaker). Estimated runtime: ~32h on RTX 4060.
+**Total folds:** 15 (one per TORGO speaker). Runtime depends on fold sample count and resume state; rely on `results/{run_name}_loso_progress.json` for observed timing.
 
 ---
 

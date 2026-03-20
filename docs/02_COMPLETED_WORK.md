@@ -1,6 +1,6 @@
 # DysarthriaNSR — Completed Work Log
 
-> **Last updated:** March 12, 2026
+> **Last updated:** March 20, 2026
 > All items below are fully resolved, implemented, and verified unless otherwise noted.
 
 ---
@@ -35,6 +35,7 @@
 | Explainability JSON | Uncertainty MC-Dropout wired into evaluation pipeline |
 | Figure suite | `scripts/generate_figures.py` with 6+ publication-quality plots |
 | LOSO infrastructure | `run_loso()` in `train.py`; `--loso` flag in `run_pipeline.py` |
+| LOSO run | `loso_v1` completed (15/15 folds): macro PER 0.2848, weighted PER 0.2299 |
 
 ---
 
@@ -89,7 +90,7 @@
 | E4 | No learning curve plot saved automatically — added |
 | E5 | Articulatory confusion depends on broken explainability — fixed |
 | E6 | `plot_rule_impact` skips when top\_rules empty — unblocked by C5 fix |
-| E7 | Bootstrap CI unreliable with n=3 — **open**, requires LOSO-CV |
+| E7 | Bootstrap CI reliability issue under tiny split — addressed by completed LOSO-CV (`loso_v1`, 15/15) |
 
 ---
 
@@ -154,7 +155,7 @@ These items from `ACTION_PLAN.md` have been implemented as part of the pre-SPCOM
 | H-6 | `_compute_stratified_per` reuses stored `output['per_scores']` instead of recomputing | `train.py` |
 | M-5 | `conformal_phoneme_sets` docstring updated to document APS-like heuristic (not calibrated conformal) | `src/models/uncertainty.py` |
 | M-6 | `plot_per_by_speaker` sort order changed to severity-ascending (controls first) | `src/visualization/experiment_plots.py` |
-| C-1 | `lambda_ce` reduced 0.35 → 0.10; baseline\_v6 retraining pending | `src/utils/config.py` |
+| C-1 | `lambda_ce` reduced 0.35 → 0.10; baseline\_v6 retrained and evaluated | `src/utils/config.py` |
 | C-4 | `plot_severity_vs_per` scatter plot implemented and wired into `evaluate_model` | `evaluate.py` + `experiment_plots.py` |
 | C-5 | `plot_rule_pair_confusion` horizontal bar chart implemented | `experiment_plots.py` |
 
@@ -167,14 +168,14 @@ These items from `ACTION_PLAN.md` have been implemented as part of the pre-SPCOM
 - Added `last.ckpt` fallback in `run_pipeline.py` when `best_model_path` is empty
 - `train(config, limit_train_batches=None)` — smoke-test parameter threaded to `pl.Trainer`
 - `UncertaintyAwareDecoder` (MC Dropout) wired into `evaluate_model` via `compute_uncertainty` flag
-- `scripts/smoke_test.py` created; all 7 tests pass
+- `scripts/smoke_test.py` upgraded to profiles: `unit` (7 checks) + `pipeline` (tiny CLI integration)
 - `sequence_utils.py` extracted as shared utility to eliminate duplicate alignment code
 
 ---
 
 ## 10. Baseline Experiment Results
 
-### baseline\_v5 (Current Best)
+### baseline\_v5 (Historical pre-LOSO reference)
 
 | Metric | Value |
 |--------|-------|
@@ -190,7 +191,7 @@ These items from `ACTION_PLAN.md` have been implemented as part of the pre-SPCOM
 
 > **Note:** `per_neural=0.305` was measured via greedy decode of the model's internal
 > neural sub-path, not via an independent neural-only model trained without the symbolic
-> layer. The proper comparison requires `ablation_neural_only` (pending — see action items).
+> layer. This comparison is now available via `ablation_neural_only_v7`.
 
 ### baseline\_v4
 
@@ -235,10 +236,12 @@ These items from `ACTION_PLAN.md` have been implemented as part of the pre-SPCOM
 
 | # | Test | Status |
 |---|------|--------|
-| 1 | `TORGO_SEVERITY_MAP` range [0,5] | ✅ |
+| 1 | Config + severity map sanity | ✅ |
 | 2 | `LearnableConstraintMatrix` gradient flow | ✅ |
-| 3 | Severity 5.0 scaling in `evaluate_model` | ✅ |
-| 4 | `BlankPriorKLLoss` non-negativity | ✅ |
-| 5 | `OrdinalContrastiveLoss` correctness | ✅ |
-| 6 | Attention mask stride consistency | ✅ |
-| 7 | Checkpoint vocab round-trip (B18) | ✅ |
+| 3 | `BlankPriorKLLoss` non-negativity + mask sensitivity | ✅ |
+| 4 | `OrdinalContrastiveLoss` correctness (incl. batch size 1) | ✅ |
+| 5 | Explainability formatter output contract | ✅ |
+| 6 | LOSO ordering/resume source guards | ✅ |
+| 7 | Compact fold progress callback output | ✅ |
+
+**Profiles:** `python scripts/smoke_test.py --profile unit` (default) and `--profile pipeline` (tiny train-only integration smoke).

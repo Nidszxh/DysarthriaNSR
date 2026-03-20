@@ -116,7 +116,8 @@ These five fixes were implemented between development sessions and are tracked i
 | `no_art_heads` | Remove articulatory auxiliary supervision | `--ablation no_art_heads` |
 | `symbolic_only` | CTC/CE disabled; test pure symbolic signal | `--ablation symbolic_only` |
 
-These ablations have not yet been systematically run. Results pending LOSO-CV completion.
+Core ablations have now been run (`baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`).
+Recommended next pass is targeted dysarthric-fold optimization and additional component ablations (`no_spec_augment`, `no_temporal_ds`) under the LOSO protocol.
 
 ---
 
@@ -167,10 +168,11 @@ mlflow ui --backend-store-uri file://$(pwd)/mlruns
 **Key experiment names:** `DysarthriaNSR` (all runs share this experiment). Filter by `run_name` tag for specific baselines.
 
 **Key runs documented in `docs/04_RESEARCH_AUDIT.md`:**
-- `baseline_v4`, `baseline_v5` — pre-fix baselines
-- `baseline_v6` — post-B1–B5 fixes; symbolic reference checkpoint
-- `ablation_neural_only_v7` — best single-split performance  
+- `baseline_v4`, `baseline_v5` — historical pre-LOSO baselines
+- `baseline_v6` — post-fix symbolic reference checkpoint
+- `ablation_neural_only_v7` — best single-split performance
 - `ablation_no_constraint_matrix_v6` — SeverityAdapter without learnable C
+- `loso_v1` — 15/15 folds complete (publication aggregate)
 
 ---
 

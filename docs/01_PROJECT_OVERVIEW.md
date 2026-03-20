@@ -1,8 +1,8 @@
 # DysarthriaNSR — Project Overview & Documentation
 
-> **Last updated:** March 12, 2026
-> **Current baseline:** `baseline_v5` — beam PER 0.4750, val/PER 0.505 (epoch 28/30)
-> **Critical open issue:** Symbolic constraint layer actively hurts PER (per\_neural=0.305 vs per\_constrained=0.475, Δ=+0.170). Must be resolved before SPCOM 2026 submission.
+> **Last updated:** March 20, 2026
+> **Current aggregate result:** `loso_v1` — macro PER 0.2848 (95% CI: [0.1921, 0.3801]), weighted PER 0.2299, macro WER 0.3362
+> **Current research focus:** reduce high-PER dysarthric fold failures (M01/M02/M04/M05/F01) and insertion-heavy error profiles.
 
 ---
 
@@ -80,8 +80,11 @@ python run_pipeline.py --run-name experiment_v3
 python run_pipeline.py --run-name baseline_v2 --skip-train \
     --explain --uncertainty --beam-search --beam-width 25
 
-# Smoke test (5 batches)
-python run_pipeline.py --run-name smoke_test --smoke-test
+# Smoke test (orchestrator quick mode)
+python run_pipeline.py --run-name smoke_test --smoke
+
+# Fast unit smoke profile
+python scripts/smoke_test.py --profile unit
 ```
 
 ---
@@ -285,7 +288,7 @@ done
 |-------|----------------------|
 | Per-fold training (30 epochs) | ~2h |
 | Per-fold evaluation (beam w=25) | ~10min |
-| Full 15-fold sweep | ~32h |
+| Full 15-fold sweep | Completed (`loso_v1`, 15/15 folds) |
 
 ### Aggregating Results
 
@@ -360,7 +363,7 @@ python run_pipeline.py --run-name loso_M01_repro \
 | `train.py` | `DysarthriaASRLightning`, `train()`, `run_loso()`, argparse CLI |
 | `evaluate.py` | `evaluate_model()`, `BeamSearchDecoder`, `compute_per()` |
 | `run_pipeline.py` | End-to-end orchestrator — owns `run_training()` + `run_evaluation()` |
-| `scripts/smoke_test.py` | 7 automated unit tests — all passing |
+| `scripts/smoke_test.py` | Smoke profiles: `unit` (7 checks), `pipeline` (tiny train-only CLI) |
 | `scripts/generate_figures.py` | Publication-quality visualization suite |
 | `src/visualization/experiment_plots.py` | Visualization module called by generate_figures.py |
 | `src/explainability/` | PhonemeAttributor, ArticulatoryConfusionAnalyzer, ExplainableOutputFormatter |
@@ -402,7 +405,7 @@ All pinned. Reproducible install. No transitive-conflict risks identified.
 | `src/explainability/output_format.py` | 175 | ✅ Production | Clinical JSON formatter |
 | `src/explainability/rule_tracker.py` | 175 | ✅ Production | Symbolic activation logger |
 | `src/visualization/experiment_plots.py` | ~800 | ✅ Production | Publication-quality figure library |
-| `scripts/smoke_test.py` | 280 | ✅ Passing | 7 automated sanity tests |
+| `scripts/smoke_test.py` | 280 | ✅ Passing | Smoke profiles: unit (7 checks) + pipeline CLI smoke |
 | `scripts/generate_figures.py` | ~300 | ✅ Production | CLI for figure generation |
 | `tests/*.py` | ~600 | ✅ Partial | pytest unit tests (7 files) |
 
@@ -414,27 +417,27 @@ All pinned. Reproducible install. No transitive-conflict risks identified.
 
 | Issue | Detail | Status |
 |-------|--------|--------|
-| Symbolic constraint hurts PER | per\_neural=0.305 vs per\_constrained=0.475, Δ=+0.170. B21+B22 fixes did not resolve gap. Root causes: frame-CE misalignment, possible constraint matrix drift toward blanks, small β still sufficient to degrade competent neural output. | ❌ Blocking — baseline\_v6 pending |
+| Dysarthric fold variance remains high | Several dysarthric held-out folds remain high-PER with insertion-heavy errors despite LOSO completion (notably M01/M02/M04/M05/F01). | ⚠️ Active post-LOSO optimization target |
 | Frame-CE label alignment (T-05) | `align_labels_to_logits` pads/truncates; supervises only first L frames without real phoneme-to-frame alignment. Mitigation: lambda\_ce reduced 0.35→0.10 (C-1). | ⚠️ Mitigated, not fixed |
-| Test set ≈ 2 speakers | 70/15/15 split gives ~2 test speakers; all statistics invalid for publication. | ❌ Requires LOSO-CV |
+| Small-split statistical fragility | Single-split statistics are fragile; publication reporting now uses completed LOSO (`loso_v1`, 15 folds). | ✅ Addressed via LOSO |
 
 ### Major
 
 | Issue | Detail | Status |
 |-------|--------|--------|
-| `OrdinalContrastiveLoss` zero-margin for control pairs | All controls have severity=0.0 (binary proxy); control–control pairs contribute no gradient. Fix: use continuous `TORGO_SEVERITY_MAP` scores. | ❌ Open |
-| `BigramLMScorer` zero-count transitions | Unseen phoneme bigrams return log(0) = −∞, silently killing hypotheses. Fix: Laplace smoothing (`count + 1`). | ❌ Open |
-| No paired significance test (neural vs constrained) | `per_neural` and `per_constrained` reported without p-value. Fix: bootstrap paired Δ PER test. | ❌ Open |
+| `OrdinalContrastiveLoss` zero-margin for control pairs | Mitigated by continuous `TORGO_SEVERITY_MAP` usage in train/eval forward path. | ✅ Fixed in active path |
+| `BigramLMScorer` zero-count transitions | Add-k smoothing prevents `log(0)` hypothesis collapse. | ✅ Fixed |
+| Paired significance test (neural vs constrained) | Bootstrap paired Δ PER test and p-values are now reported. | ✅ Fixed |
 
 ### Minor
 
 | Issue | Detail | Status |
 |-------|--------|--------|
-| `_PROBABLE_CAUSE_MAP` key format mismatch in `attribution.py` | 4-tuple keys never matched; all causes fall through to "Unknown". Fix: use 2-tuple keys. | ❌ Open |
+| `_PROBABLE_CAUSE_MAP` key format mismatch in `attribution.py` | Key formats were aligned; fallback no longer collapses to universal unknown path. | ✅ Fixed |
 | `rule_precision()` never called | Implemented in `rule_tracker.py` but not wired into `evaluate_model` output. | ❌ Open |
 | `PHONEME_DETAILS` / `PHONEME_FEATURES` duplication | Defined separately in `manifest.py` and `model.py`; must be kept in sync manually. Recommendation: move to `src/utils/constants.py`. | ❌ Open |
 | `ModelConfig.num_phonemes=44` misleading | Actual vocab size is 47 (44 ARPABET + 3 special tokens). | ❌ Minor |
-| `BlankPriorKLLoss` class default (0.85) ≠ config (0.75) | Test fixture also uses 0.85. No training impact but misleading. | ❌ Open |
+| `BlankPriorKLLoss` class default mismatch | Defaults/tests aligned to target blank probability 0.75. | ✅ Fixed |
 | `conformal_phoneme_sets` τ tautology | `tau = 1 - (1 - coverage) = coverage`; not calibrated conformal prediction. Documented as APS-like heuristic (M-5). | ✅ Documented |
 | `PhonemeAttributor.attention_attribution` not implemented | Requires CTC forced alignment (future work). | ⚠️ Known gap |
 | Uncertainty always null unless `--uncertainty` flag | MC Dropout inference not default. | By design |

@@ -3,8 +3,9 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: B1–B12 fixed (previous sessions); B13–B23 fixed (March 6, 2026 — current session). Smoke tests passing. `baseline_v5` trained and evaluated. LOSO-CV not yet run.
-**Latest baseline**: baseline_v5 (March 6, 2026) — beam-search test PER **0.4750**, val/per 0.505 (epoch 28/30), 98.9M total / 66.4M trainable, I/D=0.9×. **Critical finding**: symbolic constraints still hurt (`per_neural=0.305` vs `per_constrained=0.475`, Δ=−0.170). Articulatory accuracy: manner 78.3%, place 79.3%, voice 92.3%. Identical performance to v4 — symbolic layer is the bottleneck.
+**Status**: B1–B23 fixed. LOSO-CV completed (`loso_v1`, 15/15 folds). Smoke tests updated and passing (`unit` profile: 7/7).
+**Latest aggregate (LOSO)**: macro PER **0.2848** (95% CI: [0.1921, 0.3801]), weighted PER **0.2299**, macro WER **0.3362**, weighted WER **0.2631**.
+**Latest single-split references**: `baseline_v6` (full) avg_per 0.1372; `ablation_neural_only_v7` avg_per 0.1346. Symbolic effect is mixed (helps vs internal constrained/neural path in v6 but neural-only remains strongest overall).
 **Previous baseline**: baseline_v4 (March 5, 2026) — beam-search PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×)
 **Earlier baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
 **Reference only**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; data leakage; results inflated)
@@ -41,7 +42,7 @@ run_pipeline.py                         ← CANONICAL ENTRY POINT
 results/{run_name}/evaluation_results.json + plots + explanations.json
 
 scripts/generate_figures.py             ← publication-quality figure suite (6 plots)
-scripts/smoke_test.py                   ← 7 automated tests (all passing)
+scripts/smoke_test.py                   ← smoke profiles: unit (7 checks) + pipeline CLI smoke
 ```
 
 ---
@@ -109,7 +110,7 @@ The frame-level CE loss (`_compute_ce_loss`) pads phoneme labels [B, L] to [B, T
 | Issue | Impact | Status |
 |-------|--------|--------|
 | **Symbolic constraints hurt PER** (CRITICAL) | per_neural=0.305 vs per_constrained=0.475 (+57% relative); reproduced in v4 **and** v5 | B22 (`lambda_symbolic_kl`→0.5) + B21 (temperature init) applied; re-run needed to confirm fix |
-| **LOSO-CV not run** (HIGH) | n=3 test speakers; severity correlation p=0.347 (n.s.) — no statistically valid macro-PER estimate | `python run_pipeline.py --run-name loso_v1 --loso` (~15–22h); run after verifying constraint fix |
+| **High variance across dysarthric folds** (HIGH) | LOSO complete but several dysarthric folds remain high-PER with insertion-heavy errors | Prioritize post-LOSO tuning/ablation focused on M01/M02/M04/M05/F01 |
 | Substitution/Deletion dominance | 13,821 subs + 4,338 del vs 3,752 ins in v5 | B15 (macro-speaker PER) may shift val/per metric; next run will confirm |
 | `SymbolicRuleTracker` low confidence | `avg_confidence=0.131`; most activations are X→`<BLANK>` | B22+B21 should reduce BLANK-dominated constraint drift |
 | `PhonemeAttributor.attention_attribution` disabled | Requires CTC forced alignment | Future work |
@@ -532,24 +533,24 @@ for layer_idx in freeze_encoder_layers:
 - ✅ Uncertainty estimation: MC-Dropout via `UncertaintyAwareDecoder` (with `--uncertainty`)
 - ✅ Orchestrator: `run_pipeline.py` — single entry point for train + evaluate
 - ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
-- ✅ Automated tests: `scripts/smoke_test.py` — 7/7 passing
+- ✅ Automated tests: `scripts/smoke_test.py --profile unit` — 7/7 passing
 - ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
-- ✅ **Baseline model (baseline_v5)**: beam PER **0.4750**, val/per 0.505 (epoch 28/30); 98.9M params (66.4M trainable); I/D=0.9×; articulatory manner 78.3% / place 79.3% / voice 92.3%. Identical to v4 — symbolic layer confirmed bottleneck.
+- ✅ **LOSO model set (`loso_v1`)**: 15/15 folds complete; macro PER 0.2848 (95% CI [0.1921, 0.3801]); weighted PER 0.2299; macro WER 0.3362.
+- ✅ **Post-fix baselines**: `baseline_v6` avg_per 0.1372, `ablation_neural_only_v7` avg_per 0.1346, `ablation_no_constraint_matrix_v6` avg_per 0.1444.
 - ✅ **Baseline model (baseline_v4)**: beam PER 0.4748, val/per 0.504 (epoch 28/40); staged unfreezing; insertion bias resolved (I/D=0.87×); articulatory manner 78.6% / place 79.1% / voice 92.4%
 - ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; first run with valid speaker-independent splits
 - ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused data leakage. Preserved as historical reference.
 
 ## Next Steps: What Remains
 
-### Immediate (blocking LOSO)
-1. **Train baseline_v6** with B13–B23 fixes applied: `python run_pipeline.py --run-name baseline_v6` — establishes whether the constraint fixes (B21, B22) reduce `delta_per`
-2. **Neural-only ablation**: `python run_pipeline.py --run-name ablation_neural_only --ablation neural_only` — now properly supported (B14 stage-unfreezing fixed; `no_constraint_matrix` ablation mode added)
-3. **Verify `constraint_precision`** in `evaluation_results.json` → `helpful_rate` should rise above `harmful_rate`
+### Immediate (post-LOSO)
+1. **Create post-LOSO leaderboard** from `results/loso_v1_loso_summary.json` + per-fold diagnostics for report/table generation.
+2. **Targeted dysarthric optimization run** (focus folds with high insertion ratios: M01/M02/M04/M05/F01).
+3. **Regenerate final figures** for LOSO and ablations: `python scripts/generate_figures.py --run-name loso_v1`.
 
 ### Next priority
-4. **LOSO-CV** (~15–22h): `python run_pipeline.py --run-name loso_v1 --loso` — run after baseline_v6 confirms constraint improvement; macro-PER now correctly computed as macro-speaker (B15)
-5. **Regenerate figures** for baseline_v6: `python scripts/generate_figures.py --run-name baseline_v6`
-6. **Additional ablations**: `--ablation no_constraint_matrix`, `--ablation no_spec_augment`, `--ablation no_temporal_ds` (all now valid choices)
+4. **Additional ablations**: `--ablation no_constraint_matrix`, `--ablation no_spec_augment`, `--ablation no_temporal_ds`.
+5. **Package publication artifacts**: LOSO summary tables, per-speaker PER, and significance outputs.
 
 ### Long-term
 - **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules
@@ -598,22 +599,24 @@ When implementing new components:
   ```
 - **Evaluation-only (reuse checkpoint)**:
   ```bash
-  # Evaluate baseline_v4 with beam search, explainability, uncertainty
-  python run_pipeline.py --run-name baseline_v4 --skip-train --explain --uncertainty --beam-search --beam-width 25
+  # Evaluate baseline_v6 with beam search, explainability, uncertainty
+  python run_pipeline.py --run-name baseline_v6 --skip-train --explain --uncertainty --beam-search --beam-width 25
   ```
-- **Neural-only ablation (critical — run next)**:
+- **Neural-only ablation (reference)**:
   ```bash
-  python run_pipeline.py --run-name ablation_neural_only --ablation neural_only
+  python run_pipeline.py --run-name ablation_neural_only_v7 --ablation neural_only
   ```
 - **Smoke test (5 batches)**:
   ```bash
-  python run_pipeline.py --run-name smoke_check --smoke-test
+  python run_pipeline.py --run-name smoke_check --smoke
+  python scripts/smoke_test.py --profile unit
+  python scripts/smoke_test.py --profile pipeline
   ```
 - **Generate publication figures**:
   ```bash
-  python scripts/generate_figures.py --run-name baseline_v4
+  python scripts/generate_figures.py --run-name loso_v1
   # Compare multiple runs:
-  python scripts/generate_figures.py --run-name baseline_v4 --compare ablation_neural_only no_art_heads
+  python scripts/generate_figures.py --run-name baseline_v6 --compare ablation_neural_only_v7 ablation_no_constraint_matrix_v6
   ```
 - **Run unit tests**:
   ```bash

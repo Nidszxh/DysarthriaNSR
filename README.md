@@ -1,7 +1,8 @@
 # DysarthriaNSR — Neuro-Symbolic ASR for Dysarthric Speech
 
 > **Target venue:** SPCOM 2026  
-> **Current status:** Implementation complete; LOSO-CV pending for publication-valid results
+> **Current status:** Implementation complete; LOSO-CV completed (15/15 folds)
+> **Latest aggregate (`loso_v1`):** macro PER **0.2848** (95% CI: 0.1921–0.3801), weighted PER **0.2299**
 
 ---
 
@@ -126,6 +127,12 @@ python run_pipeline.py --run-name loso_v1 --loso
 
 # Resume LOSO from last completed fold
 python run_pipeline.py --run-name loso_v1 --loso --resume-loso
+
+# Fast smoke checks (default: unit profile)
+python scripts/smoke_test.py --profile unit
+
+# Tiny runtime integration smoke
+python scripts/smoke_test.py --profile pipeline
 ```
 
 ---
@@ -162,7 +169,7 @@ DysarthriaNSR/
 │       └── experiment_plots.py
 │
 ├── scripts/
-│   ├── smoke_test.py        # 7 automated sanity tests
+│   ├── smoke_test.py        # smoke profiles: unit (7 checks) + pipeline CLI smoke
 │   ├── generate_figures.py  # Publication-quality figure CLI
 │   └── tree.md, tree.sh, organize.py, cleanup.py
 │

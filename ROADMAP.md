@@ -1,6 +1,6 @@
 # DysarthriaNSR — Project Roadmap
 
-> **Last updated:** March 16, 2026  
+> **Last updated:** March 20, 2026  
 > **Current baseline:** `baseline_v6` — avg_per=0.137, per_neural=0.145, per_constrained=0.137  
 > **Neural-only ablation:** `ablation_neural_only_v7` — avg_per=0.135 (best single-split result to date)
 
@@ -99,8 +99,8 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | Item | Status | Detail |
 |------|--------|--------|
 | `run_loso()` implementation | ✅ | Supports `--resume-loso` |
-| Full 15-fold sweep | ❌ **Publishing blocker** | Run: `python run_pipeline.py --run-name loso_v1 --loso` |
-| Estimated runtime | — | ~32h on RTX 4060 (8 GPU hours/fold × 15 folds, minus eval overlap) |
+| Full 15-fold sweep | ✅ Completed | `loso_v1` complete (15/15 folds) |
+| Aggregate LOSO metrics | ✅ | macro PER 0.2848 (95% CI 0.1921–0.3801), weighted PER 0.2299, macro WER 0.3362 |
 | Per-fold PER aggregation | ✅ (code ready) | `macro_avg_per`, `per_95ci`, `weighted_avg_per`, `macro_avg_wer` |
 
 ### Symbolic Constraint Characterization
@@ -121,7 +121,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 | ID | Component | Issue | Evidence | Mitigation |
 |----|-----------|-------|----------|------------|
-| C-3 | Experimental design | Test set ≈ 2 speakers; all statistics invalid for publication | 70/15/15 split, n=15 speakers | ❌ **Requires LOSO-CV** |
+| C-3 | Experimental design | Small-split statistical fragility addressed via LOSO 15/15 | `loso_v1_loso_summary.json` | ✅ Resolved |
 | §2.1 | `model.py`, `train.py` | Neural-only ablation marginally beats full constrained model (0.135 vs 0.137) | `ablation_neural_only_v7` | ⚠️ Reframed: symbolic helps internal neural sub-path but not vs pure HuBERT |
 
 ### Major (Research Validity)
@@ -137,8 +137,8 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | ID | Component | Issue | Status |
 |----|-----------|-------|--------|
 | §5.4 | `manifest.py`, `model.py` | `PHONEME_DETAILS` and `PHONEME_FEATURES` defined independently (manual sync risk) | ❌ Pending: move to `src/utils/constants.py` |
-| §5.5 | `config.py` | `ModelConfig.num_phonemes=44` misleading (actual runtime vocab: 47) | ❌ No runtime impact |
-| §5.6 | `dataloader.py` | `create_single_dataloader` uses class-level weights (not speaker-level) | ❌ Inference-only risk |
+| §5.5 | `config.py` | `ModelConfig.num_phonemes` now aligned with runtime vocab convention | ✅ Fixed |
+| §5.6 | `dataloader.py` | `create_single_dataloader` now mirrors speaker-level weighting policy | ✅ Fixed |
 | §8.2 | `rule_tracker.py` | `rule_precision()` not wired into `evaluate_model` output | ⚠️ Proxy added |
 | §3.10 | `train.py` | OneCycleLR not reset after progressive unfreezing; momentum reset applied as workaround | ⚠️ Partial fix via `_reset_hubert_lr_warmup()` |
 | §9.3 | `tests/` | No integration test for `training_step` or `evaluate_model` end-to-end | ❌ Post-paper |
@@ -147,13 +147,12 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 ## Planned Improvements
 
-### Short-Term (Before SPCOM Submission)
+### Short-Term (Post-LOSO)
 
-1. **Run full LOSO-CV:** `python run_pipeline.py --run-name loso_v1 --loso`
-2. **Report LOSO results:** macro-speaker PER ± 95% CI; dysarthric vs. control fold-level summary
-3. **Compact symbolic sweep:** 3–4 runs varying `constraint_weight_init ∈ {0.01, 0.03, 0.05}`
-4. **Acceptance rule:** Accept symbolic model as primary only if globally non-inferior to neural-only AND improves at least one dysarthric strata metric
-5. **Align `create_single_dataloader` sampler** or document as inference-only tool
+1. **Publish leaderboard artifacts:** export per-fold table + macro/weighted metrics from `loso_v1_loso_summary.json`
+2. **Targeted dysarthric optimization sweep:** prioritize M01/M02/M04/M05/F01 failure modes
+3. **Compact symbolic sweep:** vary `constraint_weight_init ∈ {0.01, 0.03, 0.05}` under fixed protocol
+4. **Acceptance rule:** keep symbolic model primary only if globally non-inferior to neural-only and better on at least one dysarthric strata metric
 
 ### Medium-Term (Post-Submission)
 
@@ -177,8 +176,8 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | All B1–B23 fixes implemented | Feb 2026 | ✅ Done |
 | `baseline_v6` trained | Mar 12, 2026 | ✅ Done |
 | Neural-only ablation evaluated | Mar 13, 2026 | ✅ Done |
-| Full LOSO-CV sweep | Mar 2026 | ❌ In progress |
-| SPCOM 2026 paper submission | TBD 2026 | 🔲 Pending LOSO |
+| Full LOSO-CV sweep | Mar 2026 | ✅ Completed |
+| SPCOM 2026 paper submission | TBD 2026 | 🔲 Pending post-LOSO packaging |
 
 ---
 
@@ -191,4 +190,4 @@ mlflow ui --backend-store-uri file://$(pwd)/mlruns
 # then open http://127.0.0.1:5000
 ```
 
-Key tracked runs: `baseline_v4`, `baseline_v5`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`.
+Key tracked runs: `baseline_v4`, `baseline_v5`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`, `loso_v1`.

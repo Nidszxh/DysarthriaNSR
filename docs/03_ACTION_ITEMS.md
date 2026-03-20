@@ -1,7 +1,7 @@
 # DysarthriaNSR — Action Items & Implementation Plan
 
-> **Last updated:** March 12, 2026
-> **Status:** 11/11 March audit items implemented. Critical open issue: symbolic constraint actively hurts PER (+0.170). Must be resolved before SPCOM 2026 submission.
+> **Last updated:** March 20, 2026
+> **Status:** LOSO-CV completed (`loso_v1`, 15/15 folds). Remaining work is post-LOSO optimization and publication packaging.
 
 ---
 
@@ -29,10 +29,10 @@ Phase 0 — Quick Code Fixes (< 2h total, do first — most already done):
   ✅ M-5  Document conformal tau as heuristic
   ✅ M-6  Sort per-speaker plot by severity
 
-Phase 1 — Training Experiments (sequential, order matters):
-  C-1  Retrain baseline_v6 with lambda_ce=0.10     [~4h GPU] ← config already set
-  C-2  Run neural-only ablation                    [~4h GPU]
-  C-3  LOSO-CV loso_v1 (with best config)          [~18h GPU]
+Phase 1 — Core Training Experiments:
+  ✅ C-1  Retrain baseline_v6 with lambda_ce=0.10
+  ✅ C-2  Run neural-only ablation
+  ✅ C-3  LOSO-CV loso_v1 (15/15 folds complete)
 
 Phase 2 — Code Fixes & Figures (after Phase 1 data exists):
   ✅ C-4  Severity-PER scatter plot
@@ -98,29 +98,26 @@ python run_pipeline.py --run-name ablation_neural_v1 --ablation neural_only \
 
 | Model | Beam PER | Δ vs Neural |
 |-------|----------|------------|
-| `ablation_neural_v1` (neural-only) | ? | — |
-| `baseline_v6` (full model) | ? | target: negative (improvement) |
+| `ablation_neural_only_v7` (neural-only) | 0.1346 | — |
+| `baseline_v6` (full model) | 0.1372 | +0.0026 |
 | `baseline_v5` (full model, prev) | 0.4750 | +0.170 (constraint hurts) |
 
 ---
 
-### C-3 · Run LOSO-CV (`loso_v1`)
+### C-3 · Run LOSO-CV (`loso_v1`) ✅ COMPLETED
 
-**Difficulty:** Very Hard (~15–22h GPU; run after C-1 confirms constraint fix)
-**Impact:** Submission-blocking — n=3 test speakers is statistically invalid; no valid macro-PER or severity correlation possible
+**Difficulty:** Very Hard (~15–22h GPU)
+**Impact:** Submission-critical — now resolved with 15-speaker fold-complete estimates
 
 **Prerequisites:**
 - C-1 must complete first (run LOSO with best-performing config)
 - H-1 (`del trainer, lm` between folds) already applied
 
-```bash
-python run_pipeline.py --run-name loso_v1 --loso
-```
-
-**Deliverables from LOSO:**
-- Macro-speaker PER ± 95% CI (n=15 speakers — statistically valid)
-- Spearman ρ (severity vs PER) with p-value (n=15)
-- Per-fold PER table for supplementary material
+**Delivered (`results/loso_v1_loso_summary.json`):**
+- Macro-speaker PER: **0.2848** (95% CI: 0.1921–0.3801)
+- Weighted PER: **0.2299**
+- Macro WER: **0.3362**
+- Weighted WER: **0.2631**
 
 ---
 

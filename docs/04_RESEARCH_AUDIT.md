@@ -1,6 +1,6 @@
 # DysarthriaNSR — Research Audit & Technical Risks
 
-> **Audit dates:** March 5–17, 2026 | **Baselines evaluated:** `baseline_v4`, `baseline_v5`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`
+> **Audit dates:** March 5–20, 2026 | **Baselines evaluated:** `baseline_v4`, `baseline_v5`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`, `loso_v1`
 > This document consolidates findings from the Senior Research Scientist Audit, the Comprehensive Implementation Audit (IMPLEMENT.md), and the Full Repository Audit Report. It is the reference for research decisions and paper preparation.
 
 ---
@@ -34,7 +34,7 @@ The DysarthriaNSR codebase is architecturally complete and functionally runnable
 | Code correctness | 8.5/10 | B1–B23 fixed; `_PROBABLE_CAUSE_MAP` mismatch fixed; residual CE alignment caveat remains |
 | Architecture design | 9/10 | Clean layering, single config source, ablation support |
 | Performance efficiency | 7/10 | Alignment caching applied (H-2); LOSO memory leak fixed (H-1) |
-| Statistical rigor | 7/10 | Bootstrap CI + paired constrained-vs-neural delta test implemented; LOSO still not run |
+| Statistical rigor | 8/10 | Bootstrap CI + paired constrained-vs-neural delta test implemented; LOSO completed (15 folds) |
 | Visualization quality | 8/10 | Severity scatter (C-4) and rule confusion bar (C-5) added; publication-ready |
 | Test coverage | 8/10 | 7 smoke + 9 pytest, including synthetic integration tests for `training_step` and `evaluate_model` |
 | Research validity | 6.5/10 | Symbolic evidence mixed in v6/ablations; frame-CE misalignment still partially mitigated |
@@ -90,9 +90,9 @@ Interpretation: the constrained path now improves over the model's internal neur
 
 ---
 
-### 2.2 Test Split is Statistically Invalid
+### 2.2 Test Split Statistical Validity (LOSO)
 
-**Status:** ❌ Open — requires LOSO-CV
+**Status:** ✅ Resolved — LOSO-CV completed (`loso_v1`, 15/15 folds)
 
 TORGO has 15 speakers. A 70/15/15 random-stratified split yields approximately 10 train / 2 val / 2 test speakers. Every published test PER figure is computed on ≈2 speakers.
 
@@ -100,7 +100,11 @@ TORGO has 15 speakers. A 70/15/15 random-stratified split yields approximately 1
 - Dysarthric vs. control comparison: n=1 vs. n=2 — not a valid comparison
 - Inverted severity ordering (Control PER > Dysarthric PER) is almost certainly an artefact
 
-All t-test, Wilcoxon, and severity correlation statistics are invalid. **LOSO-CV is mandatory for publication.**
+Post-LOSO summary (`results/loso_v1_loso_summary.json`):
+- macro PER: 0.2848 (95% CI: 0.1921–0.3801)
+- weighted PER: 0.2299
+- macro WER: 0.3362
+- weighted WER: 0.2631
 
 ---
 
@@ -350,17 +354,19 @@ At n=8 dysarthric speakers, Pearson r has wide CIs. Plot should display `f"n={n_
 
 ## 9. Test Coverage Assessment
 
-### 9.1 Smoke Tests (7/7 Passing)
+### 9.1 Smoke Tests (Unit 7/7 Passing)
 
 | # | Test | Status |
 | --- | ---- | ------ |
 | 1 | `TORGO_SEVERITY_MAP` range [0,5] | ✅ |
 | 2 | `LearnableConstraintMatrix` gradient flow | ✅ |
-| 3 | Severity 5.0 scaling in `evaluate_model` | ✅ |
-| 4 | `BlankPriorKLLoss` non-negativity | ✅ |
-| 5 | `OrdinalContrastiveLoss` correctness | ✅ |
-| 6 | Attention mask stride consistency | ✅ |
-| 7 | Checkpoint vocab round-trip (B18) | ✅ |
+| 3 | `BlankPriorKLLoss` non-negativity + mask sensitivity | ✅ |
+| 4 | `OrdinalContrastiveLoss` correctness | ✅ |
+| 5 | Explainability formatter output contract | ✅ |
+| 6 | LOSO ordering/resume source guards | ✅ |
+| 7 | Compact fold progress callback output | ✅ |
+
+Additional profile: `python scripts/smoke_test.py --profile pipeline` runs a tiny train-only CLI integration smoke.
 
 ### 9.2 Pytest and Integration Tests
 
@@ -397,7 +403,7 @@ severity = batch['severity_continuous']  # [0.0–5.0 per speaker]
 
 ### Proposal 2 — Learnable Constraint Matrix with KL Anchor (Novel Contribution)
 
-**Status:** Implemented; effectiveness pending C-1/C-2 confirmation
+**Status:** Implemented; C-1/C-2 completed. Current evidence is mixed (helps internal neural sub-path in `baseline_v6`, but neural-only remains best overall single-split).
 **Venue fit:** TASLP / ACL
 **Expected impact:** Discovered `C` matrix is a publishable result — dysarthric confusion topology learned from data
 
@@ -501,7 +507,7 @@ print('PASS: explainability formatter output structure valid')
 | ---- | -------- | --------- | ----- | ------ |
 | §2.1 | **CRITICAL** | `model.py`, `train.py` | Symbolic effect is mixed: helps vs internal neural path in v6 but neural-only ablation still best overall | ⚠️ Open (reframed) |
 | §3.3 | **CRITICAL** | `sequence_utils.py` | Frame-CE pad/truncate label mismatch (T-05); lambda\_ce=0.10 mitigates | ⚠️ Mitigated |
-| §2.2 | **CRITICAL** | Experimental design | Test set ≈ 2 speakers; LOSO mandatory for publication | ❌ C-3 pending |
+| §2.2 | **CRITICAL** | Experimental design | Small-split statistical fragility addressed via LOSO 15/15 | ✅ C-3 complete |
 | §7.1 | **MAJOR** | `evaluate.py` | `BigramLMScorer` zero-count transitions kill hypotheses with −∞ | ✅ Fixed |
 | §7.2 | **MAJOR** | `evaluate.py` | No paired significance test between neural vs constrained PER | ✅ Fixed |
 | §3.8 | **MAJOR** | `losses.py` | `OrdinalContrastiveLoss` zero-margin for all control pairs | ✅ Fixed in forward path |
