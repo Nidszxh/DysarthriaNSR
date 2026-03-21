@@ -1,200 +1,118 @@
 # DysarthriaNSR — Neuro-Symbolic ASR for Dysarthric Speech
 
-> **Target venue:** SPCOM 2026  
-> **Current status:** Implementation complete; LOSO-CV completed (15/15 folds)
-> **Latest aggregate (`loso_v1`):** macro PER **0.2848** (95% CI: 0.1921–0.3801), weighted PER **0.2299**
+**Target venue:** SPCOM 2026 | **Status:** LOSO-CV complete (15/15 folds)
+
+> **LOSO macro PER · 0.2848** (95% CI: [0.1921, 0.3801])
+> **LOSO weighted PER · 0.2299**
+> **Folds complete · 15/15**
 
 ---
 
-## Project Description
+## What This Is
 
-DysarthriaNSR is a **neuro-symbolic automatic speech recognition** system designed for people with **dysarthria** — a motor speech disorder causing reduced intelligibility. The system combines a pretrained HuBERT speech encoder with a symbolic phoneme-constraint layer grounded in articulatory phonetics, enabling clinically interpretable recognition that adapts to individual speaker severity.
+Dysarthria is a motor speech disorder — caused by conditions such as cerebral palsy and ALS — that causes severely reduced intelligibility. Commercial ASR systems fail for dysarthric speakers because they treat atypical phoneme realizations as noise. DysarthriaNSR addresses this by combining a pretrained HuBERT speech encoder with a learnable symbolic phoneme constraint layer grounded in articulatory phonetics.
 
-The key technical contribution is the **SymbolicConstraintLayer**: a differentiable, learnable confusion-probability matrix initialized from articulatory feature distances, which blends neural phoneme posteriors with phonologically-motivated priors in a severity-adaptive manner. This bridges data-driven deep learning with explicit linguistic knowledge — a core requirement for clinical deployment.
-
----
-
-## Research Motivation & Key Contributions
-
-**Why dysarthria?** Dysarthric speakers are dramatically underserved by commercial ASR systems. TORGO corpus speakers show 2–98% intelligibility, with severe speakers effectively incomprehensible to standard ASR. Clinical speech-language pathology requires not only accurate recognition but *explainable* error patterns.
-
-**Key contributions:**
-1. **Learnable Constraint Matrix (P2):** End-to-end trainable phoneme confusion matrix `C`, initialized from articulatory priors and anchored by a KL-divergence loss during training.
-2. **Cross-Attention Severity Adapter (P3):** Projects continuous speaker severity `[0, 5]` to a `[B, 1, 768]` context vector; cross-attends with HuBERT hidden states for spatially-aware severity conditioning.
-3. **Ordinal Contrastive Loss (P1):** Pairwise contrastive loss with margins proportional to severity distance, learning graded dysarthria representations.
-4. **Articulatory auxiliary heads:** Manner, place, and voice classification heads supervised at the utterance level via global average pooling — providing articulatory interpretability with correct CTC semantics.
-5. **Blank-Prior KL regularisation:** Controls CTC insertion bias by regularising the mean blank emission rate toward an empirically calibrated target (0.75).
+Unlike a standard HuBERT fine-tune, DysarthriaNSR adds three key components: (1) a `LearnableConstraintMatrix` — a differentiable 47×47 phoneme confusion matrix initialized from articulatory priors (e.g., devoicing B→P, liquid gliding R→W) and trained end-to-end with a KL anchor to prevent drift; (2) a `SeverityAdapter` that injects a continuous severity score [0, 5] into HuBERT hidden states via cross-attention; and (3) a six-term multi-task loss that includes blank-prior KL regularization to suppress CTC insertion bias. The result is a system that provides clinically interpretable phoneme-level error analysis alongside recognition output.
 
 ---
 
-## System Overview
+## Key Results
 
-```
-Raw Audio [B, T_audio]
-    ↓
-HuBERT Encoder (facebook/hubert-base-ls960, frozen CNN + progressive transformer unfreezing)
-    → [B, T', 768]  where T' ≈ T_audio / 320
-    ↓
-SpecAugmentLayer (time/freq masking on hidden states, training only)
-    ↓
-SeverityAdapter (cross-attention conditioning on continuous severity [0, 5])
-    → [B, T', 768]
-    ↓
-TemporalDownsampler (stride-2 Conv1d, ~50 Hz → ~25 Hz)
-    → [B, T'//2, 768]
-    ↓
-PhonemeClassifier (768 → LayerNorm → GELU → Dropout → 512 → |V|)
-    → logits_neural [B, T, |V|]
-    ↓
-SymbolicConstraintLayer
-    → P_final = β·(P_neural @ C) + (1-β)·P_neural
-    → log_probs_constrained [B, T, |V|]
-    ↓
-CTC Decoding → Phoneme sequence → PER
-```
+| Model | Macro PER | Weighted PER | Notes |
+|---|---|---|---|
+| `loso_v1` (full system, LOSO) | **0.2848** (95% CI: [0.1921, 0.3801]) | **0.2299** | Publication result, 15/15 folds |
+| `baseline_v6` (full system, single split) | 0.1372 | — | per_constrained; post-fix reference |
+| `ablation_neural_only_v7` (single split) | **0.1346** | — | Best single-split PER to date |
+| `ablation_no_constraint_matrix_v6` (single split) | 0.1444 | — | SeverityAdapter only, no learnable C |
 
-The vocabulary `|V|` is 47 tokens: 44 stress-agnostic ARPABET phonemes + `<BLANK>`, `<PAD>`, `<UNK>`.
+The symbolic constraint story is nuanced. Within `baseline_v6`, the constrained path improves over the model's internal neural sub-path (per_constrained=0.1372 < per_neural=0.1451, p=0.0), and 9.16% of utterances benefit from constraint application versus only 3.78% that are harmed. However, a fully independent neural-only ablation (`ablation_neural_only_v7`, which bypasses SeverityAdapter and SymbolicConstraintLayer entirely) still achieves the best global single-split PER at 0.1346. This means the symbolic constraint helps within the jointly-trained system but has not yet demonstrated superiority over a pure HuBERT baseline in isolation. LOSO-CV stratified by dysarthric speaker groups — particularly the high-severity folds (M01, M02, M04, M05, F01) — is the decisive pending test for the SPCOM claim.
 
 ---
 
 ## Quick Start
 
 ### Installation
-
 ```bash
 git clone <repo-url>
 cd DysarthriaNSR
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-**Core dependencies (pinned):**
-```
-torch==2.9.0 / torchaudio==2.9.0
-transformers==4.57.1
-pytorch-lightning==2.6.0
-mlflow==3.6.0
-g2p-en==2.1.0
+python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')"
 ```
 
 ### Dataset Setup
-
-Download the TORGO corpus and generate the manifest:
-
 ```bash
-# 1. Download audio files (see docs/dataset.md for access instructions)
+# Step 1: Download TORGO audio from HuggingFace (abnerh/TORGO-database)
 python src/data/download.py
 
-# 2. Generate manifest (phoneme annotations, speaker metadata)
+# Step 2: Generate manifest with G2P + articulatory labels
 python src/data/manifest.py
-# Output: data/processed/torgo_neuro_symbolic_manifest.csv
+# Output: data/processed/torgo_neuro_symbolic_manifest.csv (16,531 rows)
 ```
 
-### Training
-
+### Run Commands
 ```bash
-# Full training + evaluation
-python run_pipeline.py --run-name experiment_v1
-
-# Train only (skip evaluation)
-python run_pipeline.py --run-name experiment_v1 --skip-eval
-
-# Smoke test (1 epoch, 5 batches — CI/sanity check)
-python run_pipeline.py --run-name smoke --smoke
-```
-
-### Evaluation
-
-```bash
-# Evaluate a saved checkpoint
-python run_pipeline.py --run-name experiment_v1 --skip-train
-
-# Beam search decoding + explainability
-python run_pipeline.py --run-name experiment_v1 --skip-train \
-    --beam-search --beam-width 10 --explain
-
-# Ablation: neural-only baseline
-python run_pipeline.py --run-name neural_only_v1 --ablation neural_only
-```
-
-### Reproduce Main Results
-
-```bash
-# Standard single-split training
+# Standard single-split training + evaluation
 python run_pipeline.py --run-name baseline_v6
 
-# Full LOSO cross-validation (publication-required; ~32h on RTX 4060)
+# Full LOSO cross-validation (publication result, ~32h on RTX 4060)
 python run_pipeline.py --run-name loso_v1 --loso
 
 # Resume LOSO from last completed fold
 python run_pipeline.py --run-name loso_v1 --loso --resume-loso
 
-# Fast smoke checks (default: unit profile)
+# Smoke test (unit profile, 7/7 checks)
 python scripts/smoke_test.py --profile unit
-
-# Tiny runtime integration smoke
-python scripts/smoke_test.py --profile pipeline
 ```
 
 ---
 
-## Repository Structure
-
+## Repository Layout
 ```
 DysarthriaNSR/
-├── run_pipeline.py          # Entry point: train + eval orchestrator
+├── run_pipeline.py          # Canonical entry point: train + eval orchestrator
 ├── train.py                 # DysarthriaASRLightning, run_loso()
-├── evaluate.py              # evaluate_model(), BeamSearchDecoder, PER
-├── requirements.txt
-├── README.md
-├── ROADMAP.md
-│
+├── evaluate.py              # evaluate_model(), BeamSearchDecoder, compute_per()
+├── requirements.txt         # Pinned dependency stack
 ├── src/
 │   ├── models/
-│   │   ├── model.py         # NeuroSymbolicASR, all architectural components
+│   │   ├── model.py         # NeuroSymbolicASR and all architectural components
 │   │   ├── losses.py        # OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss
 │   │   └── uncertainty.py   # UncertaintyAwareDecoder (MC-Dropout)
 │   ├── data/
 │   │   ├── dataloader.py    # TorgoNeuroSymbolicDataset, NeuroSymbolicCollator
 │   │   ├── manifest.py      # TORGO manifest generation (G2P → ARPABET)
-│   │   ├── download.py      # Audio download script
-│   │   └── warm_feature_cache.py
+│   │   └── download.py      # Audio download from HuggingFace
 │   ├── utils/
-│   │   ├── config.py        # All hyperparameters (single source of truth)
+│   │   ├── config.py        # All hyperparameters — single source of truth
 │   │   └── sequence_utils.py
-│   ├── explainability/
-│   │   ├── attribution.py   # PhonemeAttributor
-│   │   ├── rule_tracker.py  # SymbolicRuleTracker
-│   │   └── output_format.py # ExplainableOutputFormatter → explanations.json
-│   └── visualization/
-│       └── experiment_plots.py
-│
+│   └── explainability/      # PhonemeAttributor, SymbolicRuleTracker, formatters
 ├── scripts/
-│   ├── smoke_test.py        # smoke profiles: unit (7 checks) + pipeline CLI smoke
-│   ├── generate_figures.py  # Publication-quality figure CLI
-│   └── tree.md, tree.sh, organize.py, cleanup.py
-│
-├── docs/
-│   ├── architecture.md      # Model architecture (this suite)
-│   ├── pipeline.md          # End-to-end pipeline
-│   ├── experiments.md       # Results and ablations
-│   ├── reproducibility.md   # Step-by-step reproduction guide
-│   └── dataset.md           # TORGO corpus guide
-│
-├── data/
-│   ├── raw/audio/           # Downloaded TORGO .wav files
-│   └── processed/           # torgo_neuro_symbolic_manifest.csv, feature_cache/
-│
-├── checkpoints/             # Saved model checkpoints per run_name
-├── results/                 # Evaluation artifacts per run_name
-└── mlruns/                  # MLflow experiment tracking
+│   ├── smoke_test.py        # Profiles: unit (7 checks), pipeline (CLI integration)
+│   └── generate_figures.py  # Publication-quality figure CLI
+├── docs/                    # User-facing documentation (see index below)
+├── data/raw/audio/          # Downloaded TORGO .wav files
+├── data/processed/          # Manifest CSV + feature_cache/
+├── checkpoints/             # Per-run model checkpoints
+└── results/                 # Per-run evaluation artifacts + figures
 ```
 
 ---
 
+## Documentation Index
+
+| File | Description |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Complete model architecture reference: components, ablation modes, freeze schedule, multi-task loss |
+| [docs/experiments.md](docs/experiments.md) | Reproducible record of all experiments, LOSO results, ablation analysis, known limitations |
+| [docs/data.md](docs/data.md) | TORGO corpus, download/manifest pipeline, manifest schema, vocabulary, collator internals |
+| [docs/training.md](docs/training.md) | Environment setup, configuration system, CLI reference, training dynamics, monitoring, troubleshooting |
+| [docs/evaluation.md](docs/evaluation.md) | Metrics reference, decoding algorithms, symbolic impact analysis, explainability, uncertainty estimation |
+| [docs/contributing.md](docs/contributing.md) | Code conventions, adding components/metrics, bug fix conventions, known codebase risks |
+
+---
+
 ## Citation
-
-If you use this code, please cite:
-
 ```bibtex
 @inproceedings{dysarthriaNSR2026,
   title     = {Neuro-Symbolic Phoneme Recognition for Dysarthric Speech with
@@ -203,12 +121,21 @@ If you use this code, please cite:
   booktitle = {Proceedings of SPCOM 2026},
   year      = {2026},
 }
-```
 
-*(Full citation to be updated upon acceptance.)*
+@article{rudzicz2012torgo,
+  title     = {The TORGO database of acoustic and articulatory speech from speakers with dysarthria},
+  author    = {Rudzicz, Frank and Namasivayam, Aravind Kumar and Bhasha, Tom},
+  journal   = {Language Resources and Evaluation},
+  volume    = {46},
+  number    = {4},
+  pages     = {523--541},
+  year      = {2012},
+  publisher = {Springer}
+}
+```
 
 ---
 
 ## License
 
-[MIT License](LICENSE)
+This project is released under the [MIT License](LICENSE).

@@ -1,35 +1,46 @@
-# DysarthriaNSR — Experiments, Results & Ablations
+# docs/experiments.md — Experiments, Results & Ablations
 
-> Cross-reference: [docs/architecture.md](architecture.md) for component descriptions,
-> [docs/reproducibility.md](reproducibility.md) for exact commands to reproduce these results.
+> Cross-references: [docs/architecture.md](architecture.md) for component descriptions, [docs/training.md](training.md) for exact CLI reproduction commands.
 
 ---
 
-## Dataset: TORGO Corpus
+## Evaluation Protocol
 
-| Property | Value |
-|----------|-------|
-| Source | TORGO database — Rudzicz et al. (2012) |
-| HuggingFace ID | `abnerh/TORGO-database` |
-| Total speakers | 15 (8 dysarthric + 7 control) |
-| Total utterances (post-manifest) | ~16,531 |
-| Total duration | ~20h (approx.; exact in manifest `duration` column) |
+### Phoneme Error Rate (PER)
+```
+PER = (S + D + I) / N
+```
 
-### Speaker Severity
+where S = substitutions, D = deletions, I = insertions, N = reference phoneme count. Computed using the `editdistance` C extension at phoneme level via `compute_per()` in `evaluate.py`.
 
-Severity scores derived from Rudzicz et al. (2012) mean percent-word-correct intelligibility ratings:
-`severity = (1 - intelligibility/100) * 5.0`
+**Aggregation — macro-speaker PER:** Per-utterance PER scores are grouped by speaker, averaged within each speaker, then averaged across speakers. This treats each speaker equally regardless of utterance count. The macro-speaker aggregate is the publication metric. Sample-mean PER (averaging all utterances directly) is reported for reference only.
+
+**Why macro, not sample-mean:** TORGO speakers have highly variable utterance counts (some speakers have 3× more recordings than others). Sample-mean PER would over-weight high-utterance speakers and obscure per-speaker performance differences that are the clinical object of interest.
+
+### Why LOSO is Mandatory
+
+TORGO has 15 speakers. A 70/15/15 stratified split yields approximately 2 test speakers. With n=2, all per-speaker statistics (Pearson r, Welch t-test, CI) are statistically invalid. Single-split Pearson r between severity and PER (n=2–3) has a 95% CI spanning nearly [−1, 1]. LOSO-CV with 15 folds provides the minimum sample size for bootstrap CI and significance testing.
+
+### Bootstrap CI Methodology
+
+Bootstrap 95% CI is computed over macro-speaker PER scores (one value per fold/speaker). With n=15 (LOSO), 1000 bootstrap resamples with replacement are drawn; the 2.5th and 97.5th percentiles give the CI bounds. Implemented in `compute_per_with_ci()` in `evaluate.py`.
+
+---
+
+## TORGO Speaker Severity Table
+
+Severity formula: `severity = (1 - intelligibility/100) * 5.0`
 
 | Speaker | Type | Approx. Intelligibility | Severity Score |
-|---------|------|------------------------|----------------|
-| F01 | Dysarthric | ~2% | 4.90 (severe) |
-| F03 | Dysarthric | ~7% | 4.65 (severe) |
-| F04 | Dysarthric | ~39% | 3.05 (moderate) |
-| M01 | Dysarthric | ~2% | 4.90 (severe) |
-| M02 | Dysarthric | ~4.5% | 4.78 (severe) |
-| M03 | Dysarthric | ~8.2% | 4.59 (severe) |
-| M04 | Dysarthric | ~43% | 2.85 (moderate) |
-| M05 | Dysarthric | ~58% | 2.10 (mild) |
+|---|---|---|---|
+| F01 | Dysarthric | ~2% | 4.90 |
+| F03 | Dysarthric | ~7% | 4.65 |
+| F04 | Dysarthric | ~39% | 3.05 |
+| M01 | Dysarthric | ~2% | 4.90 |
+| M02 | Dysarthric | ~4.5% | 4.78 |
+| M03 | Dysarthric | ~8.2% | 4.59 |
+| M04 | Dysarthric | ~43% | 2.85 |
+| M05 | Dysarthric | ~58% | 2.10 |
 | FC01 | Control | ~100% | 0.00 |
 | FC02 | Control | ~100% | 0.00 |
 | FC03 | Control | ~100% | 0.00 |
@@ -40,157 +51,126 @@ Severity scores derived from Rudzicz et al. (2012) mean percent-word-correct int
 
 ---
 
-## Evaluation Protocol
+## Main Results — LOSO-CV (loso_v1)
 
-### Metric: Phoneme Error Rate (PER)
+This is the canonical publication result. All 15 folds complete. Per-fold results are in `results/loso_v1_loso_summary.json`.
 
-```
-PER = (S + D + I) / N
-```
-where S = substitutions, D = deletions, I = insertions, N = reference phoneme count.
-Computed using `editdistance.eval()` (Levenshtein distance at phoneme level).
-
-**Aggregation:** **Macro-speaker PER** — compute per-utterance PER, group by speaker, average within-speaker, then average across speakers. Treats each speaker equally regardless of utterance count.
-
-### Evaluation Protocol: Single Split
-
-70%/15%/15% speaker-stratified split (`DataConfig.split_strategy="speaker_stratified"`):
-- Train: ~10 speakers
-- Val: ~2 speakers (used for early stopping; `val/per` is checkpointing metric)
-- Test: ~2 speakers
-
-**Known limitation:** With 15 speakers and a single 70/15/15 split, the test set contains approximately 2 speakers. All per-speaker statistics (PER by severity, dysarthric vs. control comparisons, Pearson r) are statistically invalid at n≈2. **LOSO-CV is mandatory for publication.** All single-split results reported here are interim development figures only.
-
-### Evaluation Protocol: LOSO-CV (Required for Publication)
-
-Leave-One-Speaker-Out cross-validation:
-- 15 folds, one per speaker as test set
-- Each fold: remaining 14 speakers split 12/2 for train/val
-- Reported metric: macro-average PER across 15 fold test PER values with bootstrap 95% CI
+| Metric | Value |
+|---|---|
+| Macro PER | **0.2848** |
+| 95% CI (bootstrap, n=15) | [0.1921, 0.3801] |
+| Weighted PER | **0.2299** |
+| Macro WER | **0.3362** |
+| Weighted WER | **0.2631** |
+| n_folds | 15 |
+| Total speakers | 15 (8 dysarthric + 7 control) |
 
 ---
 
-## Baselines Compared
+## Single-Split Baselines
 
-| System | Description | avg_per (single split) |
-|--------|-------------|----------------------|
-| `ablation_neural_only_v7` | HuBERT + PhonemeClassifier only; SymbolicConstraintLayer bypassed; no SeverityAdapter | **0.1346** |
-| `ablation_no_constraint_matrix_v6` | HuBERT + SeverityAdapter + PhonemeClassifier; log-softmax in place of symbolic layer | 0.1444 |
-| `baseline_v6` | Full system (HuBERT + SeverityAdapter + TemporalDownsampler + SymbolicConstraintLayer with learnable C) | 0.1372 |
+**Caution:** All single-split results below are computed on approximately 2 test speakers and are not publication-valid statistics. They are reported as development references only. See the LOSO result above for the publication aggregate.
 
-### Symbolic Impact (baseline_v6)
+| Run name | avg_per | per_neural | per_constrained | Δ (const−neural) | Notes |
+|---|---|---|---|---|---|
+| `ablation_neural_only_v7` | **0.1346** | 0.1346 | N/A | N/A | Best overall; no symbolic layer |
+| `baseline_v6` | 0.1372 | 0.1451 | 0.1372 | −0.0079 | Full system, post-fix |
+| `ablation_no_constraint_matrix_v6` | 0.1444 | — | — | — | SeverityAdapter only |
+| `baseline_v5` (historical) | 0.4750 | 0.305* | 0.4750 | — | Pre-fix; per_neural via greedy internal only |
+| `baseline_v4` (historical) | 0.4748 | 0.305* | 0.4742 | — | Beam PER; insertion bias resolved (I/D=0.87×) |
 
-The model forward pass outputs both `logits_neural` (pre-symbolic) and `log_probs_constrained` (post-symbolic). Both are greedily decoded during evaluation to assess the constraint layer's direct impact:
+*`per_neural=0.305` in v4/v5 is greedy decode of the model's internal neural sub-path, not an independent model. Not comparable to beam-decoded ablation results.
 
-| Metric | baseline_v6 |
-|--------|-------------|
-| `per_neural` (neural classifier only, greedy) | 0.1451 |
-| `per_constrained` (full system, greedy) | 0.1372 |
-| Δ = constrained − neural | −0.0079 (symbolic helps vs internal neural path) |
-| `p_value_neural_vs_constrained` | 0.0 (statistically significant) |
-| Constraint helpful / neutral / harmful (per utterance) | 9.16% / 87.06% / 3.78% |
-
-**Interpretation:** The constrained path improves over the model's internal neural sub-path in `baseline_v6`. However, the full neural-only ablation (`ablation_neural_only_v7`) still achieves the best global PER (0.135 < 0.137). This supports a "symbolic helps within-system but is not yet superior to pure HuBERT" conclusion. LOSO-CV on dysarthric-only strata is the decisive test.
+**Note:** `baseline_v2` results are **invalid** due to B12 data leakage (manifest speaker extraction bug `split('_')[0]` returned `'unknown'` for all speakers). All baseline_v2 metrics are inflated and must not be cited.
 
 ---
 
-## Ablations (B1–B5 Critical Fixes)
+## Ablation Analysis
 
-These five fixes were implemented between development sessions and are tracked in conversations `d9d04797` and `78e917b4`. They resolved systemic training failures.
+### Symbolic Constraint Effect
 
-| Fix | Component | Issue | Measured Impact |
-|-----|-----------|-------|-----------------|
-| B1 | `SymbolicKLLoss` | `reduction="batchmean"` divided by V=47; effective per-row weight was 0.001 (too weak). Changed to `reduction="sum"/V` with explicit normalisation; `lambda_symbolic_kl` raised 0.05→0.50 | Constraint matrix now tracks prior across training |
-| B2 | `BlankPriorKLLoss` target | `target_prob` default/test fixture used 0.85 vs config 0.75; prior inconsistency. Aligned to 0.75 throughout | Blank KL loss now correctly-targeted |
-| B3 | SpecAugment ordering | SpecAugment was applied after SeverityAdapter, masking adapter's severity signal. Moved to before SeverityAdapter | Severity conditioning no longer corrupted by masks |
-| B4a | Log-prob underflow | `log_probs = log(P_final + 1e-12)` underflows to 0 in BF16. Changed to `clamp_min(1e-6)` | Stable log-probs in BF16 training |
-| B4b | No-grad in rule tracking | `_track_activations` built a gradient graph even during inference, wasting memory. Wrapped in `torch.no_grad()` | Inference memory usage reduced |
-| B5 | Val/test step missing keys | `logits_neural` and `hidden_states` absent from `compute_loss()` call in `validation_step`/`test_step`; CE loss silently fell back to constrained log-probs. Added both keys | Frame-CE computed on correct neural logits in validation |
+In `baseline_v6`, the constrained path improves over the model's internal neural sub-path:
 
-### Additional Architecture Ablations (Documented in Codebase)
+- `per_neural` (greedy, internal): 0.1451
+- `per_constrained` (greedy, internal): 0.1372
+- Δ = −0.0079 (constraint helps versus internal neural path)
+- `p_value_neural_vs_constrained`: 0.0 (bootstrap paired test, statistically significant)
+- Helpful / neutral / harmful (per utterance): **9.16% / 87.06% / 3.78%**
 
-| Ablation mode | Description | Activation flag |
-|--------------|-------------|--------|
-| `no_spec_augment` | Remove SpecAugment from forward pass | `--ablation no_spec_augment` |
-| `no_temporal_ds` | Remove TemporalDownsampler (direct 50Hz prediction) | `--ablation no_temporal_ds` |
-| `no_art_heads` | Remove articulatory auxiliary supervision | `--ablation no_art_heads` |
-| `symbolic_only` | CTC/CE disabled; test pure symbolic signal | `--ablation symbolic_only` |
+**Interpretation:** The symbolic constraint meaningfully changes 13% of utterances, and of those changes, 9.16%/13% ≈ 70% are beneficial. However, `ablation_neural_only_v7` (which bypasses the entire symbolic layer and SeverityAdapter) achieves a better global PER (0.1346 vs. 0.1372). This means the symbolic constraint helps within the jointly-trained system but the overhead of the constraint path slightly hurts the parts it does not improve. LOSO-CV stratified by dysarthric strata is required to determine whether the constraint provides a meaningful advantage for severe speakers.
 
-Core ablations have now been run (`baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`).
-Recommended next pass is targeted dysarthric-fold optimization and additional component ablations (`no_spec_augment`, `no_temporal_ds`) under the LOSO protocol.
+### Component Ablations
 
----
+`ablation_no_constraint_matrix_v6` (avg_per=0.1444) removes the `LearnableConstraintMatrix` while keeping `SeverityAdapter`. Its PER is worse than `baseline_v6` (0.1444 vs. 0.1372), indicating that the `SeverityAdapter` alone without the constraint matrix does not provide a net benefit. The full system (`baseline_v6`) outperforms this ablation, confirming the learnable constraint matrix adds value within the jointly-trained system.
 
-## Known Caveats & Limitations
+### Error Profile
 
-### Statistical
+Error counts from `baseline_v5` (historical, pre-LOSO):
+- Substitutions: 13,821
+- Deletions: 4,338
+- Insertions: 3,752
 
-1. **Test set contains ~2 speakers.** All reported single-split statistics (Pearson r, Welch t-test, Wilcoxon p-value, per-speaker PER) are computed on n≈2 and are not publication-valid. With n=2, 95% CI covers nearly the entire range [0,1].
+Insertion/Deletion ratio history demonstrating the progressive fix of insertion bias:
 
-2. **Severity stratification collapses to dysarthric/control.** All 7 control speakers have `severity=0.0`. Severity buckets mild/moderate/severe are therefore dysarthric-only; control speakers all appear in the "mild" bucket.
-
-3. **Bootstrap CI computed on macro-speaker PER** (3–15 values). With n≈3 (single split), the CI is extremely wide and uninformative. With n=15 (LOSO), bootstrap CI over 15 fold PER values is appropriate.
-
-4. **Inverted dysarthric/control PER ordering** observed in some single-split runs (control PER > dysarthric PER). Almost certainly an artefact of which 2 speakers land in the test set. LOSO-CV will correct this.
-
-### Architectural
-
-1. **Frame-CE alignment (T-05):** `align_labels_to_logits` pads/truncates phoneme labels to match logit time dimension without forced alignment. CE loss supervises using positionally-incorrect frame→phoneme assignments. Mitigated by reducing `lambda_ce` from 0.35 to 0.10. Full fix requires `torchaudio.functional.forced_align`.
-
-2. **Confusion matrices without forced alignment:** Substitution/deletion/insertion statistics are computed from greedy CTC decoder outputs without frame-level phoneme boundaries. The identity of which phoneme was misarticulated is ambiguous without forced alignment.
-
-3. **`OrdinalContrastiveLoss` zero-margin for control groups (partially mitigated):** All controls have `severity=0.0`, so all control–control pairs have `|sev_i − sev_j|=0` → `margin=0` → zero gradient contribution. Fixed by using continuous `TORGO_SEVERITY_MAP` severity scores in the forward path. However, the underlying binary design of control vs. dysarthric severity limits ordinal contrast.
+| Baseline | I/D ratio | Fix applied |
+|---|---|---|
+| `baseline_v1` | 56× | None (B3 attention mask bug active) |
+| `baseline_v4` | ~4.6× (internal) → 0.87× (final) | `BlankPriorKLLoss`, staged warmup |
+| `baseline_v5` | 0.9× | Same config, 30 epochs |
 
 ---
 
-## MLflow Tracking
+## Articulatory Accuracy
 
-All experiments are tracked with MLflow. Key logged values:
+Evaluated utterance-level via global average pool (GAP) over time-axis features, with mode of phoneme label sequence as target (I5 fix). Measured on `baseline_v4`.
 
-| Logged metric | Key |
-|--------------|-----|
-| Training loss | `train/loss` |
-| CTC loss | `train/loss_ctc` |
-| Mean blank probability | `train/blank_prob_mean` |
-| Constraint β | `train/avg_beta` |
-| Constraint matrix row entropy | `val/constraint_row_entropy` |
-| Constraint matrix KL from prior | `val/constraint_kl_from_prior` |
-| Validation PER (macro-speaker) | `val/per` |
-| Dysarthric PER | `val/per_dysarthric` |
-| Control PER | `val/per_control` |
+| Feature | Accuracy | Notes |
+|---|---|---|
+| Manner of articulation | **78.6%** | stop/fricative/nasal/liquid/glide/vowel/affricate/diphthong |
+| Place of articulation | **79.1%** | bilabial/alveolar/velar/postalveolar/etc. |
+| Voicing | **92.4%** | voiced/voiceless/vowel |
 
-**To access:**
+---
+
+## Known Limitations
+
+### Frame-CE Alignment (T-05)
+
+`align_labels_to_logits()` in `src/utils/sequence_utils.py` uses proportional nearest-neighbor interpolation to map phoneme labels [B, L] to logit time dimension [B, T]. CTC does not provide forced alignment, so this assignment is approximate — frame 0..L-1 does not correspond to actual phoneme boundaries. For a 3-phoneme utterance decoded to 150 frames, the CE loss supervises using positionally-incorrect frame→phoneme assignments.
+
+**Impact:** This is the most likely contributing cause of `per_constrained > per_neural` in early baselines (pre-v6). Frame-CE trains the phoneme classifier with near-random frame→phoneme associations, which may conflict with the symbolic layer's distribution-shifting. **Mitigation applied:** `lambda_ce` reduced from 0.35 to 0.10 (C-1). **Full fix:** CTC forced alignment via `torchaudio.functional.forced_align` (future work).
+
+### Small-N Statistical Validity
+
+Single-split test sets contain approximately 2 speakers. All single-split statistics — Pearson r (severity vs. PER), Welch t-test (dysarthric vs. control), per-speaker CI — are invalid at n≈2. Pearson r=-0.85 with p=0.353 at n=3 reflects this: the correlation is directionally consistent but not statistically significant. LOSO-CV (15 folds, `loso_v1`) resolves this for the overall PER aggregate. Stratified dysarthric-subset LOSO analysis remains pending.
+
+### Confusion Matrix Validity
+
+Substitution/deletion/insertion statistics and confusion matrices are computed from greedy CTC decoder outputs without frame-level phoneme boundaries. The identity of which phoneme was misarticulated at which frame is ambiguous without CTC forced alignment. Confusion statistics (e.g., T→AH dominance, vowel centralization patterns) are indicative but not fully defensible until CTCSegmentation or Montreal Forced Aligner is applied.
+
+---
+
+## Reproduce Results
 ```bash
-mlflow ui --backend-store-uri file://$(pwd)/mlruns
-# Open http://127.0.0.1:5000
+# Reproduce baseline_v6 (full system, single split)
+python run_pipeline.py --run-name baseline_v6
+
+# Reproduce neural-only ablation
+python run_pipeline.py --run-name ablation_neural_only_v7 --ablation neural_only
+
+# Reproduce no-constraint-matrix ablation
+python run_pipeline.py --run-name ablation_no_constraint_matrix_v6 --ablation no_constraint_matrix
+
+# Reproduce LOSO (15/15 folds, ~32h)
+python run_pipeline.py --run-name loso_v1 --loso
+
+# Resume LOSO from last completed fold
+python run_pipeline.py --run-name loso_v1 --loso --resume-loso
+
+# Force-rerun specific LOSO folds
+python run_pipeline.py --run-name loso_v1 --loso --resume-loso --loso-force-speakers M01,F01
+
+# Eval-only with beam search and explainability on baseline_v6
+python run_pipeline.py --run-name baseline_v6 --skip-train \
+    --beam-search --beam-width 25 --explain --uncertainty
 ```
-
-**Key experiment names:** `DysarthriaNSR` (all runs share this experiment). Filter by `run_name` tag for specific baselines.
-
-**Key runs documented in `docs/04_RESEARCH_AUDIT.md`:**
-- `baseline_v4`, `baseline_v5` — historical pre-LOSO baselines
-- `baseline_v6` — post-fix symbolic reference checkpoint
-- `ablation_neural_only_v7` — best single-split performance
-- `ablation_no_constraint_matrix_v6` — SeverityAdapter without learnable C
-- `loso_v1` — 15/15 folds complete (publication aggregate)
-
----
-
-## Evaluation Artifacts
-
-Each evaluation run produces the following under `results/{run_name}/`:
-
-| File | Description |
-|------|-------------|
-| `evaluation_results.json` | Full structured results (PER, CI, stratified, per-speaker, error counts, symbolic impact) |
-| `config.yaml` | Exact run configuration for reproducibility |
-| `confusion_matrix.png` | Top-30 phoneme confusion matrix, row-normalised |
-| `per_by_length.png` | PER by utterance length × dysarthric/control status |
-| `clinical_gap.png` | Dysarthric vs. control PER comparison bar |
-| `rule_impact.png` | Symbolic constraint activation analysis / C matrix heatmap |
-| `blank_probability_histogram.png` | Distribution of blank probabilities (target line at 0.75) |
-| `per_phoneme_per.png` | Per-phoneme PER breakdown (top-30, colour-coded) |
-| `articulatory_confusion.png` | Articulatory feature confusion heatmap |
-| `severity_vs_per.png` | Scatter: severity score vs. per-speaker PER |
-| `per_by_speaker.png` | Per-speaker PER bar chart, sorted by severity |
-| `explanations.json` | Per-utterance explainability JSON (when `--explain`) |
