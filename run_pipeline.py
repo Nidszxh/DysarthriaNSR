@@ -186,6 +186,11 @@ def run_training(
     loso: bool,
     resume_loso: bool,
     loso_force_speakers: Optional[list[str]],
+    loso_use_beam_search: bool,
+    loso_beam_width: int,
+    loso_generate_explanations: bool,
+    loso_compute_uncertainty: bool,
+    loso_uncertainty_n_samples: int,
     limit_train_batches: Optional[int],
 ) -> Tuple[Optional[DysarthriaASRLightning], Optional[TorgoNeuroSymbolicDataset]]:
     """
@@ -233,6 +238,11 @@ def run_training(
             dataset,
             resume=resume_loso,
             force_speakers=loso_force_speakers,
+            use_beam_search=loso_use_beam_search,
+            beam_width=loso_beam_width,
+            generate_explanations=loso_generate_explanations,
+            compute_uncertainty=loso_compute_uncertainty,
+            uncertainty_n_samples=loso_uncertainty_n_samples,
         )
         log.info(
             "LOSO complete: mean PER = %.4f [95%% CI: %.4f – %.4f] | weighted PER = %.4f | mean WER = %.4f",
@@ -449,6 +459,14 @@ def run_auto(args: argparse.Namespace) -> None:
             loso=args.loso,
             resume_loso=args.resume_loso,
             loso_force_speakers=loso_force_speakers,
+            loso_use_beam_search=args.beam_search,
+            loso_beam_width=args.beam_width,
+            loso_generate_explanations=args.explain,
+            loso_compute_uncertainty=(args.uncertainty or config.experiment.compute_uncertainty),
+            loso_uncertainty_n_samples=(
+                args.uncertainty_samples if args.uncertainty
+                else config.experiment.uncertainty_n_samples
+            ),
             limit_train_batches=limit_train_batches,
         )
         # LOSO mode does its own per-fold evaluation; pipeline ends here.

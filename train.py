@@ -1532,6 +1532,11 @@ def run_loso(
     dataset: TorgoNeuroSymbolicDataset,
     resume: bool = False,
     force_speakers: Optional[List[str]] = None,
+    use_beam_search: bool = False,
+    beam_width: int = 10,
+    generate_explanations: bool = False,
+    compute_uncertainty: bool = False,
+    uncertainty_n_samples: int = 20,
 ) -> Dict:
 
     # Deterministic speaker order for LOSO folds:
@@ -1914,6 +1919,11 @@ def run_loso(
             device=config.device,
             phn_to_id=dataset.phn_to_id, id_to_phn=dataset.id_to_phn,
             results_dir=results_dir,
+            use_beam_search=use_beam_search,
+            beam_width=beam_width,
+            generate_explanations=generate_explanations,
+            compute_uncertainty=compute_uncertainty,
+            uncertainty_n_samples=uncertainty_n_samples,
         )
         fold_per = eval_results.get('avg_per', float('nan'))
         fold_wer = eval_results.get('wer', float('nan'))
