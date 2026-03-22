@@ -49,6 +49,7 @@ Thumbs.db
 /mlruns/
 
 # --- Project Specific ---
+/papers/
 /chats/
 /scripted/
 /internalDocs/

@@ -111,11 +111,11 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | `ablation_neural_only_v7` | ✅ | avg_per=0.135 (best single-split) |
 | `ablation_no_constraint_matrix_v6` | ✅ | avg_per=0.144 (eliminates learnable C, keeps SeverityAdapter) |
 | Symbolic sweep | ❌ | Planned: vary `constraint_weight_init ∈ {0.01, 0.03, 0.05}` under fixed seed |
-| LOSO-level symbolic evaluation | ❌ | Required for SPCOM claim: symbolic ≥ neural on dysarthric strata |
+| LOSO-level symbolic stratified analysis | ⚠️ | Next SPCOM positioning priority: verify dysarthric-strata gains vs neural-only reference |
 
 ---
 
-## Known Issues & Open Blockers
+## Known Issues & Open Risks
 
 ### Critical (Publication-Blocking)
 

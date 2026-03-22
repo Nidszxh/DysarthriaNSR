@@ -1,54 +1,49 @@
 # docs/contributing.md — Contributing Guide
 
-> Cross-references: [docs/architecture.md](architecture.md) for adding model components, [docs/evaluation.md](evaluation.md) for adding metrics.
+> Cross-references: [architecture.md](architecture.md) for adding model components, [evaluation.md](evaluation.md) for adding metrics.
 
 ---
 
-## Code Conventions
+## Non-Negotiable Conventions
 
-All conventions below are from `.github/copilot-instructions.md` and are enforced in code review.
+The following rules are enforced in code review. Each maps to a concrete bug or design decision that demonstrates why the rule exists.
 
-### 1. Phoneme Normalization
+**1. `normalize_phoneme()` on every ARPABET string.**
 
-**Always** call `normalize_phoneme()` before any comparison or vocabulary building involving phoneme strings:
 ```python
 from src.utils.config import normalize_phoneme
-
 normalize_phoneme("AH0")  # → "AH"
 normalize_phoneme("IY1")  # → "IY"
 ```
 
-TORGO manifest uses ARPABET with stress markers (0/1/2). The model vocabulary is stress-agnostic. **Never compare raw ARPABET strings directly.** This applies at manifest build time, dataset initialization, decode time, and in any loss computation.
+TORGO manifest uses ARPABET with stress markers (0/1/2). The model vocabulary is stress-agnostic. Any comparison against raw ARPABET strings will fail or produce UNK matches. Call `normalize_phoneme()` at manifest build time, dataset initialization, decode time, and in any loss computation involving phoneme strings. Never compare raw ARPABET strings directly.
 
-### 2. Vocabulary ID Immutability
+**2. Vocabulary ID immutability (BLANK=0, PAD=1, UNK=2).**
 
-These three token IDs are fixed and must never be reassigned:
 ```python
-<BLANK> = 0    # CTC blank — alignment separator
-<PAD>   = 1    # Padding for variable-length batches
+<BLANK> = 0    # CTC blank — alignment separator, never a label target
+<PAD>   = 1    # Padding token for variable-length batching
 <UNK>   = 2    # Unknown / OOV phonemes
-# IDs 3–46: actual ARPABET phonemes (stress-stripped)
+# IDs 3–46: ARPABET phonemes
 ```
 
-Vocabulary is built once in `TorgoNeuroSymbolicDataset._build_vocabularies()`. Changing the order or re-assigning special token IDs will silently break CTC alignment and CE loss.
+These IDs are built first in `TorgoNeuroSymbolicDataset._build_vocabularies()` and assumed throughout training, evaluation, and decoding. Changing them silently breaks: CTC loss (blank ID is hardcoded as `phn_to_id['<BLANK>']` in `DysarthriaASRLightning._init_loss_functions()`), checkpoint compatibility, and all downstream decoding.
 
-### 3. Label Padding Sentinel
+**3. `-100` padding sentinel everywhere — never `0` or `1`.**
 
-Use `-100` for all sequence padding, never `0` or `1`:
 ```python
 # Correct
 labels = pad_sequence(labels, batch_first=True, padding_value=-100)
 label_lengths = (labels != -100).sum(dim=1)
 
-# Wrong — 0 is BLANK, 1 is PAD (valid token IDs)
+# Wrong — 0 is BLANK (valid CTC token), 1 is PAD (valid token ID)
 labels = pad_sequence(labels, batch_first=True, padding_value=0)
 ```
 
-`nn.CTCLoss` and `nn.CrossEntropyLoss(ignore_index=-100)` automatically ignore `-100` positions.
+`nn.CTCLoss` and `nn.CrossEntropyLoss(ignore_index=-100)` automatically ignore `-100` positions. Using `0` or `1` causes CTC and CE losses to treat padding as real phoneme tokens.
 
-### 4. File Paths via ProjectPaths
+**4. `ProjectPaths` for all file I/O — no hardcoded paths.**
 
-Use `ProjectPaths` from `src/utils/config.py` for all file I/O. **No hardcoded paths.** Every output path must be derived from `config.experiment.run_name`:
 ```python
 from src.utils.config import get_project_root, ProjectPaths
 
@@ -56,86 +51,100 @@ results_dir = get_project_root() / "results" / config.experiment.run_name
 ckpt_dir = get_project_root() / "checkpoints" / config.experiment.run_name
 ```
 
-### 5. Type Hints and Docstrings
+**5. Type hints + docstrings on all public functions.** Args/Returns/Raises format:
 
-All public functions must have complete type hints and docstrings (Args/Returns/Raises format):
 ```python
 def compute_per(prediction: List[str], reference: List[str]) -> float:
-    """
-    Compute Phoneme Error Rate (PER) using edit distance.
-
+    """Compute Phoneme Error Rate (PER) using edit distance.
     Args:
         prediction: Predicted phoneme sequence.
         reference:  Reference phoneme sequence.
-
     Returns:
         PER in [0, ∞). Can exceed 1.0 when insertions > reference length.
     """
 ```
 
-### 6. MLflow Logging
+**6. MLflow logging for every new metric.** Use `self.log('train/my_metric', value, ...)` for Lightning metrics; `mlflow.log_metric()` for evaluation-only metrics.
 
-Log all new metrics to MLflow in the step or epoch where they are computed:
-```python
-self.log('val/my_new_metric', value, on_epoch=True, prog_bar=False)
-# For step-level metrics:
-self.log('train/my_metric', value, on_step=True, on_epoch=False)
-```
-
-Hyperparameters are logged automatically via `flatten_config_for_mlflow()` at the start of training.
+**7. Tests in `tests/` for correctness invariants; structural checks in `scripts/smoke_test.py`.** New loss functions need a `tests/test_losses.py` test covering non-negativity, scalar output, and NaN-free behavior on edge cases.
 
 ---
 
-## Adding a New Component
+## Adding a New Model Component
 
-1. **Implement** in `src/models/model.py`, following the pattern of existing components (`SeverityAdapter`, `TemporalDownsampler`). Use `nn.Module` with complete `__init__()` and `forward()` signatures.
+1. **Implement** in `src/models/model.py` following the `SeverityAdapter` / `TemporalDownsampler` pattern. Use `nn.Module` with complete `__init__()` and `forward()` signatures. Log construction to `logger.info()`.
 
-2. **Add config key** to the appropriate dataclass in `src/utils/config.py` (typically `ModelConfig`). Include a default value and a descriptive comment.
+2. **Add config key** to the appropriate dataclass in `src/utils/config.py` (typically `ModelConfig`). Include a default value, a `use_*` boolean flag, and a descriptive comment.
 
-3. **Add ablation hook** in `NeuroSymbolicASR.forward()` — check `ablation_mode` before applying the component and provide a bypass path that returns the unchanged tensor. Update the ablation mode table in [docs/architecture.md](architecture.md).
+3. **Wire into `NeuroSymbolicASR.__init__()`** using the `use_*` flag pattern: `if model_config.use_my_component: self.my_component = MyComponent(...)`.
 
-4. **Add to loss computation** if the component introduces a new loss term: add the loss class to `src/models/losses.py`, instantiate it in `DysarthriaASRLightning._init_loss_functions()`, weight it with a new `lambda_*` parameter in `TrainingConfig`, and add it to `compute_loss()` in `train.py`.
+4. **Wire into `NeuroSymbolicASR.forward()`** with an `ablation_mode` guard:
+```python
+if self.my_component is not None and ablation_mode != "no_my_component":
+    hidden_states = self.my_component(hidden_states)
+```
 
-5. **Add MLflow logging** for new loss terms and diagnostic metrics.
+5. **Add a loss class** (if the component introduces a new loss term) to `src/models/losses.py` as an `nn.Module` (not a plain function — I6 fix requirement so Lightning device-manages the module). Instantiate it in `DysarthriaASRLightning._init_loss_functions()`. Add a `lambda_*` config field to `TrainingConfig`.
 
-6. **Update smoke test** in `scripts/smoke_test.py` if the component has critical invariants (e.g., gradient flow, output shape, non-negativity).
+6. **Wire into `compute_loss()`** and add MLflow logging in `training_step()`.
 
-7. **Update docs** in [docs/architecture.md](architecture.md): add a new subsection to "Components" with the purpose, design decision, class/file reference, and constructor argument table.
+7. **Update the ablation mode table** in [architecture.md](architecture.md) with a new row.
+
+8. **Add a smoke test check** in `scripts/smoke_test.py` if the component has critical invariants (gradient flow, output shape, non-negativity).
+
+9. **Add a refactor note** at the top of modified files: `# [CLEAN]`, `# [PERF]`, `# [REPRO]` per the existing log convention.
 
 ---
 
 ## Adding a New Metric
 
-Follow the pattern established in `evaluate.py`:
+1. **Implement** as a standalone function in `evaluate.py` with complete type annotations and a docstring. The function should take raw lists/arrays and return a scalar or dict, with no model or dataloader dependencies (testable in isolation).
 
-1. **Implement** as a standalone function in `evaluate.py` with complete type annotations and docstring. The function should take raw lists/arrays and return a scalar or dict, with no model or dataloader dependencies.
-
-2. **Test** with synthetic predictions: write a pytest test in `tests/test_metrics.py` covering edge cases (empty sequences, perfect match, all-wrong).
+2. **Test** in `tests/test_metrics.py` covering: edge cases (empty sequences, perfect match, all-wrong), non-negativity, scalar output, and NaN-free behavior.
 
 3. **Integrate** into `evaluate_model()`: call the function in the appropriate place in the evaluation loop and add results to the `results` dict.
 
-4. **Log to MLflow:** add a `mlflow.log_metric()` call (or use the Lightning `self.log()` if in a training context).
+4. **Log to MLflow:** add a `mlflow.log_metric()` call.
 
-5. **Add to `evaluation_results.json` schema:** document the new key in the schema section of [docs/evaluation.md](evaluation.md).
-
-6. **Document** in the Metrics Reference section of [docs/evaluation.md](evaluation.md): formula, aggregation method, where it is computed, acceptable range.
+5. **Document** in the Metrics Reference section of [evaluation.md](evaluation.md): formula, aggregation method, where computed, output field name in `evaluation_results.json`, acceptable range, and validity conditions.
 
 ---
 
-## Bug Fix Conventions
+## Adding a New Ablation Mode
 
-### Naming Scheme
+1. **Add to the choices list** in `run_pipeline.py _build_parser()`:
+```python
+choices=["full", "neural_only", ..., "my_new_ablation"]
+```
 
-| Prefix | Category |
-|---|---|
-| B | Critical correctness bugs (e.g., B1–B23 historical series) |
-| C | Critical architectural / training bugs |
-| I | Important bugs (correctness or metric validity) |
-| E | Evaluation-specific bugs |
-| Q | Code quality and refactoring |
-| H | Hotfixes (high-priority code quality or performance) |
-| T | Technical debt or training-stability issues |
-| N | New features or enhancements |
+2. **Add a guard** in `NeuroSymbolicASR.forward()`:
+```python
+if ablation_mode == "my_new_ablation":
+    # bypass specific component
+```
+
+3. **Add a row** to the ablation mode table in [architecture.md](architecture.md).
+
+4. **Run a smoke test** before committing: `python scripts/smoke_test.py --profile unit`.
+
+---
+
+## Fix Naming Convention
+
+| Prefix | Category | Examples |
+|---|---|---|
+| B | Critical correctness bugs | B1–B23 historical series |
+| C | Critical architectural / training bugs | C1 (lambda_ce), C2 (no peak norm) |
+| I | Important bugs (correctness or metric validity) | I2 (staged KL warmup), I5 (utterance-level art heads) |
+| E | Evaluation-specific bugs | E5 (always generate art confusion), E6 (fallback heatmap) |
+| H | High-impact hotfixes | H-1 (VRAM cleanup), H-2 (alignment cache), H-5 (activation cap) |
+| T | Technical debt / training-stability issues | T-04 (OneCycleLR + unfreeze interaction) |
+| N | New features or enhancements | N3 (bootstrap delta test), N4 (add-k LM), N7 (rule precision proxy) |
+| O | Optional / deferred improvements | O-2 (per-group scheduler) |
+| M | Medium-priority issues | M-5 (conformal APS heuristic), M-6 (per-speaker severity sort) |
+| Q | Code quality and refactoring | Q7 (true neural-only ablation bypass) |
+
+To add a fix: implement it, add a row to `docs/02_COMPLETED_WORK.md` with `ID | File | Fix Applied`, and add a comment at the affected code site.
 
 ### Pre-Commit Checklist
 
@@ -148,34 +157,36 @@ Before committing any code change:
 - New metrics logged to MLflow
 - Tested on RTX 4060 (8 GB VRAM target)
 - Labels use `-100` sentinel for padding (not `0` or `1`)
-- If bug fixed: add the fix ID and summary to `docs/02_COMPLETED_WORK.md` (cross-reference only — do not create that file here)
+- If bug fixed: add the fix ID and summary to `docs/02_COMPLETED_WORK.md`
 
 ---
 
 ## Known Codebase Risks
 
-The following non-blocking issues are known from the March 2026 research audit. They do not affect correctness of training or evaluation but require awareness when modifying the codebase.
+The following non-blocking issues are known from the March 2026 research audit. They do not affect training or evaluation correctness but require awareness when modifying the codebase.
 
-### N5 — `PHONEME_DETAILS` / `PHONEME_FEATURES` Duplication
+### `PHONEME_DETAILS` / `PHONEME_FEATURES` Duplication (N5)
 
-`PHONEME_DETAILS` in `src/data/manifest.py` and `PHONEME_FEATURES` in `src/models/model.py` define articulatory class mappings independently. They are currently in sync (B23 fix applied to both), but any future correction to one must be mirrored manually in the other.
+`PHONEME_DETAILS` in `src/data/manifest.py` and `PHONEME_FEATURES` in `src/models/model.py` define articulatory class mappings independently. They are currently synchronized (B23 fix applied to both), but any future correction to one must be mirrored manually in the other.
 
-**If you encounter this:** Add the fix to **both** files simultaneously. The long-term fix is to move both to `src/utils/constants.py` and import from there (N5, planned post-submission).
+**If you modify articulatory labels:** Update **both** files simultaneously. The long-term fix is to move both to `src/utils/constants.py` and import from there (planned post-submission). The consolidation was deferred to avoid mid-LOSO manifest regeneration.
 
-### `ModelConfig.num_phonemes` Misleading Comment
+### `ModelConfig.num_phonemes=47` Misleading Comment
 
-`ModelConfig.num_phonemes = 47` is the correct runtime value (44 ARPABET + 3 special tokens). The config comment may reference 44. At runtime, `NeuroSymbolicASR.__init__()` overwrites this with `len(phn_to_id)` from the manifest vocabulary, so the config default is only a documentation issue.
+`ModelConfig.num_phonemes = 47` is the correct runtime value. At runtime, `NeuroSymbolicASR.__init__()` overwrites this with `len(phn_to_id)` from the manifest vocabulary. The config default is informational only.
 
-**If you encounter this:** Trust the runtime value from `len(dataset.phn_to_id)`. The config default is informational only.
+**If you encounter this:** Trust `len(dataset.phn_to_id)` as the authoritative vocabulary size, not `model_config.num_phonemes`.
 
-### `rule_precision()` Not Wired
+### `rule_precision()` Not Wired (N7)
 
 `SymbolicRuleTracker.rule_precision()` in `src/explainability/rule_tracker.py` is implemented but not called from `evaluate_model()`. An utterance-level proxy (`constraint_precision.rule_precision`) is reported instead.
 
-**If you encounter this:** Implementing true rule precision requires knowing which reference phoneme appeared at each CTC frame (requires forced alignment). Do not wire `rule_precision()` directly until `torchaudio.functional.forced_align` is integrated.
+**If you want true rule precision:** It requires knowing which reference phoneme appeared at each CTC frame — unavailable without `torchaudio.functional.forced_align`. Do not wire `rule_precision()` directly until forced alignment is integrated.
 
-### LOSO Resume Orchestration Gaps
+### LOSO Resume Orchestration Test Gap (§9.3)
 
-The LOSO resume logic in `run_loso()` covers three cases: (1) completed folds from progress JSON, (2) weights-only resume from exhausted scheduler checkpoints, (3) normal checkpoint resume. However, there is no integration test covering multi-fold interruption and resume. The resume path is exercised only through end-to-end LOSO runs.
+The `weights_only_resume` and `scheduler_exhausted` paths in `run_loso()` have no automated integration test. If a fold resumes incorrectly, debug by checking:
+1. `lm.resume_epoch_offset` — should equal the saved `start_epoch` from `weights_only_resume.pt`
+2. The `weights_only_resume.pt` marker file in the fold's checkpoint directory — delete it to force a clean weights-only resume from `last.ckpt`
 
-**If you encounter this:** If a fold resumes incorrectly (wrong epoch count, wrong freeze stage), check `lm.resume_epoch_offset` and the `weights_only_resume.pt` marker file in the fold's checkpoint directory. Delete the marker to force a clean weights-only resume from `last.ckpt`.
+**Recommended fix:** Add `tests/test_loso_resume.py` with a synthetic 3-fold LOSO run that interrupts and resumes each code path. This is post-paper work.
