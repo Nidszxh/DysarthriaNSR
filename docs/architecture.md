@@ -1,6 +1,6 @@
 # docs/architecture.md — Model Architecture
 
-> Cross-references: [experiments.md](experiments.md) for ablation results, [data.md](data.md) for vocabulary and input tensor shapes, [training.md](training.md) for freeze schedule operational details.
+> Cross-references: [../README.md#final-system-figure](../README.md#final-system-figure) for the final rendered architecture figure, [experiments.md](experiments.md) for ablation results, [data.md](data.md) for vocabulary and input tensor shapes, [training.md](training.md) for freeze schedule operational details.
 
 ---
 
