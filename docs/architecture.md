@@ -309,7 +309,9 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `lambda_blank_kl` | `0.20` | Blank-prior KL weight (final stage) |
 | `blank_target_prob` | `0.75` | Target mean blank probability |
 | `lambda_symbolic_kl` | `0.50` | Symbolic KL anchor weight |
-| `early_stopping_patience` | `8` | Epochs without improvement before stopping |
+| `early_stopping_patience` | `8` | Epochs without improvement before stopping (paper full-system runs use 6; ablations use 8) |
+
+**Optimizer LR groups (paper setting):** HuBERT encoder uses `0.1×` peak LR, classifier+adapter uses `1.0×`, and the constraint layer uses `0.5×` under the same OneCycle schedule.
 | `ablation_mode` | `full` | Active ablation mode |
 
 ---

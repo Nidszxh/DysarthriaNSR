@@ -93,7 +93,7 @@ Config is saved to both `checkpoints/{run_name}/config.yaml` (during training) a
 | `training.max_epochs` | `40` | `--max-epochs INT` | Maximum training epochs |
 | `training.batch_size` | `12` | `--batch-size INT` | Per-GPU batch size |
 | `training.gradient_accumulation_steps` | `3` | `--grad-accum INT` | Effective batch = batch_size × grad_accum |
-| `training.early_stopping_patience` | `8` | `--early-stopping-patience INT` | Epochs without improvement |
+| `training.early_stopping_patience` | `8` | `--early-stopping-patience INT` | Epochs without improvement (paper full-system runs use 6; ablations use 8) |
 | `training.check_val_every_n_epoch` | `1` | `--check-val-every-n-epoch INT` | Set to 2 to halve validation overhead for LOSO |
 | `training.encoder_warmup_epochs` | `1` | (modify config.py) | Stage 1 unfreeze trigger |
 | `training.lambda_symbolic_kl` | `0.5` | (modify config.py) | KL anchor strength |
@@ -209,6 +209,18 @@ python run_pipeline.py --run-name cache_warmup --warm-cache --warm-cache-only
 ---
 
 ## Training Dynamics Deep Dive
+
+### Differential Learning-Rate Groups (paper configuration)
+
+Paper runs use AdamW with three parameter groups under OneCycleLR (5% warmup, cosine annealing):
+
+| Parameter group | LR multiplier | Base LR | Effective peak LR |
+|---|---:|---:|---:|
+| HuBERT encoder | 0.1× | 3e-5 | 3e-6 |
+| PhonemeClassifier + SeverityAdapter | 1.0× | 3e-5 | 3e-5 |
+| Constraint layer (`LearnableConstraintMatrix`) | 0.5× | 3e-5 | 1.5e-5 |
+
+This split keeps pretrained HuBERT updates conservative while allowing classifier/adapter adaptation and moderate constraint-matrix plasticity.
 
 ### Three-Stage Freeze Schedule
 

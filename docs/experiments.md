@@ -83,7 +83,7 @@ Per-fold detail (speaker | PER | WER | n_samples | trained_epochs | elapsed_min)
 | `ablation_neural_only_v7` | **0.1346** | 0.1346 | N/A | N/A | Best overall single-split; no symbolic layer or SeverityAdapter |
 | `baseline_v6` | 0.1372 | 0.1451 | 0.1372 | −0.0079 | Full system, post-fix; all B1–B23 applied |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | — | — | SeverityAdapter kept; constraint matrix removed |
-| `baseline_v4` (historical) | 0.4748 | 0.305* | 0.4742 | — | Beam PER; insertion bias resolved (I/D=0.87×); articulatory manner 78.6% / place 79.1% / voice 92.4% |
+| `baseline_v4` (historical) | 0.4748 | 0.305* | 0.4742 | — | Beam PER; insertion bias resolved (I/D=0.87×); superseded by `baseline_v6` and LOSO |
 | `baseline_v2` | ~~0.215~~ | — | — | — | ⚠️ **Invalid** — B12 data leakage; manifest speaker extraction bug returned `'unknown'` for all speakers |
 
 *`per_neural=0.305` in v4 is greedy decode of the model's internal neural sub-path in an older evaluation path, not an independent model. Not comparable to beam-decoded ablation results.
@@ -134,13 +134,13 @@ Insertion/Deletion ratio history demonstrating progressive insertion bias correc
 
 ## Articulatory Accuracy
 
-Evaluated utterance-level via global average pool (I5 fix: bypasses invalid frame-level CTC alignment). Target is the mode of the phoneme label sequence for the utterance. Measured on `baseline_v4`.
+Evaluated utterance-level via global average pool (I5 fix: bypasses invalid frame-level CTC alignment). Target is the mode of the phoneme label sequence for the utterance. Measured on the full system (`baseline_v6`, final configuration used in paper analysis).
 
-| Feature | Accuracy | Classes |
-|---|---|---|
-| Manner of articulation | **78.6%** | stop, fricative, affricate, nasal, liquid, glide, vowel, diphthong |
-| Place of articulation | **79.1%** | bilabial, labiodental, dental, alveolar, postalveolar, palatal, velar, glottal, labio-velar, front, back, central |
-| Voicing | **92.4%** | voiced, voiceless, vowel |
+| Feature | Accuracy | Classes | Notes |
+|---|---|---|---|
+| Manner of articulation | **75.9%** | stop, fricative, affricate, nasal, liquid, glide, vowel, diphthong | Comparable across model configurations |
+| Place of articulation | **82.0%** | bilabial, labiodental, dental, alveolar, postalveolar, palatal, velar, glottal, labio-velar, front, back, central | Lower than SeverityAdapter-only (`ablation_no_constraint_matrix_v6`: 88.7%), consistent with the structured label-smoothing trade-off described in the paper |
+| Voicing | **94.4%** | voiced, voiceless, vowel | Strongest auxiliary axis and stable across constrained runs |
 
 ---
 
