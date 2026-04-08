@@ -93,6 +93,7 @@ class BigramLMScorer:
         self._bigram_counts: Dict = defaultdict(int)   # (prev_id, next_id) → count
         self._unigram_counts: Dict = defaultdict(int)  # prev_id → count
         self._vocab_size: int = 0
+        self._log_prob_matrix: Optional[np.ndarray] = None
         self._built: bool = False
 
     def fit(
@@ -106,6 +107,9 @@ class BigramLMScorer:
             phoneme_id_seqs: List of phoneme-ID sequences (from training labels).
             vocab_size:      Total vocabulary size (len(phn_to_id)).
         """
+        self._bigram_counts.clear()
+        self._unigram_counts.clear()
+
         for seq in phoneme_id_seqs:
             clean = [t for t in seq if t >= 0]  # drop -100 padding
             for i in range(len(clean) - 1):
@@ -113,13 +117,29 @@ class BigramLMScorer:
                 self._unigram_counts[clean[i]] += 1
             if clean:
                 self._unigram_counts[clean[-1]] += 1
+
         self._vocab_size = vocab_size
+        self._log_prob_matrix = np.empty((vocab_size, vocab_size), dtype=np.float32)
+
+        for prev_id in range(vocab_size):
+            uni = self._unigram_counts.get(prev_id, 0)
+            den = max(uni + self.k * vocab_size, 1e-10)
+            base = np.log(max(self.k / den, 1e-10))
+            self._log_prob_matrix[prev_id, :] = base
+
+        for (prev_id, next_id), cnt in self._bigram_counts.items():
+            uni = self._unigram_counts.get(prev_id, 0)
+            den = max(uni + self.k * vocab_size, 1e-10)
+            self._log_prob_matrix[prev_id, next_id] = np.log(max((cnt + self.k) / den, 1e-10))
+
         self._built = True
 
     def log_prob(self, prev_id: int, next_id: int) -> float:
         """Return log P(next_id | prev_id) with add-k smoothing."""
         if not self._built:
             return 0.0
+        if self._log_prob_matrix is not None:
+            return float(self._log_prob_matrix[prev_id, next_id])
         num = self._bigram_counts.get((prev_id, next_id), 0) + self.k
         den = self._unigram_counts.get(prev_id, 0) + self.k * self._vocab_size
         return float(np.log(max(num / max(den, 1e-10), 1e-10)))
@@ -200,17 +220,17 @@ class BeamSearchDecoder:
         ]
         allowed_ids = [blank_id] + emit_ids
 
-        # Beam state: {prefix: (p_blank, p_non_blank, lm_cumulative_score)}
+        # Beam state: {prefix: (p_blank, p_non_blank, lm_for_blank, lm_for_non_blank)}
         # p_blank and p_non_blank are PURE acoustic log-probs (CTC semantics).
-        # lm_cumulative_score accumulates bigram log-probs per emitted token.
-        # They are kept separate so CTC collapse arithmetic stays correct.
-        beam: Dict[tuple, tuple] = {(): (0.0, float('-inf'), 0.0)}
+        # Separate LM accumulators keep LM scores path-consistent with the
+        # acoustic branch that produced each hypothesis component.
+        beam: Dict[tuple, tuple] = {(): (0.0, float('-inf'), 0.0, 0.0)}
 
         use_lm = (self.lm_scorer is not None and self.lm_weight > 0.0)
 
         for t in range(T):
             new_beam: Dict[tuple, tuple] = defaultdict(
-                lambda: (float('-inf'), float('-inf'), 0.0)
+                lambda: (float('-inf'), float('-inf'), 0.0, 0.0)
             )
 
             # Renormalize each frame over CTC-valid IDs only:
@@ -220,14 +240,16 @@ class BeamSearchDecoder:
             frame_log_z = np.logaddexp.reduce(frame_allowed)
             blank_lp = log_probs[t, blank_id] - frame_log_z
 
-            for prefix, (p_b, p_nb, lm_acc) in beam.items():
+            for prefix, (p_b, p_nb, lm_b_acc, lm_nb_acc) in beam.items():
                 # --- Extend with true CTC blank only ---------------------------
                 new_p_b = np.logaddexp(p_b, p_nb) + blank_lp
-                prev_b, prev_nb, prev_lm = new_beam[prefix]
+                src_lm_for_blank = lm_b_acc if p_b >= p_nb else lm_nb_acc
+                prev_b, prev_nb, prev_lm_b, prev_lm_nb = new_beam[prefix]
                 new_beam[prefix] = (
                     np.logaddexp(prev_b, new_p_b),
                     prev_nb,
-                    max(prev_lm, lm_acc),  # preserve latest LM acc for this prefix
+                    src_lm_for_blank if new_p_b > prev_b else prev_lm_b,
+                    prev_lm_nb,
                 )
 
                 # --- Extend with non-blank phonemes ---------------------------
@@ -241,27 +263,30 @@ class BeamSearchDecoder:
                         # runs and can bias beam search toward blank/deletions.
                         new_prefix = prefix
                         new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
-                        new_lm_acc = lm_acc   # no new token emitted
+                        new_lm_acc = lm_nb_acc if p_nb >= p_b else lm_b_acc
                     else:
                         # New token → extend prefix, update LM accumulator
                         new_prefix = prefix + (c,)
                         new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
+                        src_lm_for_nb = lm_nb_acc if p_nb >= p_b else lm_b_acc
                         if use_lm and len(prefix) > 0:
                             # Incremental bigram score for this single new token
-                            new_lm_acc = lm_acc + self.lm_scorer.log_prob(prefix[-1], c)
+                            new_lm_acc = src_lm_for_nb + self.lm_scorer.log_prob(prefix[-1], c)
                         else:
-                            new_lm_acc = lm_acc
+                            new_lm_acc = src_lm_for_nb
 
-                    prev_b, prev_nb, prev_lm = new_beam[new_prefix]
+                    prev_b, prev_nb, prev_lm_b, prev_lm_nb = new_beam[new_prefix]
                     new_beam[new_prefix] = (
                         prev_b,
                         np.logaddexp(prev_nb, new_p_nb),
-                        max(prev_lm, new_lm_acc),
+                        prev_lm_b,
+                        new_lm_acc if new_p_nb > prev_nb else prev_lm_nb,
                     )
 
             # Prune to beam_width — rank by acoustic + LM together
             def _beam_rank(item: tuple) -> float:
-                pfx, (pb, pnb, lm_s) = item
+                pfx, (pb, pnb, lm_b, lm_nb) = item
+                lm_s = lm_nb if pnb >= pb else lm_b
                 return np.logaddexp(pb, pnb) + (self.lm_weight * lm_s if use_lm else 0.0)
 
             beam = dict(sorted(new_beam.items(), key=_beam_rank, reverse=True)[:self.beam_width])
@@ -269,15 +294,16 @@ class BeamSearchDecoder:
         # Final selection: acoustic / len^α + λ * lm_cumulative
         # §3.3 fix: length norm applied to acoustic score only; LM bonus is
         # per-token so it should NOT be divided by sequence length.
-        def _norm_score(prefix: tuple, p_b: float, p_nb: float, lm_s: float) -> float:
+        def _norm_score(prefix: tuple, p_b: float, p_nb: float, lm_b: float, lm_nb: float) -> float:
             acoustic  = np.logaddexp(p_b, p_nb)
+            lm_s = lm_nb if p_nb >= p_b else lm_b
             lm_bonus  = (self.lm_weight * lm_s) if use_lm else 0.0
             length    = max(len(prefix), 1)
             return acoustic / (length ** self.length_norm_alpha) + lm_bonus
 
-        best_prefix, (p_b, p_nb, _lm) = max(
+        best_prefix, (p_b, p_nb, _lm_b, _lm_nb) = max(
             beam.items(),
-            key=lambda x: _norm_score(x[0], x[1][0], x[1][1], x[1][2])
+            key=lambda x: _norm_score(x[0], x[1][0], x[1][1], x[1][2], x[1][3])
         )
         best_score = np.logaddexp(p_b, p_nb)
         
@@ -1107,7 +1133,7 @@ def plot_confusion_matrix(
     
     # Normalize by row (reference phoneme)
     row_sums = matrix.sum(axis=1, keepdims=True)
-    matrix_norm = np.divide(matrix, row_sums, where=row_sums!=0)
+    matrix_norm = np.divide(matrix, row_sums, out=np.zeros_like(matrix), where=row_sums != 0)
     
     # Plot
     plt.figure(figsize=(14, 12))
@@ -1408,6 +1434,8 @@ def evaluate_model(
     # on CPU and evaluated directly without a Trainer.fit() call.
     device = torch.device(device)
     model = model.to(device)
+    if hasattr(model, 'symbolic_kl_loss') and getattr(model, 'symbolic_kl_loss') is not None:
+        model.symbolic_kl_loss = model.symbolic_kl_loss.to(device)
 
     model.eval()
 
@@ -1687,16 +1715,20 @@ def evaluate_model(
             'status': speaker_status_map.get(spk, -1),
         }
 
-    # H-2: Pre-compute phoneme alignments ONCE; all 4 analysis functions share the cache.
-    print("🔍 Pre-computing phoneme alignments (shared cache for all analysis functions)...")
-    _all_alignments: List[List[Tuple]] = [
-        phoneme_alignment(p, r) for p, r in zip(all_predictions, all_references)
-    ]
+    # Keep full alignments only when needed; otherwise stream computation to
+    # reduce peak memory on large LOSO evaluation sets.
+    _need_full_alignments = bool(generate_explanations or symbolic_rules)
+    _all_alignments: Optional[List[List[Tuple]]] = None
     _neural_alignments: Optional[List[List[Tuple]]] = None
-    if all_predictions_neural and len(all_predictions_neural) == len(all_references):
-        _neural_alignments = [
-            phoneme_alignment(p, r) for p, r in zip(all_predictions_neural, all_references)
+    if _need_full_alignments:
+        print("🔍 Pre-computing phoneme alignments (shared cache for all analysis functions)...")
+        _all_alignments = [
+            phoneme_alignment(p, r) for p, r in zip(all_predictions, all_references)
         ]
+        if all_predictions_neural and len(all_predictions_neural) == len(all_references):
+            _neural_alignments = [
+                phoneme_alignment(p, r) for p, r in zip(all_predictions_neural, all_references)
+            ]
 
     # Phoneme-level error analysis
     print("📊 Analyzing phoneme-level errors...")

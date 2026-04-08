@@ -104,7 +104,7 @@ class ModelConfig:
     hidden_dim: int = 512
     # Runtime vocab is rebuilt from the manifest and includes 3 special tokens
     # (<BLANK>, <PAD>, <UNK>) plus the observed ARPABET phonemes.
-    num_phonemes: int = 47
+    num_phonemes: Optional[int] = None
     classifier_dropout: float = 0.1
     
     # Symbolic Neural-Fusion

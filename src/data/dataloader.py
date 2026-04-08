@@ -1,6 +1,7 @@
 import warnings
 import hashlib
 import os
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -98,6 +99,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
         # Precompute sequence encodings once (safe optimization): avoids
         # repeated per-batch string split/token encoding for labels.
         self._sequence_cache = self._build_sequence_cache()
+        self._materialize_sequence_tensors()
         
         # Pre-calculate inverse-frequency phoneme weights
         self.phoneme_weights = self._calculate_phoneme_weights()
@@ -448,7 +450,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
             return
 
         cache_path = self._feature_cache_path(idx, audio_path)
-        tmp_path = cache_path.with_suffix(f".pt.tmp.{os.getpid()}")
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        tmp_path = cache_path.with_suffix(
+            f".pt.tmp.{os.getpid()}.{worker_id}.{threading.get_ident()}"
+        )
         try:
             torch.save(features, tmp_path)
             tmp_path.replace(cache_path)
@@ -524,6 +530,34 @@ class TorgoNeuroSymbolicDataset(Dataset):
 
         return cached_sequences
 
+    def _materialize_sequence_tensors(self) -> None:
+        """Convert per-sample sequence cache to compact preallocated tensors."""
+        n_samples = len(self._sequence_cache)
+        if n_samples == 0:
+            self._labels_tensor = torch.empty((0, 0), dtype=torch.long)
+            self._manner_tensor = torch.empty((0, 0), dtype=torch.long)
+            self._place_tensor = torch.empty((0, 0), dtype=torch.long)
+            self._voice_tensor = torch.empty((0, 0), dtype=torch.long)
+            self._seq_lengths = torch.empty((0,), dtype=torch.long)
+            return
+
+        max_seq_len = max(int(seq["labels"].numel()) for seq in self._sequence_cache)
+        self._labels_tensor = torch.full((n_samples, max_seq_len), -100, dtype=torch.long)
+        self._manner_tensor = torch.full((n_samples, max_seq_len), -100, dtype=torch.long)
+        self._place_tensor = torch.full((n_samples, max_seq_len), -100, dtype=torch.long)
+        self._voice_tensor = torch.full((n_samples, max_seq_len), -100, dtype=torch.long)
+        self._seq_lengths = torch.zeros((n_samples,), dtype=torch.long)
+
+        for idx, seq in enumerate(self._sequence_cache):
+            seq_len = int(seq["labels"].numel())
+            self._seq_lengths[idx] = seq_len
+            self._labels_tensor[idx, :seq_len] = seq["labels"]
+            self._manner_tensor[idx, :seq_len] = seq["manner"]
+            self._place_tensor[idx, :seq_len] = seq["place"]
+            self._voice_tensor[idx, :seq_len] = seq["voice"]
+
+        del self._sequence_cache
+
     def _get_articulatory_tokens(
         self,
         row: pd.Series,
@@ -565,15 +599,19 @@ class TorgoNeuroSymbolicDataset(Dataset):
                 audio_features = audio_features[:self.max_audio_samples]
             self._store_cached_features(idx, audio_path, audio_features)
         
-        seq = self._sequence_cache[idx]
+        seq_len = int(self._seq_lengths[idx].item())
+        labels = self._labels_tensor[idx, :seq_len].clone()
+        manner = self._manner_tensor[idx, :seq_len].clone()
+        place = self._place_tensor[idx, :seq_len].clone()
+        voice = self._voice_tensor[idx, :seq_len].clone()
         
         return {
             "input_values": audio_features,
-            "labels": seq["labels"],
+            "labels": labels,
             "articulatory_labels": {
-                "manner": seq["manner"],
-                "place": seq["place"],
-                "voice": seq["voice"],
+                "manner": manner,
+                "place": place,
+                "voice": voice,
             },
             "metadata": {
                 "speaker": row['speaker'],

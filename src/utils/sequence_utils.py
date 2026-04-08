@@ -13,7 +13,11 @@ a single canonical implementation that both modules import.
 import torch
 
 
-def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
+def align_labels_to_logits(
+    labels: torch.Tensor,
+    time_steps_logits: int,
+    center_weight: float = 0.7,
+) -> torch.Tensor:
     """
     Align a label tensor's time dimension to match the logits time dimension.
 
@@ -25,6 +29,9 @@ def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torc
     Args:
         labels:             Label tensor [batch, seq_len]
         time_steps_logits:  Target time dimension (from logits.size(1))
+        center_weight:      Boundary de-emphasis factor in [0, 1]. Higher values
+                            mask more segment edges with -100 and keep only the
+                            central fraction for frame-CE supervision.
 
     Returns:
         Aligned labels [batch, time_steps_logits]
@@ -40,6 +47,29 @@ def align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torc
         * (time_steps_labels / float(time_steps_logits))
     ).long().clamp(0, time_steps_labels - 1)
     aligned = labels[:, indices]
+
+    if center_weight > 0.0 and time_steps_labels > 1 and time_steps_logits > 2:
+        keep_frac = max(0.0, min(1.0, 1.0 - float(center_weight)))
+        if keep_frac < 1.0:
+            seg_edges = torch.linspace(
+                0,
+                time_steps_logits,
+                steps=time_steps_labels + 1,
+                device=labels.device,
+            ).floor().long()
+            for seg_idx in range(time_steps_labels):
+                start = int(seg_edges[seg_idx].item())
+                end = int(seg_edges[seg_idx + 1].item())
+                seg_len = end - start
+                if seg_len <= 0:
+                    continue
+                keep_len = max(1, int(round(seg_len * keep_frac)))
+                center_start = start + max(0, (seg_len - keep_len) // 2)
+                center_end = min(end, center_start + keep_len)
+                if center_start > start:
+                    aligned[:, start:center_start] = -100
+                if center_end < end:
+                    aligned[:, center_end:end] = -100
 
     # [PERF] Vectorized -100 tail propagation.
     # Previous: Python for-loop over batch items (O(B) sequential tensor ops).

@@ -11,6 +11,13 @@ import pandas as pd
 from datasets import Audio, load_dataset
 from tqdm import tqdm
 
+try:
+    from src.utils.constants import PHONEME_DETAILS
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.utils.constants import PHONEME_DETAILS
+
 # --- CONFIGURATION ---
 
 @dataclass(frozen=True)
@@ -26,66 +33,6 @@ class DataPaths:
         object.__setattr__(self, "data_dir", self.root / "data")
         object.__setattr__(self, "raw_dir", self.data_dir / "raw")
         object.__setattr__(self, "processed_dir", self.data_dir / "processed")
-
-# Phoneme-to-Articulatory details (American English ARPABET)
-# Format: (Manner, Place, Voicing)
-PHONEME_DETAILS = {
-    # Stops (Plosives)
-    'P': ('stop', 'bilabial', 'voiceless'),
-    'B': ('stop', 'bilabial', 'voiced'),
-    'T': ('stop', 'alveolar', 'voiceless'),
-    'D': ('stop', 'alveolar', 'voiced'),
-    'K': ('stop', 'velar', 'voiceless'),
-    'G': ('stop', 'velar', 'voiced'),
-    # Fricatives
-    'F': ('fricative', 'labiodental', 'voiceless'),
-    'V': ('fricative', 'labiodental', 'voiced'),
-    'TH': ('fricative', 'dental', 'voiceless'),
-    'DH': ('fricative', 'dental', 'voiced'),
-    'S': ('fricative', 'alveolar', 'voiceless'),
-    'Z': ('fricative', 'alveolar', 'voiced'),
-    # §5.3 fix: SH/ZH are postalveolar (retroflex/laminal), not palatal — aligned
-    # with IPA and model.py PHONEME_FEATURES
-    'SH': ('fricative', 'postalveolar', 'voiceless'),
-    'ZH': ('fricative', 'postalveolar', 'voiced'),
-    'HH': ('fricative', 'glottal', 'voiceless'),
-    # Affricates
-    # §5.3 fix: CH/JH are postalveolar affricates, not palatal
-    'CH': ('affricate', 'postalveolar', 'voiceless'),
-    'JH': ('affricate', 'postalveolar', 'voiced'),
-    # Nasals
-    'M': ('nasal', 'bilabial', 'voiced'),
-    'N': ('nasal', 'alveolar', 'voiced'),
-    'NG': ('nasal', 'velar', 'voiced'),
-    # Liquids
-    'L': ('liquid', 'alveolar', 'voiced'),
-    # §5.3 fix: American English /r/ is a retroflex approximant — alveolar, not palatal
-    'R': ('liquid', 'alveolar', 'voiced'),
-    # Glides
-    # §5.3 fix: /w/ is labio-velar (labialized velar), not merely bilabial
-    'W': ('glide', 'labio-velar', 'voiced'),
-    'Y': ('glide', 'palatal', 'voiced'),
-    # Vowels (Monophthongs)
-    'IY': ('vowel', 'front', 'voiced'),
-    'IH': ('vowel', 'front', 'voiced'),
-    'EH': ('vowel', 'front', 'voiced'),
-    'EY': ('vowel', 'front', 'voiced'),
-    'AE': ('vowel', 'front', 'voiced'),
-    'AA': ('vowel', 'back', 'voiced'),
-    'AO': ('vowel', 'back', 'voiced'),
-    'OW': ('vowel', 'back', 'voiced'),
-    'UH': ('vowel', 'back', 'voiced'),
-    'UW': ('vowel', 'back', 'voiced'),
-    'AH': ('vowel', 'central', 'voiced'),
-    'ER': ('vowel', 'central', 'voiced'),
-    'AX': ('vowel', 'central', 'voiced'),
-    'IX': ('vowel', 'central', 'voiced'),
-    'AXR': ('vowel', 'central', 'voiced'),
-    # Diphthongs
-    'AY': ('diphthong', 'front', 'voiced'),
-    'AW': ('diphthong', 'back', 'voiced'),
-    'OY': ('diphthong', 'back', 'voiced'),
-}
 
 MIN_PHONEME_COUNT = 2
 MAX_PHONEMES_PER_SEC = 20

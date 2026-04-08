@@ -169,6 +169,49 @@ class DysarthriaASRLightning(pl.LightningModule):
         # this offset preserves epoch-aware behavior (staged unfreezing, KL ramp)
         # as if training had continued from the checkpoint epoch.
         self.resume_epoch_offset = 0
+        self._encoder_unfrozen = False
+        self._encoder_deep_unfrozen = False
+        self._encoder_deeper_unfrozen = False
+        self._sync_unfreeze_flags_from_epoch(self.resume_epoch_offset)
+
+    def _sync_unfreeze_flags_from_epoch(self, effective_epoch: int, apply_to_model: bool = False) -> None:
+        """Sync progressive-unfreeze stage flags from an effective epoch.
+
+        This prevents duplicate stage transitions during weights-only resume.
+        Optionally applies the implied unfreeze stage to the underlying model
+        immediately (useful when resume offset is injected after __init__).
+        """
+        warmup_ep = self.config.training.encoder_warmup_epochs
+        second_unfreeze = getattr(self.config.training, 'encoder_second_unfreeze_epoch', 6)
+        third_unfreeze = getattr(self.config.training, 'encoder_third_unfreeze_epoch', 12)
+
+        epoch = int(effective_epoch)
+        if epoch >= third_unfreeze:
+            self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
+            self._encoder_deep_unfrozen = True
+            self._encoder_deeper_unfrozen = True
+            if apply_to_model:
+                self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
+        elif epoch >= second_unfreeze:
+            self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
+            self._encoder_deep_unfrozen = True
+            self._encoder_deeper_unfrozen = False
+            if apply_to_model:
+                self.model.unfreeze_encoder(layers=[6, 7, 8, 9, 10, 11])
+        elif epoch >= warmup_ep:
+            self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
+            self._encoder_deep_unfrozen = False
+            self._encoder_deeper_unfrozen = False
+            if apply_to_model:
+                self.model.unfreeze_encoder(layers=[8, 9, 10, 11])
+        else:
+            self.encoder_unfrozen = False
+            self._encoder_unfrozen = False
+            self._encoder_deep_unfrozen = False
+            self._encoder_deeper_unfrozen = False
     
     def _init_loss_functions(self) -> None:
         """Initialize loss functions (simplified to 2 losses)."""
@@ -316,12 +359,17 @@ class DysarthriaASRLightning(pl.LightningModule):
                 loss_art = torch.stack(art_losses).mean()
 
         # 4. Blank-prior KL (insertion fix)
-        loss_blank_kl = self.blank_kl_loss(log_probs_constrained, attention_mask)
+        loss_blank_kl = self.blank_kl_loss(log_probs_constrained, attention_mask, severity=severity)
 
         # 5. Ordinal contrastive severity loss (Proposal P1)
         loss_ordinal = None
         hidden = outputs.get('hidden_states')
         if hidden is not None and severity is not None and ablation != 'symbolic_only':
+            if attention_mask is not None:
+                assert hidden.size(1) == attention_mask.size(1), (
+                    f"Hidden ({hidden.size(1)}) and mask ({attention_mask.size(1)}) "
+                    "time dims must match"
+                )
             loss_ordinal = self.ordinal_loss(hidden, severity, attention_mask)
 
         # 6. Symbolic KL anchor (Proposal P2 — learnable constraint matrix)
@@ -529,22 +577,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         # instead of the coarse binary status * 5.0 used previously.
         severity = _get_batch_severity(batch, log_probs_constrained.device)
 
-        attn_mask = batch.get('attention_mask')
-        if attn_mask is not None:
-            # Downsample attention mask from audio-frame resolution to logit resolution.
-            # The effective stride is 320 (HuBERT CNN) * 2 (TemporalDownsampler) when
-            # the downsampler is active (§2.7 fix: was always using 320, causing ~2×
-            # too many valid-frame entries after truncation).
-            T_log = log_probs_constrained.size(1)
-            ctc_stride = 320 * (2 if self.model.temporal_downsampler is not None else 1)
-            attn_mask_ds = (
-                attn_mask[:, ::ctc_stride].to(log_probs_constrained.device)
-                if attn_mask.size(1) > T_log
-                else attn_mask.to(log_probs_constrained.device)
-            )
-            attn_mask_ds = attn_mask_ds[:, :T_log]
-        else:
-            attn_mask_ds = None
+        attn_mask_ds = self._downsample_attn_mask(batch, log_probs_constrained)
 
         losses = self.compute_loss(
             outputs_filtered,
@@ -574,18 +607,17 @@ class DysarthriaASRLightning(pl.LightningModule):
             beta_val = beta_val.mean()
         self.log('train/avg_beta', beta_val, on_step=False, on_epoch=True)
 
-        # Q4: Gradient norm monitoring — log L2 norm every 50 steps for stability diagnostics.
-        # Logged after the backward pass has populated .grad attributes via Lightning's
-        # on_before_optimizer_step hook ordering; accessing here is safe because
-        # training_step is called before the optimizer step in Lightning 2.x.
+        # Q4: Gradient norm monitoring — reduce host sync points by doing
+        # vectorised norm computation and a single scalar extraction.
         if self.global_step % 50 == 0:
-            total_norm_sq = sum(
-                p.grad.detach().norm(2).item() ** 2
+            grads = [
+                p.grad.detach().reshape(-1)
                 for p in self.parameters()
                 if p.grad is not None
-            )
-            grad_norm = total_norm_sq ** 0.5
-            self.log('train/grad_norm', grad_norm, on_step=True, prog_bar=False)
+            ]
+            if grads:
+                grad_norm = torch.linalg.vector_norm(torch.cat(grads), ord=2)
+                self.log('train/grad_norm', float(grad_norm), on_step=True, prog_bar=False)
 
         return losses['loss']
 
@@ -623,20 +655,22 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Resume-safe stage selection: choose the highest stage implied by the
         # current epoch immediately. This avoids one-epoch lag when resuming at
         # late epochs (e.g., epoch 21 must directly enter Stage 3).
-        if epoch >= third_unfreeze and not getattr(self, '_encoder_deeper_unfrozen', False):
+        if epoch >= third_unfreeze and not self._encoder_deeper_unfrozen:
             self.model.unfreeze_encoder(layers=[4, 5, 6, 7, 8, 9, 10, 11])
             self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
             self._encoder_deep_unfrozen = True
             self._encoder_deeper_unfrozen = True
             self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 3: Unfroze HuBERT layers 4-11 at epoch {epoch}")
 
-        elif epoch >= second_unfreeze and not getattr(self, '_encoder_deep_unfrozen', False):
+        elif epoch >= second_unfreeze and not self._encoder_deep_unfrozen:
             # Stage 2: unfreeze layers 6-11 only (§2.4 fix: was calling
             # unfreeze_after_warmup() which unfroze ALL layers 4-11, making
             # Stage 3 a no-op)
             self.model.unfreeze_encoder(layers=[6, 7, 8, 9, 10, 11])
             self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
             self._encoder_deep_unfrozen = True
             self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 2: Unfroze HuBERT layers 6-11 at epoch {epoch}")
@@ -645,6 +679,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # Stage 1: unfreeze top 4 layers only
             self.model.unfreeze_encoder(layers=[8, 9, 10, 11])
             self.encoder_unfrozen = True
+            self._encoder_unfrozen = True
             self._reset_hubert_lr_warmup()  # T-04: reset Adam state for newly-active params
             print(f"🔥 Stage 1: Unfroze HuBERT layers 8-11 at epoch {epoch}")
 
@@ -773,6 +808,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             input_lengths,
             label_lengths,
             articulatory_labels=art_labels,
+            severity=_get_batch_severity(batch, log_probs_constrained.device)[valid_mask],
             attention_mask=self._downsample_attn_mask(batch, log_probs_constrained, valid_mask),
         )
 
@@ -873,7 +909,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         self,
         batch: Dict,
         log_probs: torch.Tensor,
-        valid_mask: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Downsample the batch attention mask to logit resolution and apply valid_mask.
 
@@ -884,11 +920,25 @@ class DysarthriaASRLightning(pl.LightningModule):
         attn_mask = batch.get('attention_mask')
         if attn_mask is None:
             return None
+        T_audio = attn_mask.size(1)
         T_log = log_probs.size(1)
-        stride = 320 * (2 if self.model.temporal_downsampler is not None else 1)
-        ds = attn_mask[:, ::stride].to(log_probs.device)
-        ds = ds[:, :T_log]
-        return ds[valid_mask]
+        if T_audio <= 0 or T_log <= 0:
+            return None
+
+        # Interpolation-style index mapping keeps mask length matched to logits
+        # even when audio/logit lengths are close at batch boundaries.
+        indices = torch.linspace(
+            0,
+            T_audio - 1,
+            T_log,
+            device=attn_mask.device,
+            dtype=torch.float32,
+        ).long().clamp(0, T_audio - 1)
+
+        ds = attn_mask.index_select(dim=1, index=indices).to(log_probs.device)
+        if valid_mask is not None:
+            return ds[valid_mask]
+        return ds
 
     def _compute_stratified_per(self) -> Tuple[float, float]:
         """
@@ -989,6 +1039,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             input_lengths,
             label_lengths,
             articulatory_labels=art_labels,
+            severity=_get_batch_severity(batch, log_probs_constrained.device)[valid_mask],
             attention_mask=self._downsample_attn_mask(batch, log_probs_constrained, valid_mask),
         )
 
@@ -1146,8 +1197,8 @@ def create_dataloaders(
     train_weights = [1.0 / speaker_counts[dataset.df.iloc[i]['speaker']] for i in train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     
-    # Create dataloaders with shared worker/prefetch settings for throughput.
-    common_loader_kwargs = dict(
+    # Create dataloaders with split-specific worker/prefetch settings.
+    base_loader_kwargs = dict(
         batch_size=config.training.batch_size,
         shuffle=False,
         collate_fn=collator,
@@ -1155,24 +1206,32 @@ def create_dataloaders(
         pin_memory=config.training.pin_memory,
         worker_init_fn=_seed_worker,
     )
+
+    train_loader_kwargs = dict(base_loader_kwargs)
+    val_loader_kwargs = dict(base_loader_kwargs)
+    test_loader_kwargs = dict(base_loader_kwargs)
     if config.training.num_workers > 0:
-        common_loader_kwargs["persistent_workers"] = True
-        common_loader_kwargs["prefetch_factor"] = config.training.prefetch_factor
+        train_loader_kwargs["persistent_workers"] = True
+        train_loader_kwargs["prefetch_factor"] = config.training.prefetch_factor
+        val_loader_kwargs["persistent_workers"] = False
+        val_loader_kwargs["prefetch_factor"] = 2
+        test_loader_kwargs["persistent_workers"] = False
+        test_loader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_dataset,
         sampler=sampler,
-        **common_loader_kwargs,
+        **train_loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        **common_loader_kwargs,
+        **val_loader_kwargs,
     )
 
     test_loader = DataLoader(
         test_dataset,
-        **common_loader_kwargs,
+        **test_loader_kwargs,
     )
     
     return train_loader, val_loader, test_loader
@@ -1500,7 +1559,7 @@ def create_loso_splits(
     train_weights = [1.0 / max(speaker_counts_loso.get(df.iloc[i]['speaker'], 1), 1) for i in train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
 
-    def _make_loader(idx, shuffle_sampler=None):
+    def _make_loader(idx, shuffle_sampler=None, is_train: bool = False):
         loader_kwargs = dict(
             batch_size=config.training.batch_size,
             shuffle=False,
@@ -1511,19 +1570,19 @@ def create_loso_splits(
             worker_init_fn=_seed_worker,
         )
         if config.training.num_workers > 0:
-            # Keep worker processes alive across epochs/folds to reduce startup
-            # overhead and improve I/O throughput for long LOSO runs.
-            loader_kwargs["persistent_workers"] = True
-            loader_kwargs["prefetch_factor"] = config.training.prefetch_factor
+            loader_kwargs["persistent_workers"] = bool(is_train)
+            loader_kwargs["prefetch_factor"] = (
+                config.training.prefetch_factor if is_train else 2
+            )
         return DataLoader(
             Subset(dataset, idx),
             **loader_kwargs,
         )
 
     return (
-        _make_loader(train_idx, shuffle_sampler=sampler),
-        _make_loader(val_idx),
-        _make_loader(test_idx),
+        _make_loader(train_idx, shuffle_sampler=sampler, is_train=True),
+        _make_loader(val_idx, is_train=False),
+        _make_loader(test_idx, is_train=False),
     )
 
 
@@ -1751,6 +1810,7 @@ def run_loso(
                 if marker_state is not None and marker_start_epoch < int(config.training.max_epochs):
                     lm.load_state_dict(marker_state, strict=False)
                     lm.resume_epoch_offset = marker_start_epoch
+                    lm._sync_unfreeze_flags_from_epoch(lm.resume_epoch_offset, apply_to_model=True)
                     trainer_max_epochs = max(1, int(config.training.max_epochs) - marker_start_epoch)
                     resumed_epoch = marker_start_epoch - 1
                     weights_only_resume = True
@@ -1837,6 +1897,7 @@ def run_loso(
                     start_epoch = resumed_epoch + 1
                     remaining_epochs = max(1, int(config.training.max_epochs) - start_epoch)
                     lm.resume_epoch_offset = start_epoch
+                    lm._sync_unfreeze_flags_from_epoch(lm.resume_epoch_offset, apply_to_model=True)
                     trainer_max_epochs = remaining_epochs
                     weights_only_resume = True
                     ckpt_path = None
@@ -1994,6 +2055,17 @@ def run_loso(
         if valid_mask.any() else float('nan')
     )
 
+    severity_weights = np.array([get_speaker_severity(spk) for spk in speakers], dtype=float)
+    dysarthric_mask = severity_weights > 0.0
+    dysarthric_avg_per = float(np.nanmean(per_arr[dysarthric_mask])) if np.any(dysarthric_mask) else float('nan')
+    control_avg_per = float(np.nanmean(per_arr[~dysarthric_mask])) if np.any(~dysarthric_mask) else float('nan')
+    sev_weight = 1.0 + (severity_weights / 5.0)
+    sev_valid = ~np.isnan(per_arr)
+    severity_weighted_per = (
+        float(np.nansum(per_arr[sev_valid] * sev_weight[sev_valid]) / np.nansum(sev_weight[sev_valid]))
+        if np.any(sev_valid) else float('nan')
+    )
+
     # WER aggregation (both simple mean and weighted)
     wer_arr = np.array([w for w in wer_per_fold if not np.isnan(w)])
     macro_wer = float(np.nanmean(wer_arr)) if len(wer_arr) > 0 else float('nan')
@@ -2007,6 +2079,8 @@ def run_loso(
     print(f"\n✅ LOSO Complete:")
     print(f"   Mean PER     = {macro_per:.4f}  [95% CI: {ci_lo:.4f} – {ci_hi:.4f}]")
     print(f"   Weighted PER = {weighted_per:.4f}  (weighted by fold sample count)")
+    print(f"   Dys PER      = {dysarthric_avg_per:.4f}  |  Ctrl PER = {control_avg_per:.4f}")
+    print(f"   Sev-weighted = {severity_weighted_per:.4f}")
     print(f"   Mean WER     = {macro_wer:.4f}  |  Weighted WER = {weighted_wer:.4f}")
 
     loso_summary = {
@@ -2021,6 +2095,10 @@ def run_loso(
         # Sample-weighted averages (I3 requirement)
         'weighted_avg_per': weighted_per,
         'weighted_avg_wer': weighted_wer,
+        # Severity-stratified LOSO summaries
+        'dysarthric_avg_per': dysarthric_avg_per,
+        'control_avg_per': control_avg_per,
+        'severity_weighted_per': severity_weighted_per,
     }
 
     # Save aggregated LOSO summary to results/{base_run_name}_loso_summary.json (I3)

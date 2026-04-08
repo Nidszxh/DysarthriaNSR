@@ -7,7 +7,7 @@ logging refactors. These tests intentionally avoid long training runs.
 
 Usage
 -----
-    python scripts/smoke_test.py [--tests 1,2,3,4,5,6,7]
+    python scripts/smoke_test.py [--tests 1,2,3,4,5,6,7,8,9]
 
 Current checks
 --------------
@@ -18,6 +18,8 @@ Current checks
 5. Explainability formatter output contract
 6. LOSO ordering/resume safeguards are present in source
 7. Compact fold progress callback emits one-line epoch summary
+8. evaluate_model unit-path returns valid metrics + artifacts
+9. CLI pipeline smoke (train-only)
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import contextlib
 import inspect
 import io
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -63,12 +66,18 @@ def test1_config_and_severity_map() -> None:
     """Config load round-trip and TORGO severity range sanity."""
     import yaml  # noqa: PLC0415
 
+    from src.utils import constants as constants_mod  # noqa: PLC0415
     from src.utils.config import Config, TORGO_SEVERITY_MAP  # noqa: PLC0415
-
-    from src.utils.config import TORGO_SEVERITY_MAP  # noqa: PLC0415
 
     invalid = {k: v for k, v in TORGO_SEVERITY_MAP.items() if not (0.0 <= v <= 5.0)}
     assert not invalid, f"Invalid severity values: {invalid}"
+
+    # P5-A guard: tuple and dict constants must stay in sync.
+    for phn, (manner, place, voice) in constants_mod.PHONEME_DETAILS.items():
+        feat = constants_mod.PHONEME_FEATURES.get(phn, {})
+        assert feat.get("manner") == manner, f"manner mismatch for {phn}"
+        assert feat.get("place") == place, f"place mismatch for {phn}"
+        assert feat.get("voice") == voice, f"voice mismatch for {phn}"
 
     minimal_yaml = {
         "experiment": {"run_name": "smoke_yaml_test"},
@@ -236,7 +245,86 @@ def test7_compact_progress_callback_output() -> None:
     )
 
 
-def test8_pipeline_cli_smoke() -> None:
+def test8_evaluate_per_computation() -> None:
+    """evaluate_model with a dummy dataloader returns valid metrics and writes JSON."""
+    import torch  # noqa: PLC0415
+    import torch.nn as nn  # noqa: PLC0415
+    import torch.nn.functional as F  # noqa: PLC0415
+
+    from evaluate import evaluate_model  # noqa: PLC0415
+
+    class _DummyEvalModel(nn.Module):
+        def __init__(self, num_classes: int, time_steps: int = 3):
+            super().__init__()
+            self.time_steps = time_steps
+            self.num_classes = num_classes
+
+        def forward(
+            self,
+            input_values,
+            attention_mask=None,
+            speaker_severity=None,
+            output_attentions=False,
+            ablation_mode="full",
+        ):
+            batch_size = input_values.size(0)
+            device = input_values.device
+
+            logits_neural = torch.full(
+                (batch_size, self.time_steps, self.num_classes),
+                -6.0,
+                dtype=torch.float32,
+                device=device,
+            )
+            for b in range(batch_size):
+                for t in range(self.time_steps):
+                    token_id = 3 if (b + t) % 2 == 0 else 4
+                    logits_neural[b, t, token_id] = 6.0
+
+            log_probs = F.log_softmax(logits_neural, dim=-1)
+            return {
+                "logits_constrained": log_probs,
+                "logits_neural": logits_neural,
+                "output_lengths": torch.full((batch_size,), self.time_steps, dtype=torch.long, device=device),
+                "beta": torch.tensor(0.1, device=device),
+                "logits_manner": None,
+                "logits_place": None,
+                "logits_voice": None,
+            }
+
+    phn_to_id = {"<BLANK>": 0, "<PAD>": 1, "<UNK>": 2, "P": 3, "B": 4}
+    id_to_phn = {v: k for k, v in phn_to_id.items()}
+    model = _DummyEvalModel(num_classes=len(phn_to_id), time_steps=3)
+
+    batch = {
+        "input_values": torch.randn(2, 1920),
+        "attention_mask": torch.ones(2, 1920, dtype=torch.long),
+        "labels": torch.tensor([[3, 4, 3, -100], [4, 3, -100, -100]], dtype=torch.long),
+        "status": torch.tensor([1, 0], dtype=torch.long),
+        "speakers": ["M01", "MC01"],
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        results = evaluate_model(
+            model=model,
+            dataloader=[batch],
+            device="cpu",
+            phn_to_id=phn_to_id,
+            id_to_phn=id_to_phn,
+            results_dir=out_dir,
+            use_beam_search=False,
+            generate_explanations=False,
+            compute_uncertainty=False,
+            ablation_mode="neural_only",
+        )
+
+        assert 0.0 <= float(results.get("avg_per", -1.0)) <= 1.0
+        assert int(results.get("overall", {}).get("n_samples", 0)) > 0
+        assert (out_dir / "evaluation_results.json").exists()
+
+
+def test9_pipeline_cli_smoke() -> None:
     """Run a tiny end-to-end CLI smoke stage (train-only)."""
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_name = f"smoke_cli_{int(time.time())}"
@@ -279,10 +367,11 @@ UNIT_TESTS: List[tuple] = [
     (5, "ExplainableOutputFormatter output structure",        test5_explainability_formatter_structure),
     (6, "LOSO ordering/resume source guards",                test6_loso_source_guards_present),
     (7, "Compact fold progress callback output",             test7_compact_progress_callback_output),
+    (8, "evaluate_model dummy metrics + artifact",           test8_evaluate_per_computation),
 ]
 
 PIPELINE_TESTS: List[tuple] = [
-    (8, "CLI pipeline smoke (train-only, --smoke)",          test8_pipeline_cli_smoke),
+    (9, "CLI pipeline smoke (train-only, --smoke)",          test9_pipeline_cli_smoke),
 ]
 
 

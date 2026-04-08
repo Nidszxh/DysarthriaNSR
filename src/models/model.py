@@ -41,11 +41,13 @@ logger = logging.getLogger(__name__)
 
 try:
     from src.utils.config import ModelConfig, SymbolicConfig, normalize_phoneme
+    from src.utils.constants import PHONEME_FEATURES as SHARED_PHONEME_FEATURES
 except ImportError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from utils.config import ModelConfig, SymbolicConfig, normalize_phoneme
+    from utils.constants import PHONEME_FEATURES as SHARED_PHONEME_FEATURES
 
 try:
     from src.explainability.rule_tracker import SymbolicRuleTracker
@@ -65,56 +67,7 @@ class ArticulatoryFeatureEncoder:
     - Voicing:                Vocal fold vibration (voiced vs voiceless)
     """
 
-    PHONEME_FEATURES = {
-        # STOPS
-        'P':  {'manner': 'stop', 'place': 'bilabial',      'voice': 'voiceless'},
-        'B':  {'manner': 'stop', 'place': 'bilabial',      'voice': 'voiced'},
-        'T':  {'manner': 'stop', 'place': 'alveolar',      'voice': 'voiceless'},
-        'D':  {'manner': 'stop', 'place': 'alveolar',      'voice': 'voiced'},
-        'K':  {'manner': 'stop', 'place': 'velar',         'voice': 'voiceless'},
-        'G':  {'manner': 'stop', 'place': 'velar',         'voice': 'voiced'},
-        # FRICATIVES
-        'F':  {'manner': 'fricative', 'place': 'labiodental',  'voice': 'voiceless'},
-        'V':  {'manner': 'fricative', 'place': 'labiodental',  'voice': 'voiced'},
-        'TH': {'manner': 'fricative', 'place': 'dental',       'voice': 'voiceless'},
-        'DH': {'manner': 'fricative', 'place': 'dental',       'voice': 'voiced'},
-        'S':  {'manner': 'fricative', 'place': 'alveolar',     'voice': 'voiceless'},
-        'Z':  {'manner': 'fricative', 'place': 'alveolar',     'voice': 'voiced'},
-        'SH': {'manner': 'fricative', 'place': 'postalveolar', 'voice': 'voiceless'},
-        'ZH': {'manner': 'fricative', 'place': 'postalveolar', 'voice': 'voiced'},
-        'HH': {'manner': 'fricative', 'place': 'glottal',      'voice': 'voiceless'},
-        # AFFRICATES
-        'CH': {'manner': 'affricate', 'place': 'postalveolar', 'voice': 'voiceless'},
-        'JH': {'manner': 'affricate', 'place': 'postalveolar', 'voice': 'voiced'},
-        # NASALS
-        'M':  {'manner': 'nasal', 'place': 'bilabial', 'voice': 'voiced'},
-        'N':  {'manner': 'nasal', 'place': 'alveolar', 'voice': 'voiced'},
-        'NG': {'manner': 'nasal', 'place': 'velar',    'voice': 'voiced'},
-        # LIQUIDS
-        'L':  {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
-        'R':  {'manner': 'liquid', 'place': 'alveolar', 'voice': 'voiced'},
-        # GLIDES
-        'W':  {'manner': 'glide', 'place': 'labio-velar', 'voice': 'voiced'},
-        'Y':  {'manner': 'glide', 'place': 'palatal',     'voice': 'voiced'},
-        # VOWELS
-        'IY': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'high'},
-        'IH': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'high'},
-        'EH': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'mid'},
-        'EY': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'mid'},
-        'AE': {'manner': 'vowel', 'place': 'front',   'voice': 'voiced', 'height': 'low'},
-        'AA': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'low'},
-        'AO': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'mid'},
-        'OW': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'mid'},
-        'UH': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'high'},
-        'UW': {'manner': 'vowel', 'place': 'back',    'voice': 'voiced', 'height': 'high'},
-        'AH': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
-        'ER': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
-        'AX': {'manner': 'vowel', 'place': 'central', 'voice': 'voiced', 'height': 'mid'},
-        # DIPHTHONGS
-        'AY': {'manner': 'diphthong', 'place': 'front', 'voice': 'voiced'},
-        'AW': {'manner': 'diphthong', 'place': 'back',  'voice': 'voiced'},
-        'OY': {'manner': 'diphthong', 'place': 'back',  'voice': 'voiced'},
-    }
+    PHONEME_FEATURES = SHARED_PHONEME_FEATURES
 
     @classmethod
     def compute_distance(
@@ -716,6 +669,10 @@ class NeuroSymbolicASR(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.symbolic_config = symbolic_config
+        if len(phn_to_id) <= 3:
+            raise ValueError(
+                "Vocabulary must contain at least <BLANK>, <PAD>, <UNK> and one phoneme token"
+            )
         model_config.num_phonemes = len(phn_to_id)
 
         # ── HuBERT Encoder ────────────────────────────────────────────────────
@@ -926,7 +883,7 @@ class NeuroSymbolicASR(nn.Module):
         # adapter's severity signal for masked frames, corrupting its training.
         # B3 fix: moved from after SeverityAdapter to before it.
         # Skipped when ablation_mode == 'no_spec_augment' to isolate its contribution.
-        if self.spec_augment is not None and ablation_mode != "no_spec_augment":
+        if self.spec_augment is not None and ablation_mode != "no_spec_augment" and not self._hubert_is_frozen:
             hidden_states = self.spec_augment(hidden_states)
 
         # ── Severity Adapter (Proposal P3) ────────────────────────────────────

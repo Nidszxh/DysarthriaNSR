@@ -38,7 +38,7 @@ class TestConfigDefaults:
 
     def test_default_num_phonemes_includes_special_tokens(self):
         cfg = Config()
-        assert cfg.model.num_phonemes == 47
+        assert cfg.model.num_phonemes is None
 
     def test_symbolic_min_confidence(self):
         """C5 fix: min_rule_confidence should be 0.05 (lowered from 0.1)."""

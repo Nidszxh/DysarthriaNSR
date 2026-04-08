@@ -92,6 +92,7 @@ class UncertaintyAwareDecoder:
 
         # Stack: [N, B, T, V]
         lp_stack = torch.stack(log_probs_samples, dim=0).to(device)
+        del log_probs_samples
         mean_lp = lp_stack.mean(dim=0)  # [B, T, V]
 
         # Predictive entropy: H(y|x) = -Σ p̄_v log p̄_v

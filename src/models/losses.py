@@ -130,11 +130,14 @@ class BlankPriorKLLoss(nn.Module):
         self,
         log_probs: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        severity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             log_probs:      Log-probabilities [B, T, V] (output of log_softmax)
             attention_mask: Valid-frame mask [B, T] (1 = valid, 0 = padding)
+            severity:       Optional per-sample severity [B] used to adapt the
+                            blank target between control (0.80) and severe (0.70).
 
         Returns:
             Scalar KL loss ≥ 0.
@@ -152,7 +155,12 @@ class BlankPriorKLLoss(nn.Module):
         # Clamp to numerical stability
         eps = 1e-7
         p = p_blank_mean.clamp(eps, 1.0 - eps)
-        q = self.target_prob.clamp(eps, 1.0 - eps)
+        if severity is not None:
+            # Control (severity=0) -> 0.80, severe (severity=5) -> 0.70.
+            sev_norm = severity.float().mean().clamp(0.0, 5.0) / 5.0
+            q = (0.80 - 0.10 * sev_norm).clamp(eps, 1.0 - eps)
+        else:
+            q = self.target_prob.clamp(eps, 1.0 - eps)
 
         # KL(Bernoulli(p) || Bernoulli(q))
         kl = p * (p / q).log() + (1.0 - p) * ((1.0 - p) / (1.0 - q)).log()
