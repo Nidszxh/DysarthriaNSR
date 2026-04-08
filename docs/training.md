@@ -123,7 +123,7 @@ python run_pipeline.py --run-name experiment_v1 --skip-train
 # Smoke test: max_epochs=1, limit_train_batches=5 (fast CI check)
 python run_pipeline.py --run-name smoke --smoke
 
-# Smoke test: unit profile (7 automated checks)
+# Smoke test: unit profile (8 automated checks)
 python scripts/smoke_test.py --profile unit
 
 # Smoke test: pipeline CLI (trains 1 epoch, verifies end-to-end)

@@ -3,7 +3,7 @@
 ## Project Overview
 DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. It combines HuBERT (self-supervised) neural representations with articulatory-based symbolic constraints for explainable phoneme-level recognition on the TORGO dataset.
 
-**Status**: B1–B23 fixed. LOSO-CV completed (`loso_v1`, 15/15 folds). Smoke tests updated and passing (`unit` profile: 7/7).
+**Status**: B1–B23 fixed. LOSO-CV completed (`loso_v1`, 15/15 folds). Smoke tests updated and passing (`unit` profile: 8/8).
 **Latest aggregate (LOSO)**: macro PER **0.2848** (95% CI: [0.1921, 0.3801]), weighted PER **0.2299**, macro WER **0.3362**, weighted WER **0.2631**.
 **Latest single-split references**: `baseline_v6` (full) avg_per 0.1372; `ablation_neural_only_v7` avg_per 0.1346. Symbolic effect is mixed (helps vs internal constrained/neural path in v6 but neural-only remains strongest overall).
 **Previous baseline**: baseline_v4 (March 5, 2026) — beam-search PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×)
@@ -42,7 +42,7 @@ run_pipeline.py                         ← CANONICAL ENTRY POINT
 results/{run_name}/evaluation_results.json + plots + explanations.json
 
 scripts/generate_figures.py             ← publication-quality figure suite (6 plots)
-scripts/smoke_test.py                   ← smoke profiles: unit (7 checks) + pipeline CLI smoke
+scripts/smoke_test.py                   ← smoke profiles: unit (8 checks) + pipeline CLI smoke
 ```
 
 ---
@@ -533,7 +533,7 @@ for layer_idx in freeze_encoder_layers:
 - ✅ Uncertainty estimation: MC-Dropout via `UncertaintyAwareDecoder` (with `--uncertainty`)
 - ✅ Orchestrator: `run_pipeline.py` — single entry point for train + evaluate
 - ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
-- ✅ Automated tests: `scripts/smoke_test.py --profile unit` — 7/7 passing
+- ✅ Automated tests: `scripts/smoke_test.py --profile unit` — 8/8 passing
 - ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
 - ✅ **LOSO model set (`loso_v1`)**: 15/15 folds complete; macro PER 0.2848 (95% CI [0.1921, 0.3801]); weighted PER 0.2299; macro WER 0.3362.
 - ✅ **Post-fix baselines**: `baseline_v6` avg_per 0.1372, `ablation_neural_only_v7` avg_per 0.1346, `ablation_no_constraint_matrix_v6` avg_per 0.1444.

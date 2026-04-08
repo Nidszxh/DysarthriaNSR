@@ -136,12 +136,12 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 | ID | Component | Issue | Status |
 |----|-----------|-------|--------|
-| §5.4 | `manifest.py`, `model.py` | `PHONEME_DETAILS` and `PHONEME_FEATURES` defined independently (manual sync risk) | ❌ Pending: move to `src/utils/constants.py` |
+| §5.4 | `manifest.py`, `model.py` | `PHONEME_DETAILS` and `PHONEME_FEATURES` defined independently (manual sync risk) | ✅ Fixed: centralized in `src/utils/constants.py` |
 | §5.5 | `config.py` | `ModelConfig.num_phonemes` now aligned with runtime vocab convention | ✅ Fixed |
 | §5.6 | `dataloader.py` | `create_single_dataloader` now mirrors speaker-level weighting policy | ✅ Fixed |
 | §8.2 | `rule_tracker.py` | `rule_precision()` not wired into `evaluate_model` output | ⚠️ Proxy added |
 | §3.10 | `train.py` | OneCycleLR not reset after progressive unfreezing; momentum reset applied as workaround | ⚠️ Partial fix via `_reset_hubert_lr_warmup()` |
-| §9.3 | `tests/` | No integration test for `training_step` or `evaluate_model` end-to-end | ❌ Post-paper |
+| §9.3 | `tests/` | Limited integration coverage for resume/orchestration edge paths | ⚠️ Partial: `tests/test_training_step.py`, `tests/test_evaluate_model.py`, and smoke eval test added; LOSO resume path still untested |
 
 ---
 
@@ -158,7 +158,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 1. **CTC forced alignment** via `torchaudio.functional.forced_align` — fixes T-05 at root level; enables phoneme-boundary-accurate confusion matrices
 2. **Per-group `CosineAnnealingWarmRestarts`** scheduler — full fix for T-04 OneCycleLR/progressive-unfreeze interaction
-3. **Canonicalize phoneme features** `PHONEME_DETAILS` / `PHONEME_FEATURES` into `src/utils/constants.py`
+3. **LOSO resume integration test** for `weights_only_resume` and scheduler-exhausted branches
 4. **Integration tests** for `training_step` + `evaluate_model` (M-2/M-3 from audit)
 
 ### Long-Term Research (Journal Extension)

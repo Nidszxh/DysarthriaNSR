@@ -165,15 +165,15 @@ Before committing any code change:
 
 The following non-blocking issues are known from the March 2026 research audit. They do not affect training or evaluation correctness but require awareness when modifying the codebase.
 
-### `PHONEME_DETAILS` / `PHONEME_FEATURES` Duplication (N5)
+### Articulatory Constants Source of Truth
 
-`PHONEME_DETAILS` in `src/data/manifest.py` and `PHONEME_FEATURES` in `src/models/model.py` define articulatory class mappings independently. They are currently synchronized (B23 fix applied to both), but any future correction to one must be mirrored manually in the other.
+`PHONEME_DETAILS` and `PHONEME_FEATURES` are now centralized in `src/utils/constants.py` and imported by both `src/data/manifest.py` and `src/models/model.py`.
 
-**If you modify articulatory labels:** Update **both** files simultaneously. The long-term fix is to move both to `src/utils/constants.py` and import from there (planned post-submission). The consolidation was deferred to avoid mid-LOSO manifest regeneration.
+**If you modify articulatory labels:** Update `src/utils/constants.py` only. Keep `scripts/smoke_test.py` Test 1 passing, which asserts tuple/dict constant consistency.
 
-### `ModelConfig.num_phonemes=47` Misleading Comment
+### `ModelConfig.num_phonemes` Runtime Assignment
 
-`ModelConfig.num_phonemes = 47` is the correct runtime value. At runtime, `NeuroSymbolicASR.__init__()` overwrites this with `len(phn_to_id)` from the manifest vocabulary. The config default is informational only.
+`ModelConfig.num_phonemes` defaults to `None`. At runtime, `NeuroSymbolicASR.__init__()` sets it to `len(phn_to_id)` from the manifest vocabulary (typically 47 on TORGO).
 
 **If you encounter this:** Trust `len(dataset.phn_to_id)` as the authoritative vocabulary size, not `model_config.num_phonemes`.
 

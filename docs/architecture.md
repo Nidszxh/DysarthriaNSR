@@ -135,7 +135,7 @@ graph LR
 |---|---|---|
 | `hidden_dim` | `512` | Projection bottleneck width |
 | `classifier_dropout` | `0.1` | Dropout between layers |
-| `num_phonemes` | `47` (runtime: `len(phn_to_id)`) | Set to exact vocab size at init |
+| `num_phonemes` | `None` (runtime: `len(phn_to_id)`, typically 47 on TORGO) | Set to exact vocab size at init |
 
 **Architecture:** `Linear(768, 512)` → `LayerNorm` → `GELU` → `Dropout` → `Linear(512, 47)`.
 
@@ -270,7 +270,7 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `use_gradient_checkpointing` | `True` | Reduces VRAM ~15–25% |
 | `freeze_encoder_layers` | `[0, 1, 2, 3]` | Permanently frozen transformer layers |
 | `hidden_dim` | `512` | PhonemeClassifier hidden size |
-| `num_phonemes` | `47` (runtime) | Set to `len(phn_to_id)` at init; config default is informational only |
+| `num_phonemes` | `None` (runtime set at init) | Set to `len(phn_to_id)` at init; TORGO runs typically resolve to 47 |
 | `classifier_dropout` | `0.1` | Dropout in classifier and adapter |
 | `constraint_weight_init` | `0.05` | Initial β_base for symbolic blending |
 | `constraint_learnable` | `True` | Enable learnable β parameter |

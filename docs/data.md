@@ -81,7 +81,7 @@ data/raw/audio/
 
 ## Manifest Generation (`src/data/manifest.py`)
 
-`SymbolicProcessor` in `src/data/manifest.py` performs: (1) G2P transcription via `g2p_en.G2p()` (NLTK-backed), (2) stress stripping via `rstrip('012')`, (3) articulatory class annotation from `PHONEME_DETAILS`, (4) audio metric extraction (duration, RMS energy via `librosa`), and (5) quality filtering.
+`SymbolicProcessor` in `src/data/manifest.py` performs: (1) G2P transcription via `g2p_en.G2p()` (NLTK-backed), (2) stress stripping via `rstrip('012')`, (3) articulatory class annotation from shared constants in `src/utils/constants.py`, (4) audio metric extraction (duration, RMS energy via `librosa`), and (5) quality filtering.
 
 **B12 fix (speaker extraction):** TORGO HuggingFace filenames follow `unknown_{hash}_{SPEAKER}_{session}_{mic}_{n}.wav`. The speaker ID is at position `[2]` after `split('_')`, not `[0]` (which returns `'unknown'`). Fix: `speaker_id = meta.get("speaker_id", path.name.split('_')[2])`. The manifest was **regenerated on March 4, 2026** with correct TORGO IDs.
 
@@ -98,7 +98,7 @@ data/raw/audio/
 
 **Expected output:** approximately 16,531 rows, ~20 hours total audio.
 
-**B23 articulatory label corrections** (applied to both `PHONEME_DETAILS` in `manifest.py` and `PHONEME_FEATURES` in `model.py`):
+**B23 articulatory label corrections** (now centralized in `src/utils/constants.py` and imported by both `manifest.py` and `model.py`):
 
 | Phoneme(s) | Before | After | Reason |
 |---|---|---|---|
@@ -197,11 +197,11 @@ voiced, voiceless, vowel
 
 ### Feature Cache
 
-Processed `input_values` tensors are cached to an LRU disk cache (`data/processed/feature_cache/{namespace}/{sha1}.pt`) and an in-process LRU memory cache (default 2048 entries, LRU eviction via `OrderedDict`). The cache namespace is a 12-character SHA-1 hash of: `processor_id + sampling_rate + max_audio_samples + manifest_name`. This ensures cache invalidation when any of these parameters change. Corrupt cache files are treated as misses and silently overwritten. Cache writes use atomic `.tmp` rename to prevent partial writes.
+Processed `input_values` tensors are cached to an LRU disk cache (`data/processed/feature_cache/{namespace}/{sha1}.pt`) and an in-process LRU memory cache (default 2048 entries, LRU eviction via `OrderedDict`). The cache namespace is a 12-character SHA-1 hash of: `processor_id + sampling_rate + max_audio_samples + manifest_name`. This ensures cache invalidation when any of these parameters change. Corrupt cache files are treated as misses and silently overwritten. Cache writes use atomic `.tmp` rename with a unique suffix (`pid.worker_id.thread_id`) to prevent multi-worker collisions.
 
-### `_build_sequence_cache()` — Precomputed Label Sequences
+### `_build_sequence_cache()` + Tensor Materialization
 
-All label and articulatory class sequences are precomputed once at dataset initialization and stored in `self._sequence_cache`. This avoids repeated per-batch string splitting and vocabulary lookup. If a phoneme count mismatches its articulatory class count, both are truncated to the minimum length with a warning.
+All label and articulatory class sequences are precomputed once at dataset initialization and then materialized into preallocated tensors (`_labels_tensor`, `_manner_tensor`, `_place_tensor`, `_voice_tensor`) with per-sample lengths tracked in `_seq_lengths`. This avoids repeated per-batch string splitting and reduces Python object overhead from per-sample tensor allocations. If a phoneme count mismatches its articulatory class count, both are truncated to the minimum length with a warning.
 
 ### Label Padding Sentinel
 

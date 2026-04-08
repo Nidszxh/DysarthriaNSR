@@ -77,13 +77,13 @@ Welch t-test (`scipy.stats.ttest_ind(equal_var=False)`) and Wilcoxon rank-sum (`
 
 CLI: `--beam-search --beam-width INT`. Class: `BeamSearchDecoder` in `evaluate.py`.
 
-**Beam state:** `{prefix: (p_blank, p_non_blank, lm_cumulative_score)}` where `p_blank` and `p_non_blank` are pure acoustic log-probabilities kept separate to enable correct CTC prefix merging semantics.
+**Beam state:** `{prefix: (p_blank, p_non_blank, lm_for_blank, lm_for_non_blank)}` where `p_blank` and `p_non_blank` are pure acoustic log-probabilities and LM accumulators are tracked per acoustic branch. This keeps LM scores path-consistent when multiple paths merge to the same prefix.
 
 **PAD/UNK exclusion:** PAD and UNK are excluded from `emit_ids`. This prevents their probability mass from inflating blank transitions. Frame log-probs are renormalized over `allowed_ids = [blank_id] + emit_ids` only.
 
 **Repeated-token path:** When the new token equals `prefix[-1]`, both `p_blank` and `p_non_blank` predecessors are included via `new_p_nb = logaddexp(p_b, p_nb) + c_lp`. Omitting `p_non_blank` underestimates long same-token runs.
 
-**Length normalization (B19 fix):** `score = acoustic / len(prefix)^α + lm_weight * lm_cumulative_score`. The LM bonus is added **after** length normalization — not divided by it. The original bug divided both acoustic and LM scores by `len^α`, unfairly penalizing longer hypotheses. Default α=0.6.
+**Length normalization (B19 fix):** `score = acoustic / len(prefix)^α + lm_weight * lm_score`. The LM bonus is added **after** length normalization — not divided by it. The original bug divided both acoustic and LM scores by `len^α`, unfairly penalizing longer hypotheses. Default α=0.6.
 
 ---
 
@@ -99,6 +99,8 @@ log_prob(prev_id, next_id) = log(
 ```
 
 The LM is built automatically from training phoneme sequences when `--lm-weight > 0.0`. Default `lm_weight=0.0` disables LM fusion.
+
+`BigramLMScorer.fit()` precomputes a full `[V, V]` log-probability matrix once, so beam search uses O(1) array indexing per LM query instead of repeated dictionary lookups in the inner decode loop.
 
 ---
 
@@ -129,7 +131,7 @@ Rates reported as `helpful_rate`, `neutral_rate`, `harmful_rate` in `evaluation_
 - `'delete'`: pred_ph present in prediction but not in reference; increments insertion count for pred_ph
 - `'insert'`: ref_ph present in reference but not in prediction; increments deletion count for ref_ph
 
-**H-2 optimization:** `_all_alignments` is precomputed once for all (prediction, reference) pairs in `evaluate_model()`, then shared across four analysis functions: `analyze_phoneme_errors()`, `compute_per_phoneme_breakdown()`, `compute_articulatory_stratified_per()`, and `compute_rule_pair_confusion()`.
+**H-2 optimization:** `_all_alignments` is precomputed once and shared across analysis functions only when deep diagnostics are requested (`--explain` or symbolic rule-pair confusion). Otherwise, alignment is computed on-demand inside each metric function to reduce peak memory.
 
 ---
 

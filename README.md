@@ -14,7 +14,7 @@ This repository builds and evaluates a clinically interpretable neuro-symbolic a
 
 Dysarthria is a motor speech disorder — caused by conditions such as cerebral palsy and ALS — that produces severely reduced intelligibility due to impaired articulatory control. Commercial ASR systems fail for dysarthric speakers because they treat atypical phoneme realizations as noise. DysarthriaNSR addresses this by combining a pretrained HuBERT encoder (`facebook/hubert-base-ls960`) with three jointly-trained neuro-symbolic components.
 
-The **`LearnableConstraintMatrix`** (Proposal P2) is a 47×47 differentiable phoneme confusion matrix initialized from articulatory priors — for example, the devoicing tendency B→P or the liquid gliding tendency R→W — and trained end-to-end while a symbolic KL anchor (λ=0.5) prevents arbitrary drift. The **`SeverityAdapter`** (Proposal P3) injects a continuous severity score [0, 5] into HuBERT hidden states via cross-attention, allowing a single model to condition behavior across the full spectrum from control speakers (severity=0.0) to severely dysarthric speakers (severity=4.9). The **`SymbolicConstraintLayer`** fuses neural posteriors with the learned constraint using a severity-adaptive blend weight β = clamp(β_base + 0.2·severity/5, 0.0, 0.8), bypassing the constraint entirely for blank-dominant CTC frames (P_neural\[blank\] ≥ 0.5) to avoid amplifying blank posteriors across ~85% of frames. Training uses six simultaneous loss terms including blank-prior KL regularization to suppress CTC insertion bias. The result is a system providing clinically interpretable phoneme-level error analysis alongside recognition output.
+The **`LearnableConstraintMatrix`** (Proposal P2) is a |V|×|V| differentiable phoneme confusion matrix (47×47 on the current TORGO vocabulary) initialized from articulatory priors — for example, the devoicing tendency B→P or the liquid gliding tendency R→W — and trained end-to-end while a symbolic KL anchor (λ=0.5) prevents arbitrary drift. The **`SeverityAdapter`** (Proposal P3) injects a continuous severity score [0, 5] into HuBERT hidden states via cross-attention, allowing a single model to condition behavior across the full spectrum from control speakers (severity=0.0) to severely dysarthric speakers (severity=4.9). The **`SymbolicConstraintLayer`** fuses neural posteriors with the learned constraint using a severity-adaptive blend weight β = clamp(β_base + 0.2·severity/5, 0.0, 0.8), bypassing the constraint entirely for blank-dominant CTC frames (P_neural\[blank\] ≥ 0.5) to avoid amplifying blank posteriors across ~85% of frames. Training uses six simultaneous loss terms including blank-prior KL regularization to suppress CTC insertion bias. The result is a system providing clinically interpretable phoneme-level error analysis alongside recognition output.
 
 ## Final system figure
 
@@ -93,7 +93,7 @@ python run_pipeline.py --run-name loso_v1 --loso
 # Resume LOSO from last completed fold (crash-safe)
 python run_pipeline.py --run-name loso_v1 --loso --resume-loso
 
-# Smoke test: unit profile (7 checks, fast)
+# Smoke test: unit profile (8 checks, fast)
 python scripts/smoke_test.py --profile unit
 ```
 
@@ -118,10 +118,11 @@ DysarthriaNSR/
 │   │   └── download.py      # Audio download from HuggingFace
 │   ├── utils/
 │   │   ├── config.py        # All hyperparameters — single source of truth
+│   │   ├── constants.py     # Shared phoneme articulatory constants
 │   │   └── sequence_utils.py # align_labels_to_logits()
 │   └── explainability/      # PhonemeAttributor, SymbolicRuleTracker, formatters
 ├── scripts/
-│   ├── smoke_test.py        # Profiles: unit (7 checks), pipeline (CLI integration)
+│   ├── smoke_test.py        # Profiles: unit (8 checks), pipeline (CLI integration)
 │   └── generate_figures.py  # Publication-quality figure CLI
 ├── docs/                    # User-facing documentation
 ├── data/raw/audio/          # Downloaded TORGO .wav files (gitignored)
