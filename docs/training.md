@@ -271,6 +271,11 @@ The current epoch's value is stored as `self._current_lambda_blank_kl` on the Li
 
 Samples where `label_lengths > input_lengths` are dropped before loss computation. CTC loss would return `inf` for these samples, producing NaN gradients that crash training. The fraction of dropped samples is logged as `train/ctc_invalid_frac`. `input_lengths` used here are the exact `outputs['output_lengths']` from the model's live forward pass — not the approximate `batch['input_lengths']` from the collator (B4 fix).
 
+### Runtime Notes (Frozen Warmup + Loader Workers)
+
+- **Frozen-warmup SpecAugment:** SpecAugment is skipped while HuBERT is fully frozen during early warmup. This avoids paying augmentation overhead when encoder parameters are not being updated.
+- **Split-specific loader policy:** Train loader keeps `persistent_workers=True` with configured `prefetch_factor` for throughput, while val/test loaders use `persistent_workers=False` and `prefetch_factor=2` to reduce memory residency across epochs/folds.
+
 ---
 
 ## LOSO Operational Guide
@@ -310,6 +315,21 @@ torch.cuda.empty_cache()
 ```
 
 This explicit cleanup after each fold prevents VRAM fragmentation accumulation on the 8 GB RTX 4060.
+
+### LOSO Summary Metrics (`results/{run_name}_loso_summary.json`)
+
+`run_loso()` writes both macro and severity-aware aggregate fields:
+
+| Field | Meaning |
+|---|---|
+| `macro_avg_per` | Unweighted mean PER across folds |
+| `weighted_avg_per` | PER weighted by `n_samples_per_fold` |
+| `dysarthric_avg_per` | Mean PER over held-out dysarthric speakers |
+| `control_avg_per` | Mean PER over held-out control speakers |
+| `severity_weighted_per` | PER weighted by `1 + severity/5` for each held-out speaker |
+| `macro_avg_wer` | Unweighted mean WER across folds |
+| `weighted_avg_wer` | WER weighted by `n_samples_per_fold` |
+| `per_95ci` | Bootstrap 95% CI over fold-level PER means |
 
 ### Per-Fold Timing on RTX 4060
 

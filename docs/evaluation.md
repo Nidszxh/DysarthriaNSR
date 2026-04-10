@@ -30,6 +30,21 @@
 
 **Methodology:** Non-parametric bootstrap (n=1000 resamples) with replacement over macro-speaker PER scores. The 2.5th and 97.5th percentiles give 95% CI bounds. Implemented in `compute_per_with_ci()`. With n=15 (LOSO), bootstrap CI over fold PER values is statistically appropriate. With n=3 test speakers (single split), CI covers nearly the full range [0, 1] and is meaningless.
 
+### LOSO Summary Fields (from `run_loso()`)
+
+When running LOSO via `run_pipeline.py --loso`, aggregate metrics are written to `results/{run_name}_loso_summary.json`:
+
+| Field | Meaning |
+|---|---|
+| `macro_avg_per` | Unweighted mean PER across folds |
+| `weighted_avg_per` | PER weighted by fold sample count |
+| `dysarthric_avg_per` | Mean PER for dysarthric held-out speakers |
+| `control_avg_per` | Mean PER for control held-out speakers |
+| `severity_weighted_per` | PER weighted by `1 + severity/5` per held-out speaker |
+| `macro_avg_wer` | Unweighted mean WER across folds |
+| `weighted_avg_wer` | WER weighted by fold sample count |
+| `per_95ci` | Bootstrap 95% CI over fold-level PER |
+
 ---
 
 ### Paired Bootstrap Delta (Neural vs. Constrained)
@@ -78,6 +93,8 @@ Welch t-test (`scipy.stats.ttest_ind(equal_var=False)`) and Wilcoxon rank-sum (`
 CLI: `--beam-search --beam-width INT`. Class: `BeamSearchDecoder` in `evaluate.py`.
 
 **Beam state:** `{prefix: (p_blank, p_non_blank, lm_for_blank, lm_for_non_blank)}` where `p_blank` and `p_non_blank` are pure acoustic log-probabilities and LM accumulators are tracked per acoustic branch. This keeps LM scores path-consistent when multiple paths merge to the same prefix.
+
+**Eval robustness note:** `evaluate_model()` explicitly moves `symbolic_kl_loss` to the active device after `model.to(device)` so eval-only CPU/GPU paths do not hit buffer device mismatches.
 
 **PAD/UNK exclusion:** PAD and UNK are excluded from `emit_ids`. This prevents their probability mass from inflating blank transitions. Frame log-probs are renormalized over `allowed_ids = [blank_id] + emit_ids` only.
 
