@@ -195,12 +195,15 @@ class SymbolicKLLoss(nn.Module):
 
     Args:
         static_matrix: Static symbolic prior [V, V], row-normalised.
+        blank_penalty_weight: Optional weight for mean blank-column mass
+            penalty C_learned[:, 0].mean().
     """
 
-    def __init__(self, static_matrix: torch.Tensor):
+    def __init__(self, static_matrix: torch.Tensor, blank_penalty_weight: float = 0.0):
         super().__init__()
         # Store as log-probability reference (not a parameter)
         self.register_buffer("log_prior", static_matrix.clamp(1e-8).log())
+        self.blank_penalty_weight = float(blank_penalty_weight)
 
     def forward(self, logit_C: torch.Tensor) -> torch.Tensor:
         """
@@ -228,4 +231,8 @@ class SymbolicKLLoss(nn.Module):
             reduction="sum",
             log_target=True,
         ) / log_learned.size(0)
+        if self.blank_penalty_weight > 0.0:
+            c_learned = torch.softmax(logit_C, dim=-1)
+            blank_penalty = c_learned[:, 0].mean()
+            return kl + self.blank_penalty_weight * blank_penalty
         return kl

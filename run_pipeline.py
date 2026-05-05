@@ -504,9 +504,28 @@ def run_auto(args: argparse.Namespace) -> None:
         log.info("Building bigram LM from training phoneme sequences (λ=%.2f)...", args.lm_weight)
         try:
             from src.utils.config import normalize_phoneme
-            # Use manifest train split to gather phoneme ID sequences
-            import pandas as pd
-            train_df = dataset.df[dataset.df['split'] == 'train'] if 'split' in dataset.df.columns else dataset.df
+            # P3.4 FIX: Use speaker-based split logic - get test/val speakers reliably
+            # Get test speakers from test_loader's dataset (the actual test split)
+            test_speakers = set()
+            if hasattr(test_loader.dataset, 'df'):
+                test_speakers = set(test_loader.dataset.df['speaker'].unique())
+            elif hasattr(test_loader.dataset, 'speaker_to_indices'):
+                test_speakers = set(test_loader.dataset.speaker_to_indices.keys())
+            
+            # Get val speakers - check if val_loader exists, otherwise use dataset's val speakers
+            val_speakers = set()
+            if 'val_loader' in dir() and val_loader is not None:
+                if hasattr(val_loader.dataset, 'df'):
+                    val_speakers = set(val_loader.dataset.df['speaker'].unique())
+                elif hasattr(val_loader.dataset, 'speaker_to_indices'):
+                    val_speakers = set(val_loader.dataset.speaker_to_indices.keys())
+            
+            # Filter to only training speakers
+            train_speakers = [
+                s for s in dataset.df['speaker'].unique()
+                if s not in test_speakers and s not in val_speakers
+            ]
+            train_df = dataset.df[dataset.df['speaker'].isin(train_speakers)]
             phn_seqs: list = []
             for phn_str in train_df['phonemes'].dropna():
                 ids = [
@@ -517,7 +536,8 @@ def run_auto(args: argparse.Namespace) -> None:
                     phn_seqs.append(ids)
             _lm_scorer = BigramLMScorer(k=0.5)
             _lm_scorer.fit(phn_seqs, vocab_size=len(dataset.phn_to_id))
-            log.info("Bigram LM built from %d training sequences.", len(phn_seqs))
+            log.info("Bigram LM built from %d training sequences (test=%s, val=%s, train=%d speakers).", 
+                     len(phn_seqs), len(test_speakers), len(val_speakers), len(train_speakers))
         except Exception as _lm_exc:
             log.warning("Bigram LM build failed (non-fatal, falling back to acoustic-only): %s", _lm_exc)
             _lm_scorer = None
@@ -657,7 +677,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="full",
         choices=["full", "neural_only", "symbolic_only", "no_art_heads",
-                 "no_constraint_matrix", "no_spec_augment", "no_temporal_ds"],
+                 "no_constraint_matrix", "no_spec_augment", "no_temporal_ds",
+                 "no_severity_adapter"],
         metavar="STR",
         help="Ablation mode.",
     )

@@ -281,7 +281,7 @@ class SymbolicConstraintLayer(nn.Module):
         # amplifies the blank posterior through the row of C that maps blank→blank,
         # degrading PER.  Only apply the constrained distribution where the
         # neural model is not already blank-dominant.
-        blank_threshold = getattr(self.config, 'blank_constraint_threshold', 0.5)
+        blank_threshold = getattr(self.config, 'blank_constraint_threshold', 0.25)
         non_blank_mask = (P_neural[:, :, 0] < blank_threshold).unsqueeze(-1)  # [B, T, 1]
         P_final = torch.where(non_blank_mask, P_final, P_neural)
         P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -883,12 +883,13 @@ class NeuroSymbolicASR(nn.Module):
         # adapter's severity signal for masked frames, corrupting its training.
         # B3 fix: moved from after SeverityAdapter to before it.
         # Skipped when ablation_mode == 'no_spec_augment' to isolate its contribution.
-        if self.spec_augment is not None and ablation_mode != "no_spec_augment" and not self._hubert_is_frozen:
+        # Apply during training regardless of encoder freeze state.
+        if self.spec_augment is not None and ablation_mode != "no_spec_augment" and self.training:
             hidden_states = self.spec_augment(hidden_states)
 
         # ── Severity Adapter (Proposal P3) ────────────────────────────────────
-        # Skipped in neural_only ablation for a true neural baseline (Q7).
-        if ablation_mode != "neural_only":
+        # P3.1: Skipped in neural_only ablation OR no_severity_adapter for ablation study.
+        if ablation_mode not in ("neural_only", "no_severity_adapter"):
             if self.severity_adapter is not None and speaker_severity is not None:
                 hidden_states = self.severity_adapter(hidden_states, speaker_severity)
 

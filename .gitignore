@@ -3,6 +3,7 @@
 /data/external
 /data/raw/
 /home/nidszxh/Projects/DysarthriaNSR/data/_home_nidszxh_Projects_DysarthriaNSR_data_abnerh___torgo-database_default_0.0.0_c4e0b560a515465e61bb555455e34fc620031fe8.lock
+/nltk_data/
 
 # --- Python Environment ---
 .venv*/
@@ -51,5 +52,5 @@ Thumbs.db
 # --- Project Specific ---
 /papers/
 /chats/
-/scripted/
+/temp/
 /internalDocs/

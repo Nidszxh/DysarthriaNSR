@@ -1439,6 +1439,17 @@ def evaluate_model(
 
     model.eval()
 
+    # P3.5: Disable gradient checkpointing during eval for ~15-25% speedup
+    _gc_was_enabled = False
+    try:
+        hubert = getattr(model, 'hubert', None) or getattr(model, 'model', None)
+        if hubert is not None:
+            _gc_was_enabled = getattr(hubert.config, 'gradient_checkpointing', False)
+            if _gc_was_enabled:
+                hubert.gradient_checkpointing_disable()
+    except Exception:
+        pass  # Non-fatal — proceed without GC disable
+
     # Initialize decoder
     if use_beam_search:
         decoder = BeamSearchDecoder(
@@ -1460,6 +1471,21 @@ def evaluate_model(
     all_speakers = []
     all_phoneme_lengths = []
     all_blank_probs: List[float] = []   # I2: per-utterance mean blank probability
+    all_constraint_pass_rates: List[float] = []  # P1.1: per-utterance frame-pass ratio for symbolic mask
+
+    blank_constraint_threshold = 0.25
+    try:
+        if hasattr(model, 'config') and hasattr(model.config, 'symbolic'):
+            blank_constraint_threshold = float(
+                getattr(model.config.symbolic, 'blank_constraint_threshold', 0.25)
+            )
+        elif hasattr(model, 'model') and hasattr(model.model, 'symbolic_layer'):
+            blank_constraint_threshold = float(
+                getattr(model.model.symbolic_layer.config, 'blank_constraint_threshold', 0.25)
+            )
+    except Exception:
+        pass
+
     articulatory_results = {"manner": [], "place": [], "voice": []}
 
     # Uncertainty estimation (ROADMAP §9, UncertaintyAwareDecoder)
@@ -1532,10 +1558,30 @@ def evaluate_model(
             # Decode predictions
             log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
             logits_neural = outputs.get('logits_neural')
+            p_neural = outputs.get('P_neural')
             # output_lengths: valid CTC frame count per sample (audio-pad mask
             # converted to frame space by the model).  Guards both greedy and
             # beam decoders from emitting padding-frame noise as insertions.
             output_lengths = outputs.get('output_lengths')
+
+            # P1.1 diagnostic: measure fraction of frames where the symbolic
+            # constraint would be active (P_neural(blank) < threshold).
+            if p_neural is not None:
+                try:
+                    blank_id = phn_to_id.get('<BLANK>', 0)
+                    mask_batch = (p_neural[:, :, blank_id] < blank_constraint_threshold)
+                    if output_lengths is not None:
+                        for _s in range(mask_batch.size(0)):
+                            _valid_t = int(output_lengths[_s].item())
+                            if _valid_t > 0:
+                                _mr = mask_batch[_s, :_valid_t].float().mean().item()
+                                all_constraint_pass_rates.append(float(_mr))
+                    else:
+                        all_constraint_pass_rates.extend(
+                            mask_batch.float().mean(dim=1).detach().cpu().tolist()
+                        )
+                except Exception:
+                    pass
 
             # I2: Track per-utterance mean blank probability for insertion diagnostic
             try:
@@ -1625,6 +1671,13 @@ def evaluate_model(
     
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
+
+    if all_constraint_pass_rates:
+        print(
+            "   Constraint frame-pass rate "
+            f"(P(blank) < {blank_constraint_threshold:.2f}): "
+            f"{float(np.mean(all_constraint_pass_rates)):.1%}"
+        )
 
     # Corpus-level WER (I1 / E2) — join phoneme sequences as space-separated tokens
     print("📝 Computing corpus-level WER...")
@@ -1865,10 +1918,14 @@ def evaluate_model(
     # meaningful.  We report both with an explicit `correlation_valid` flag.
     n_speakers_eval = len(per_by_speaker)
     correlation_valid = n_speakers_eval >= 5   # True → statistically interpretable
+    spearman_valid = False  # default; will be set below
     try:
         from src.utils.config import get_speaker_severity
         sev_scores     = [get_speaker_severity(spk) for spk in per_by_speaker]
         per_scores_spk = [per_by_speaker[spk]        for spk in per_by_speaker]
+        # P3.2: Check for tied ranks (e.g., control speakers with severity=0.0)
+        zero_sev_count = sum(1 for s in sev_scores if s == 0.0)
+        spearman_valid = (zero_sev_count / len(sev_scores)) <= 0.4 if sev_scores else False
         if n_speakers_eval >= 2:
             pearson_r,  pearson_p  = stats.pearsonr(sev_scores, per_scores_spk)
             spearman_r, spearman_p = stats.spearmanr(sev_scores, per_scores_spk)
@@ -1980,6 +2037,7 @@ def evaluate_model(
             'spearman_p_sev_per':  float(spearman_p),
             'correlation_n_speakers': n_speakers_eval,
             'correlation_valid':   correlation_valid,  # False when n<5 (treat as descriptive)
+            'spearman_valid':     spearman_valid,    # False when >40% tied ranks (e.g., controls at sev=0.0)
             'p_value_neural_vs_constrained': paired_delta_stats.get('p_value_two_sided'),
             'ci_95_delta_per': [paired_delta_stats.get('ci_95_low'), paired_delta_stats.get('ci_95_high')],
         },
@@ -2060,6 +2118,13 @@ def evaluate_model(
     ratio_str = f"{ins/max(dels,1):.1f}×" if dels > 0 else "N/A"
     print(f"  I/D ratio:      {ratio_str}  (target: <3×)")
     print("="*65)
+
+    # P3.5: Re-enable gradient checkpointing if it was enabled before eval
+    try:
+        if _gc_was_enabled:
+            hubert.gradient_checkpointing_enable()
+    except Exception:
+        pass  # Non-fatal
 
     return results
 

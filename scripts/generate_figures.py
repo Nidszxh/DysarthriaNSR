@@ -27,22 +27,18 @@ import json
 import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
 # Project root on sys.path so ``src`` package is importable
-# ---------------------------------------------------------------------------
 _SCRIPT_DIR  = Path(__file__).resolve().parent       # scripts/
 _PROJECT_ROOT = _SCRIPT_DIR.parent                   # DysarthriaNSR/
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-from src.utils.config import TORGO_SEVERITY_MAP                 # noqa: E402
+from src.utils.config import TORGO_SEVERITY_MAP                    # noqa: E402
 from src.visualization.experiment_plots import generate_all_plots  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _load_json(path: Path, label: str) -> dict | None:
     """Load a JSON file; returns ``None`` and prints a warning on failure."""
@@ -60,10 +56,10 @@ def _load_json(path: Path, label: str) -> dict | None:
 def _load_run(results_root: Path, run_name: str) -> tuple[dict | None, dict | None, dict | None]:
     """
     Load ``evaluation_results.json``, ``explanations.json``, and
-    ``per_phoneme_per.json`` for *run_name*.
+``per_phoneme_per.json`` for *run_name*.
 
     Returns:
-        (eval_results, explanations, per_phoneme_per) — any may be ``None``.
+        (eval_results, explanations, per_phoneme_per, per_by_manner) — any may be ``None``.
     """
     run_dir = results_root / run_name
     eval_results  = _load_json(run_dir / "evaluation_results.json",
@@ -72,12 +68,12 @@ def _load_run(results_root: Path, run_name: str) -> tuple[dict | None, dict | No
                                f"explanations ({run_name})")
     per_phoneme   = _load_json(run_dir / "per_phoneme_per.json",
                                f"per_phoneme_per ({run_name})")
-    return eval_results, explanations, per_phoneme
+    per_by_manner = _load_json(run_dir / "per_by_manner.json",
+                               f"per_by_manner ({run_name})")
+    return eval_results, explanations, per_phoneme, per_by_manner
 
 
-# ---------------------------------------------------------------------------
 # Schema validation
-# ---------------------------------------------------------------------------
 
 _REQUIRED_EVAL_KEYS  = {"avg_per", "overall", "error_analysis", "per_speaker",
                         "symbolic_impact", "articulatory_accuracy"}
@@ -145,9 +141,7 @@ def _validate_utterance_schema(utterances: list[dict]) -> tuple[list[str], list[
     return missing, issues
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -200,10 +194,8 @@ def main() -> None:
     print(f"  Output:     {save_dir}")
     print(f"{'='*60}\n")
 
-    # ------------------------------------------------------------------
     # Load primary run
-    # ------------------------------------------------------------------
-    eval_results, explanations, per_phoneme_per = _load_run(results_root, run_name)
+    eval_results, explanations, per_phoneme_per, per_by_manner = _load_run(results_root, run_name)
 
     if eval_results is None:
         print(f"\n✗  Cannot find evaluation_results.json for run '{run_name}'.")
@@ -211,9 +203,7 @@ def main() -> None:
         print("   Did you run evaluation yet?  python run_pipeline.py --run-name <NAME>")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
     # Schema validation
-    # ------------------------------------------------------------------
     if not args.no_validate:
         missing_eval = _validate_eval_schema(eval_results, run_name)
         if missing_eval:
@@ -239,9 +229,7 @@ def main() -> None:
             print(f"     To generate: python run_pipeline.py --run-name {run_name} "
                   "--skip-train --explain --uncertainty\n")
 
-    # ------------------------------------------------------------------
     # Load comparison runs (if requested)
-    # ------------------------------------------------------------------
     comparison_results: dict[str, dict] | None = None
     if args.compare:
         comparison_results = {}
@@ -254,9 +242,7 @@ def main() -> None:
                 print(f"  ⚠  Comparison run '{cmp_run}' not found — skipped.")
         print()
 
-    # ------------------------------------------------------------------
     # Generate all plots
-    # ------------------------------------------------------------------
     print("  Generating figures...")
     saved = generate_all_plots(
         eval_results=eval_results,
@@ -266,6 +252,7 @@ def main() -> None:
         severity_map=TORGO_SEVERITY_MAP,
         comparison_results=comparison_results,
         per_phoneme_per=per_phoneme_per,
+        per_by_manner=per_by_manner,
     )
 
     print(f"\n{'='*60}")

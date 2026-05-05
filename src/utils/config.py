@@ -117,7 +117,7 @@ class ModelConfig:
     use_learnable_constraint: bool = True
     # Cross-attention severity adapter (Proposal P3)
     use_severity_adapter: bool = True
-    severity_adapter_dim: int = 64   # Projection bottleneck for severity embedding
+    severity_adapter_dim: int = 128  # P2.4: increase severity-conditioning capacity
 
     # Temporal downsampling bottleneck (stride-2 Conv1d before phoneme head).
     # Halves frame rate (~50 Hz → ~25 Hz), forcing the model to aggregate
@@ -167,7 +167,8 @@ class TrainingConfig:
 
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
-    lambda_ce: float = 0.10           # C-1: reduced from 0.35 — frame-CE uses pad/truncate alignment (not forced), so high weight confounds constraint layer
+    lambda_ce: float = 0.05           # Testing: middle ground between 0.02 (P1.2) and 0.1 (original)
+    frame_ce_start_epoch: int = 15    # P1.2: disable frame-CE until epoch 15 (CTC-only boundary learning phase)
     lambda_articulatory: float = 0.08  # T-01: reduced from 0.15 — articulatory accuracy already ~78–92%; marginal gain is low
 
     # --- Phase 2: New loss weights (audit Proposals P1, P2, R3) ---
@@ -194,6 +195,7 @@ class TrainingConfig:
     monitor_metric: str = "val/per"
     monitor_mode: str = "min"
     early_stopping_patience: int = 8
+    loso_early_stopping_patience: int = 22
     beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
     beam_lm_weight: float = 0.0           # Bigram LM shallow-fusion weight (0.0 = disabled)
     save_top_k: int = 2
@@ -276,7 +278,9 @@ class SymbolicConfig:
     # Blank-frame constraint masking (Phase 3 Fix B): apply symbolic constraint
     # only at frames where P_neural[blank] < threshold; avoids amplifying blank
     # posteriors (which make up ~85% of CTC frames) through the constraint matrix.
-    blank_constraint_threshold: float = 0.5
+    # 0.25 keeps hard blank frames bypassed while allowing ambiguous transition
+    # frames to remain constraint-eligible.
+    blank_constraint_threshold: float = 0.25
 
 
 # --- Master Config Handler ---

@@ -1014,6 +1014,83 @@ def plot_phoneme_per(
     return _save(fig, Path(save_path))
 
 
+def plot_per_by_manner(
+    per_manner: Dict[str, Dict],
+    save_path: Path,
+) -> Path:
+    """
+    Horizontal bar chart of PER by manner-of-articulation class.
+
+    Manner classes are sorted descending by PER (hardest first).
+    Bars are colour-coded:
+      * Red   — PER ≥ 0.40 (high error)
+      * Orange — PER 0.20–0.39 (medium)
+      * Green — PER < 0.20 (low error)
+
+    Args:
+        per_manner: Dict mapping manner class → {per, n_ref, n_sub, n_del}.
+        save_path:   Destination PNG path.
+
+    Returns:
+        Resolved ``save_path``.
+    """
+    import matplotlib.patches as mpatches
+
+    _apply_style()
+
+    if not per_manner:
+        warnings.warn("plot_per_by_manner: empty dict — skipping.", stacklevel=2)
+        return Path(save_path)
+
+    sorted_items = sorted(
+        per_manner.items(),
+        key=lambda kv: float(kv[1].get("per", 0.0)) if isinstance(kv[1], dict) else float(kv[1]),
+        reverse=True,
+    )
+    manners = [m for m, _ in sorted_items]
+    values = [
+        float(v.get("per", 0.0)) if isinstance(v, dict) else float(v)
+        for _, v in sorted_items
+    ]
+
+    colours = []
+    for v in values:
+        if v >= 0.40:
+            colours.append("#d62728")   # red
+        elif v >= 0.20:
+            colours.append("#ff7f0e")   # orange
+        else:
+            colours.append("#2ca02c")   # green
+
+    fig, ax = plt.subplots(figsize=(6.5, max(3.5, 0.4 * len(manners) + 1.0)))
+    y_pos = np.arange(len(manners))
+
+    ax.barh(y_pos, values, color=colours, edgecolor="white", linewidth=0.5, zorder=3)
+
+    for idx, val in enumerate(values):
+        n_ref = per_manner[manners[idx]].get("n_ref", 0) if isinstance(per_manner[manners[idx]], dict) else 0
+        ax.text(val + 0.008, y_pos[idx], f"{val:.2f} (n={n_ref})",
+                va="center", ha="left", fontsize=7)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(manners, fontsize=9)
+    ax.set_xlabel("Phoneme Error Rate (PER)")
+    ax.set_title(f"PER by Manner of Articulation ({len(manners)} classes)")
+    ax.set_xlim(0, 1.0)
+    ax.xaxis.grid(True, alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+
+    legend_handles = [
+        mpatches.Patch(color="#d62728", label="High  (≥ 0.40)"),
+        mpatches.Patch(color="#ff7f0e", label="Medium (0.20 – 0.39)"),
+        mpatches.Patch(color="#2ca02c", label="Low    (< 0.20)"),
+    ]
+    ax.legend(handles=legend_handles, frameon=False, fontsize=8, loc="lower right")
+
+    fig.tight_layout()
+    return _save(fig, Path(save_path))
+
+
 # ---------------------------------------------------------------------------
 # Master entry point
 # ---------------------------------------------------------------------------
@@ -1026,6 +1103,7 @@ def generate_all_plots(
     severity_map: Optional[Dict[str, float]] = None,
     comparison_results: Optional[Dict[str, Dict]] = None,
     per_phoneme_per: Optional[Dict[str, float]] = None,
+    per_by_manner: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Path]:
     """
     Generate the full diagnostic visualization suite for one experiment run.
@@ -1205,6 +1283,16 @@ def generate_all_plots(
         print(f"  ✓ per_phoneme_per              → {p.name}")
     else:
         print("  ⚠  per_phoneme_per skipped — per_phoneme_per.json not loaded")
+
+    # ------------------------------------------------------------------
+    # 11. PER by Manner (P3.3 new)
+    # ------------------------------------------------------------------
+    if per_by_manner:
+        p = plot_per_by_manner(per_by_manner, save_dir / "per_by_manner.png")
+        saved["per_by_manner"] = p
+        print(f"  ✓ per_by_manner               → {p.name}")
+    else:
+        print("  ⚠  per_by_manner skipped — per_by_manner dict not provided")
 
     print(f"\n  All figures saved to: {save_dir}")
     return saved

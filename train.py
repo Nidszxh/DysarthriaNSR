@@ -172,6 +172,10 @@ class DysarthriaASRLightning(pl.LightningModule):
         self._encoder_unfrozen = False
         self._encoder_deep_unfrozen = False
         self._encoder_deeper_unfrozen = False
+        # P1.3: short per-group LR warmup after each staged unfreeze
+        self._hubert_warmup_steps_remaining = 0
+        self._hubert_warmup_total_steps = 100
+        self._hubert_warmup_peak_lr = float(self.config.training.learning_rate) * 0.1
         self._sync_unfreeze_flags_from_epoch(self.resume_epoch_offset)
 
     def _sync_unfreeze_flags_from_epoch(self, effective_epoch: int, apply_to_model: bool = False) -> None:
@@ -272,7 +276,10 @@ class DysarthriaASRLightning(pl.LightningModule):
         if self.config.model.use_learnable_constraint:
             sl = self.model.symbolic_layer
             if sl.learnable_matrix is not None:
-                self.symbolic_kl_loss = SymbolicKLLoss(sl.static_constraint_matrix)
+                self.symbolic_kl_loss = SymbolicKLLoss(
+                    sl.static_constraint_matrix,
+                    blank_penalty_weight=0.1,
+                )
 
         # Register core loss weights as buffers
         self.register_buffer('lambda_ctc', torch.tensor(self.config.training.lambda_ctc))
@@ -341,9 +348,16 @@ class DysarthriaASRLightning(pl.LightningModule):
             log_probs_constrained, labels, input_lengths, label_lengths
         )
 
-        # 2. Frame-level CE applied to NEURAL logits (not constrained log-probs)
-        #    Fixes the original misaligned-label gradient pathology (audit S2)
-        loss_ce = self._compute_ce_loss(outputs.get('logits_neural', log_probs_constrained), labels)
+        # 2. Frame-level CE applied to NEURAL logits (not constrained log-probs).
+        # P1.2: enable only after an initial CTC-only phase to reduce
+        # alignment-noise gradients early in training.
+        effective_epoch = int(self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0)))
+        frame_ce_start_epoch = int(getattr(self.config.training, 'frame_ce_start_epoch', 15))
+        frame_ce_enabled = effective_epoch >= frame_ce_start_epoch
+        if frame_ce_enabled:
+            loss_ce = self._compute_ce_loss(outputs.get('logits_neural', log_probs_constrained), labels)
+        else:
+            loss_ce = torch.zeros_like(loss_ctc)
 
         # 3. Articulatory auxiliary heads
         loss_art = None
@@ -381,7 +395,7 @@ class DysarthriaASRLightning(pl.LightningModule):
 
         # ── Ablation-mode weighting ──────────────────────────────────────────
         lambda_ctc  = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ctc)
-        lambda_ce   = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ce)
+        lambda_ce   = 0.0 if (ablation == 'symbolic_only' or not frame_ce_enabled) else float(self.lambda_ce)
         lambda_art  = float(self.lambda_articulatory)
         lambda_ord  = self.config.training.lambda_ordinal
         # I2: Use staged lambda_blank_kl set by on_train_epoch_start (falls back to
@@ -497,6 +511,24 @@ class DysarthriaASRLightning(pl.LightningModule):
             return self.art_ce_losses[key](logits_flat, labels_flat)
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
+
+        # P1.3: staged-unfreeze LR warm-restart for HuBERT param group.
+        # OneCycleLR cannot be rewound per group, so we explicitly set the
+        # encoder LR for a brief ramp after each unfreeze event.
+        warm_steps_remaining = int(getattr(self, '_hubert_warmup_steps_remaining', 0))
+        if warm_steps_remaining > 0:
+            optimizer = self.optimizers()
+            if isinstance(optimizer, list):
+                optimizer = optimizer[0]
+            warm_steps_total = int(getattr(self, '_hubert_warmup_total_steps', 100))
+            peak_lr = float(getattr(self, '_hubert_warmup_peak_lr', self.config.training.learning_rate * 0.1))
+            lr_scale = min(1.0, (warm_steps_total - warm_steps_remaining) / max(float(warm_steps_total), 1.0))
+            for pg in optimizer.param_groups:
+                if pg.get('name') == 'hubert_encoder':
+                    pg['lr'] = peak_lr * lr_scale
+                    break
+            self._hubert_warmup_steps_remaining = max(0, warm_steps_remaining - 1)
+            self.log('train/hubert_lr_warmup_scale', lr_scale, on_step=True, on_epoch=False, prog_bar=False)
 
         outputs = self(batch)
         
@@ -721,6 +753,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         optimizer = self.optimizers()
         if isinstance(optimizer, list):
             optimizer = optimizer[0]
+        hubert_peak_lr = float(self.config.training.learning_rate) * 0.1
         for pg in optimizer.param_groups:
             if pg.get('name') == 'hubert_encoder':
                 for p in pg['params']:
@@ -728,6 +761,12 @@ class DysarthriaASRLightning(pl.LightningModule):
                         # Clear the whole per-parameter state so Adam fully
                         # reinitializes exp_avg / exp_avg_sq / step on next use.
                         optimizer.state[p].clear()
+                # P1.3: kick the encoder group back to its peak LR and run a
+                # short warmup ramp over the next steps.
+                pg['lr'] = hubert_peak_lr
+                self._hubert_warmup_peak_lr = hubert_peak_lr
+                self._hubert_warmup_total_steps = 100
+                self._hubert_warmup_steps_remaining = 100
                 break
 
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
@@ -920,22 +959,32 @@ class DysarthriaASRLightning(pl.LightningModule):
         attn_mask = batch.get('attention_mask')
         if attn_mask is None:
             return None
-        T_audio = attn_mask.size(1)
         T_log = log_probs.size(1)
-        if T_audio <= 0 or T_log <= 0:
+        if T_log <= 0:
             return None
 
-        # Interpolation-style index mapping keeps mask length matched to logits
-        # even when audio/logit lengths are close at batch boundaries.
-        indices = torch.linspace(
-            0,
-            T_audio - 1,
-            T_log,
-            device=attn_mask.device,
-            dtype=torch.float32,
-        ).long().clamp(0, T_audio - 1)
+        # P2.2: mirror the model's actual temporal path.
+        # Step 1) HuBERT feature-extractor output lengths from audio-frame mask.
+        audio_lengths = attn_mask.sum(dim=1).long()
+        hubert_lengths = self.model.hubert._get_feat_extract_output_lengths(audio_lengths).long()
 
-        ds = attn_mask.index_select(dim=1, index=indices).to(log_probs.device)
+        # Step 2) Optional stride-2 temporal downsampling (when active in forward).
+        ablation_mode = getattr(self.config.training, 'ablation_mode', 'full')
+        if self.model.temporal_downsampler is not None and ablation_mode != 'no_temporal_ds':
+            logit_lengths = (hubert_lengths + 1) // 2
+        else:
+            logit_lengths = hubert_lengths
+
+        # Reconstruct binary mask directly from valid lengths.
+        ds = torch.zeros(
+            attn_mask.size(0),
+            T_log,
+            dtype=attn_mask.dtype,
+            device=log_probs.device,
+        )
+        for b, l in enumerate(logit_lengths.clamp(max=T_log).tolist()):
+            if l > 0:
+                ds[b, :int(l)] = 1
         if valid_mask is not None:
             return ds[valid_mask]
         return ds
@@ -1439,10 +1488,15 @@ def train(
         save_top_k=config.training.save_top_k,
         save_last=True
     )
+
+    early_stop_patience = int(config.training.early_stopping_patience)
+    if config.training.ablation_mode == 'full':
+        min_full_patience = int(getattr(config.training, 'encoder_third_unfreeze_epoch', 12)) + 10
+        early_stop_patience = max(early_stop_patience, min_full_patience)
     
     early_stop_callback = EarlyStopping(
         monitor=config.training.monitor_metric,
-        patience=config.training.early_stopping_patience,
+        patience=early_stop_patience,
         mode=config.training.monitor_mode,
         verbose=True
     )
@@ -1644,6 +1698,7 @@ def run_loso(
     progress_path = summary_dir / f"{base_run_name}_loso_progress.json"
 
     completed_folds: Dict[str, Dict] = {}
+    new_fold_elapsed_sec: List[float] = []
     if resume and progress_path.exists():
         try:
             with open(progress_path, "r", encoding="utf-8") as _pf:
@@ -1933,7 +1988,14 @@ def run_loso(
                 ckpt_cb,
                 EarlyStopping(
                     monitor='val_per',
-                    patience=config.training.early_stopping_patience,
+                    patience=(
+                        max(
+                            int(getattr(config.training, 'loso_early_stopping_patience', config.training.early_stopping_patience)),
+                            int(getattr(config.training, 'encoder_third_unfreeze_epoch', 12)) + 10,
+                        )
+                        if config.training.ablation_mode == 'full'
+                        else int(config.training.early_stopping_patience)
+                    ),
                     mode='min'
                 ),
                 _CompactFoldProgressCallback(),
@@ -2008,11 +2070,16 @@ def run_loso(
             'checkpoint': str(best_eval_ckpt) if best_eval_ckpt is not None else str(ckpt_dir / 'last.ckpt'),
             'results_dir': str(results_dir),
         }
+        new_fold_elapsed_sec.append(float(fold_elapsed_sec))
         _write_progress()
         elapsed_min = fold_elapsed_sec / 60.0
         done_folds = len(completed_folds)
         remaining_folds = len(speakers) - done_folds
-        avg_elapsed_sec = np.mean([float(v.get('elapsed_sec', 0.0)) for v in completed_folds.values()])
+        avg_elapsed_sec = (
+            float(np.mean(new_fold_elapsed_sec))
+            if new_fold_elapsed_sec
+            else float(fold_elapsed_sec)
+        )
         eta_total_sec = max(0.0, avg_elapsed_sec * remaining_folds)
         eta_h = int(eta_total_sec // 3600)
         eta_m = int((eta_total_sec % 3600) // 60)
@@ -2119,7 +2186,8 @@ def main() -> None:
     parser.add_argument('--run-name',            type=str, help='MLflow run name')
     parser.add_argument('--ablation',            type=str, default='full',
                         choices=['full', 'neural_only', 'symbolic_only', 'no_art_heads',
-                                 'no_constraint_matrix', 'no_spec_augment', 'no_temporal_ds'],
+                                 'no_constraint_matrix', 'no_spec_augment', 'no_temporal_ds',
+                                 'no_severity_adapter'],
                         help='Ablation mode (default: full)')
     parser.add_argument('--loso',                action='store_true',
                         help='Run Leave-One-Speaker-Out cross-validation')
