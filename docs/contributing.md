@@ -143,8 +143,9 @@ if ablation_mode == "my_new_ablation":
 | O | Optional / deferred improvements | O-2 (per-group scheduler) |
 | M | Medium-priority issues | M-5 (conformal APS heuristic), M-6 (per-speaker severity sort) |
 | Q | Code quality and refactoring | Q7 (true neural-only ablation bypass) |
+| FIX | v0.4.0 audit fixes | FIX-1 (blank threshold), FIX-2 (frame-CE gating), FIX-3 (OneCycleLR restart), FIX-9 (no_severity_adapter), FIX-10 (spearman_valid), FIX-11 (plot_per_by_manner), FIX-12 (BigramLM leak) |
 
-To add a fix: implement it, add a row to `docs/02_COMPLETED_WORK.md` with `ID | File | Fix Applied`, and add a comment at the affected code site.
+To add a fix: implement it, add a row to `docs/02_COMPLETED_WORK.md` with `ID | File | Fix Applied`, add a `# [FIX-N]` comment block at the affected code site, and document in `docs/changes.md`.
 
 ### Pre-Commit Checklist
 

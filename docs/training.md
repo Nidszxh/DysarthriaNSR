@@ -89,11 +89,13 @@ Config is saved to both `checkpoints/{run_name}/config.yaml` (during training) a
 | Config key | Default | CLI flag | Notes |
 |---|---|---|---|
 | `experiment.run_name` | `rtx4060_optimized_v1` | `--run-name STR` | Single source of truth for all output paths |
-| `training.ablation_mode` | `full` | `--ablation MODE` | One of: full, neural_only, no_constraint_matrix, no_art_heads, no_spec_augment, no_temporal_ds, symbolic_only |
+| `training.ablation_mode` | `full` | `--ablation MODE` | One of: full, neural_only, no_constraint_matrix, no_severity_adapter, no_art_heads, no_spec_augment, no_temporal_ds, symbolic_only |
 | `training.max_epochs` | `40` | `--max-epochs INT` | Maximum training epochs |
 | `training.batch_size` | `12` | `--batch-size INT` | Per-GPU batch size |
 | `training.gradient_accumulation_steps` | `3` | `--grad-accum INT` | Effective batch = batch_size × grad_accum |
-| `training.early_stopping_patience` | `8` | `--early-stopping-patience INT` | Epochs without improvement (paper full-system runs use 6; ablations use 8) |
+| `training.early_stopping_patience` | `8` | `--early-stopping-patience INT` | Epochs without improvement (single-split/ablation runs) |
+| `training.loso_early_stopping_patience` | `22` | (modify config.py) | LOSO full-system runs use higher patience (FIX-4) |
+| `training.frame_ce_start_epoch` | `15` | (modify config.py) | Frame-CE activates after epoch 15 (FIX-2) |
 | `training.check_val_every_n_epoch` | `1` | `--check-val-every-n-epoch INT` | Set to 2 to halve validation overhead for LOSO |
 | `training.encoder_warmup_epochs` | `1` | (modify config.py) | Stage 1 unfreeze trigger |
 | `training.lambda_symbolic_kl` | `0.5` | (modify config.py) | KL anchor strength |
@@ -253,7 +255,9 @@ Epoch 40     ──────────────────────�
 
 When encoder layers are unfrozen, the `hubert_encoder` parameter group in AdamW has its per-parameter state cleared: `optimizer.state[p].clear()` for each parameter `p` in the group. This clears the **entire** state dict entry (exp_avg + exp_avg_sq + step), not individual keys. Clearing only `exp_avg` leaves a partially-initialized state that causes `KeyError('exp_avg')` on the next `optimizer.step()`. The full `.clear()` ensures Adam reinitializes cleanly on first use after unfreeze.
 
-**Known limitation (T-04/O-2):** OneCycleLR's step counter is not reset. Newly unfrozen parameters enter at the current (potentially decayed) LR position rather than at the original peak. Full fix requires per-group `CosineAnnealingWarmRestarts` schedulers (planned post-submission).
+**FIX-3 update:** OneCycleLR warm restart is now triggered after each unfreeze stage, resetting the scheduler step counter to give newly unfrozen parameters a fresh warmup period. This addresses T-04 by providing proper LR ramp for unfrozen layers.
+
+**Known limitation (T-04/O-2):** Per-group schedulers are still planned for full independent LR curves per parameter group.
 
 ### Staged `lambda_blank_kl` Ramp (I2)
 

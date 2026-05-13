@@ -520,7 +520,7 @@ def run_auto(args: argparse.Namespace) -> None:
                 elif hasattr(val_loader.dataset, 'speaker_to_indices'):
                     val_speakers = set(val_loader.dataset.speaker_to_indices.keys())
             
-            # Filter to only training speakers
+            # [FIX-12] Filter to only training speakers (prevents data leakage from val/test)
             train_speakers = [
                 s for s in dataset.df['speaker'].unique()
                 if s not in test_speakers and s not in val_speakers

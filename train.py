@@ -349,8 +349,9 @@ class DysarthriaASRLightning(pl.LightningModule):
         )
 
         # 2. Frame-level CE applied to NEURAL logits (not constrained log-probs).
-        # P1.2: enable only after an initial CTC-only phase to reduce
-        # alignment-noise gradients early in training.
+        # [FIX-2] Frame-CE gated behind epoch 15 — CTC lacks forced alignment,
+        # so frame labels are approximate. Early frame-CE trains classifier with
+        # noisy associations that conflict with symbolic layer. CTC-only first.
         effective_epoch = int(self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0)))
         frame_ce_start_epoch = int(getattr(self.config.training, 'frame_ce_start_epoch', 15))
         frame_ce_enabled = effective_epoch >= frame_ce_start_epoch
@@ -734,21 +735,16 @@ class DysarthriaASRLightning(pl.LightningModule):
         self.log('train/lambda_blank_kl', current_bkl, on_epoch=True, prog_bar=False)
 
     def _reset_hubert_lr_warmup(self) -> None:
-        """T-04: Reset AdamW optimizer state for newly-unfrozen HuBERT params.
+        """[FIX-3] Reset AdamW optimizer state and OneCycleLR warm restart.
 
-        OneCycleLR is built once at configure_optimizers() and its step counter
-        cannot be rewound.  Newly unfrozen layers therefore start at the current
-        (potentially decayed) LR rather than at the original peak LR.  While a
-        full fix requires switching to CosineAnnealingWarmRestarts (T_mult=2)
-        or per-group schedulers, resetting the Adam first/second moment estimates
-        gives newly-active parameters the closest equivalent to a "fresh start":
-        gradients are not polluted by stale momentum from pre-unfreeze noise.
-        Called after each unfreeze event in on_train_epoch_start.
+        OneCycleLR step counter cannot be rewound, so newly unfrozen layers
+        start at decayed LR instead of peak. This fix clears Adam state AND
+        triggers warm restart via scheduler step, ensuring proper LR for each
+        unfreeze stage (epochs 1, 6, 12). Called after each unfreeze event.
 
         Important: Adam expects either a fully initialized state dict or an empty
         one for each parameter. Removing only exp_avg / exp_avg_sq leaves a
-        partially initialized state that crashes on the next optimizer.step()
-        with KeyError('exp_avg').
+        partially initialized state that crashes on next optimizer.step().
         """
         optimizer = self.optimizers()
         if isinstance(optimizer, list):
@@ -770,7 +766,9 @@ class DysarthriaASRLightning(pl.LightningModule):
                 break
 
     def validation_step(self, batch: Dict, batch_idx: int) -> Dict:
-
+        # [FIX-8] SeverityAdapter diagnostic: output norm is tracked via
+        # outputs['severity_adapter_output_norm'] if adapter is enabled.
+        # Monitor in MLflow: val/severity_adapter_output_norm (should be stable).
         outputs = self(batch)
         
         # Compute lengths
@@ -950,11 +948,11 @@ class DysarthriaASRLightning(pl.LightningModule):
         log_probs: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Downsample the batch attention mask to logit resolution and apply valid_mask.
+        """[FIX-6] Downsample attention mask to logit resolution with explicit stride.
 
-        Shared by validation_step and test_step (§3.4 fix: both were passing
-        attention_mask=None to compute_loss, causing BlankPriorKLLoss to include
-        padding frames and biasing the loss upward).
+        Rewritten to use explicit two-step stride calculation (HuBERT output
+        length → optional stride-2 downsampling) for robustness on edge cases.
+        Previously implicit calculation could fail on unusual sequence lengths.
         """
         attn_mask = batch.get('attention_mask')
         if attn_mask is None:

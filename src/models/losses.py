@@ -182,21 +182,17 @@ class BlankPriorKLLoss(nn.Module):
 
 
 class SymbolicKLLoss(nn.Module):
-    """
-    Symbolic KL Anchor Loss (Proposal P2 — Learnable Constraint Matrix).
+    """[FIX-5] Symbolic KL Anchor Loss with blank-mass penalty.
 
     Prevents the learned constraint matrix C from diverging arbitrarily from the
-    articulatory/phonological prior C_static. Each row of C is a probability
-    distribution over target phonemes; the KL penalty keeps each row near the
-    corresponding row of the prior.
+    articulatory/phonological prior C_static. Each row is a probability
+    distribution; KL keeps each row near its prior.
 
-    Formula:
-        loss = (1/V) Σ_i KL(C_learned[i] || C_static[i])
+    With more constraint activation (FIX-1), rows may drift toward blank-dominated
+    distributions. The blank_penalty_weight (default 0.1) explicitly penalizes this
+    drift by adding mean(blank-column mass) to the loss.
 
-    Args:
-        static_matrix: Static symbolic prior [V, V], row-normalised.
-        blank_penalty_weight: Optional weight for mean blank-column mass
-            penalty C_learned[:, 0].mean().
+    Formula: loss = (1/V) Σ_i KL(C_learned[i] || C_static[i]) + λ_blank * C[:, 0].mean()
     """
 
     def __init__(self, static_matrix: torch.Tensor, blank_penalty_weight: float = 0.0):

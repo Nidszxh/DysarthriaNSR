@@ -1918,6 +1918,9 @@ def evaluate_model(
     # meaningful.  We report both with an explicit `correlation_valid` flag.
     n_speakers_eval = len(per_by_speaker)
     correlation_valid = n_speakers_eval >= 5   # True → statistically interpretable
+    # [FIX-10] spearman_valid flag: Spearman is degenerate with >40% tied ranks.
+    # All 7 control speakers have severity=0.0, creating massive ties. Flag indicates
+    # whether Spearman correlation is statistically meaningful.
     spearman_valid = False  # default; will be set below
     try:
         from src.utils.config import get_speaker_severity

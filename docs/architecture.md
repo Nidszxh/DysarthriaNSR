@@ -32,7 +32,7 @@ graph LR
 | Neural softmax | `P_neural` | [B, T, 47] | softmax(logits_neural) |
 | Constraint matrix | `C` | [47, 47] | Row-stochastic, learnable |
 | Constrained distribution | `P_constrained` | [B, T, 47] | P_neural @ C, renormalized |
-| Blank-masked fusion | `P_final` | [B, T, 47] | β·P_constrained + (1-β)·P_neural; frames where P_neural\[blank\] ≥ 0.5 retain P_neural |
+| Blank-masked fusion | `P_final` | [B, T, 47] | β·P_constrained + (1-β)·P_neural; frames where P_neural\[blank\] ≥ 0.25 retain P_neural (FIX-1: lowered from 0.5) |
 | Log-probs for CTC | `log_probs_constrained` | [B, T, 47] | log(P_final.clamp_min(1e-6)) |
 | CTC input | transposed | [T, B, 47] | Required by `nn.CTCLoss` |
 | Output lengths | `output_lengths` | [B] | Exact valid CTC frame count; used to mask padding in decode |
@@ -175,7 +175,7 @@ P_fused       = β(s)·P_constrained + (1-β(s))·P_neural  # severity-adaptive 
 β(s)          = clamp(β_base + 0.2·s/5, 0.0, 0.8)       # s ∈ [0, 5]
 
 # Blank-frame masking: bypass constraint where blank is dominant
-mask = (P_neural[:,:,0] < blank_constraint_threshold)     # threshold = 0.5
+mask = (P_neural[:,:,0] < blank_constraint_threshold)     # threshold = 0.25 (FIX-1)
 P_final = mask * P_fused + ~mask * P_neural
 
 log_probs_constrained = log(P_final.clamp_min(1e-6))
@@ -193,7 +193,7 @@ log_probs_constrained = log(P_final.clamp_min(1e-6))
 |---|---|---|
 | `constraint_weight_init` | `0.05` | Initial β_base (learnable, clamped < 0.8) |
 | `severity_beta_slope` | `0.2` | Rate of β increase per normalized severity unit |
-| `blank_constraint_threshold` | `0.5` | Blank-dominance gate threshold |
+| `blank_constraint_threshold` | `0.25` | Blank-dominance gate threshold (FIX-1: lowered from 0.5) |
 | `min_rule_confidence` | `0.05` | Minimum β for rule activation logging (C5 fix) |
 
 **`_track_activations()` (B4b fix):** Wrapped in `torch.no_grad()` to prevent building an unused gradient graph during inference. Capped at 100 indices per call; `SymbolicRuleTracker` caps total activations at `_MAX_ACTIVATIONS = 50,000` (H-5 fix).
@@ -209,6 +209,7 @@ Controlled via `--ablation` flag (stored in `config.training.ablation_mode`):
 | `full` | ✅ | ✅ learnable C | ✅ | 0.1372 | Default production mode |
 | `neural_only` | ❌ | ❌ bypassed entirely | ❌ | **0.1346** | Pure HuBERT+classifier; **globally best single-split** |
 | `no_constraint_matrix` | ✅ | ❌ log-softmax of neural logits | ✅ | 0.1444 | Isolates SeverityAdapter contribution |
+| `no_severity_adapter` | ❌ | ✅ learnable C | ✅ | — | Tests symbolic constraint without severity conditioning (FIX-9) |
 | `no_art_heads` | ✅ | ✅ | ❌ | — | Tests articulatory head contribution |
 | `no_spec_augment` | ✅ (no aug) | ✅ | ✅ | — | Tests SpecAugment contribution |
 | `no_temporal_ds` | ✅ (no DS) | ✅ | ✅ | — | Tests TemporalDownsampler contribution |
@@ -309,7 +310,9 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `lambda_blank_kl` | `0.20` | Blank-prior KL weight (final stage) |
 | `blank_target_prob` | `0.75` | Target mean blank probability |
 | `lambda_symbolic_kl` | `0.50` | Symbolic KL anchor weight |
-| `early_stopping_patience` | `8` | Epochs without improvement before stopping (paper full-system runs use 6; ablations use 8) |
+| `early_stopping_patience` | `8` | Epochs without improvement before stopping (single-split/ablation runs) |
+| `loso_early_stopping_patience` | `22` | Epochs without improvement for full-system LOSO runs (FIX-4: higher due to fold variance) |
+| `frame_ce_start_epoch` | `15` | Epoch at which frame-CE loss activates (FIX-2: gated to allow CTC boundary learning first) |
 
 **Optimizer LR groups (paper setting):** HuBERT encoder uses `0.1×` peak LR, classifier+adapter uses `1.0×`, and the constraint layer uses `0.5×` under the same OneCycle schedule.
 | `ablation_mode` | `full` | Active ablation mode |

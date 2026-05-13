@@ -515,11 +515,12 @@ class SpecAugmentLayer(nn.Module):
         return int(torch.randint(low, high + 1, (1,), generator=self._rng).item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, T, D] hidden states
-        Returns:
-            [B, T, D] with random time/freq regions zeroed (training only)
+        """[FIX-7] SpecAugment uses self.training only, decoupled from HuBERT freeze.
+
+        Previously tied to _hubert_is_frozen, which disabled augmentation during
+        warmup (epoch 0) even though downstream modules (classifier, adapter,
+        constraint layer) were actively training. Now active whenever model is
+        in training mode, providing regularization throughout all stages.
         """
         if not self.training:
             return x
@@ -888,7 +889,8 @@ class NeuroSymbolicASR(nn.Module):
             hidden_states = self.spec_augment(hidden_states)
 
         # ── Severity Adapter (Proposal P3) ────────────────────────────────────
-        # P3.1: Skipped in neural_only ablation OR no_severity_adapter for ablation study.
+        # [FIX-9] no_severity_adapter ablation added to test constraint layer alone.
+        # neural_only bypasses both adapter and constraint; this mode isolates adapter.
         if ablation_mode not in ("neural_only", "no_severity_adapter"):
             if self.severity_adapter is not None and speaker_severity is not None:
                 hidden_states = self.severity_adapter(hidden_states, speaker_severity)

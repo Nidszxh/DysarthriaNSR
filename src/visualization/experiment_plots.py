@@ -1014,7 +1014,7 @@ def plot_phoneme_per(
     return _save(fig, Path(save_path))
 
 
-def plot_per_by_manner(
+def plot_per_by_manner(  # [FIX-11] Added for articulatory-stratified PER analysis
     per_manner: Dict[str, Dict],
     save_path: Path,
 ) -> Path:
