@@ -33,7 +33,6 @@ def _make_constraint_layer(learnable: bool = False) -> SymbolicConstraintLayer:
         id_to_phn=id_to_phn,
         symbolic_config=cfg,
         constraint_weight=0.1,
-        learnable=learnable,
         use_learnable_matrix=learnable,
     )
 

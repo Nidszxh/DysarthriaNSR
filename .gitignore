@@ -49,8 +49,17 @@ Thumbs.db
 *.swp
 /mlruns/
 
+# --- Generated Experiment Outputs ---
+results/
+
+# --- Generated Data Artifacts ---
+data/processed/*.csv
+
+# --- Hyperparameter Configs (local tuning only) ---
+configs/
+
 # --- Project Specific ---
 /papers/
 /chats/
 /temp/
-/internalDocs/
+/justdocs/

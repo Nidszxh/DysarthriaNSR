@@ -1,3 +1,4 @@
+import logging
 import warnings
 import hashlib
 import os
@@ -14,17 +15,12 @@ import torchaudio.functional as taF
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import AutoFeatureExtractor, AutoProcessor
 
-# Import from project config (single source of truth)
-try:
-    from src.utils.config import ProjectPaths, normalize_phoneme
-except ImportError:
-    # Fallback for different execution contexts
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.utils.config import ProjectPaths, normalize_phoneme
+from src.utils.config import ProjectPaths, normalize_phoneme
+
+logger = logging.getLogger(__name__)
 
 
-def _compute_sample_weights(df: pd.DataFrame) -> List[float]:
+def compute_sample_weights(df: pd.DataFrame) -> List[float]:
     """Build inverse-frequency sample weights with speaker priority.
 
     Training uses speaker-balanced sampling to avoid overweighting speakers with
@@ -44,9 +40,8 @@ def _compute_sample_weights(df: pd.DataFrame) -> List[float]:
     return [class_weights[label] for label in label_series]
 
 
-
 class TorgoNeuroSymbolicDataset(Dataset):
-    
+
     def __init__(
         self,
         manifest_path: str,
@@ -56,15 +51,15 @@ class TorgoNeuroSymbolicDataset(Dataset):
         enable_feature_cache: bool = True,
         feature_cache_dir: Optional[str] = None,
         enable_memory_cache: bool = True,
-        memory_cache_size: int = 2048,
-    ):
+        memory_cache_size: int = 256,  # per-worker; shuffled access patterns don't benefit from large LRU
+    ) -> None:
         # Validate manifest exists
         if not Path(manifest_path).exists():
             raise FileNotFoundError(
                 f"Manifest not found at {manifest_path}. "
                 f"Run 'python src/data/manifest.py' to generate it."
             )
-        
+
         self.manifest_path = manifest_path
         self.sampling_rate = sampling_rate
         self.max_audio_samples = (
@@ -73,11 +68,11 @@ class TorgoNeuroSymbolicDataset(Dataset):
         self.enable_feature_cache = enable_feature_cache
         self.enable_memory_cache = enable_memory_cache
         self.memory_cache_size = max(0, int(memory_cache_size))
-        
+
         # Load manifest and validate
         self.df = pd.read_csv(manifest_path)
         self._validate_and_clean_manifest()
-        
+
         # Load feature processor
         self.processor = self._load_processor(processor_id)
         self.processor_id = processor_id
@@ -92,7 +87,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
             (self.feature_cache_dir / self._cache_namespace).mkdir(parents=True, exist_ok=True)
 
         self._memory_feature_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
-        
+
         # Build vocabularies
         self._build_vocabularies()
 
@@ -100,15 +95,15 @@ class TorgoNeuroSymbolicDataset(Dataset):
         # repeated per-batch string split/token encoding for labels.
         self._sequence_cache = self._build_sequence_cache()
         self._materialize_sequence_tensors()
-        
+
         # Pre-calculate inverse-frequency phoneme weights
         self.phoneme_weights = self._calculate_phoneme_weights()
         self.articulatory_weights = self._calculate_articulatory_weights()
-        
-        print(f"✅ Dataset initialized: {len(self.df)} samples from {manifest_path}")
-        print(f"   Vocabulary: {len(self.phn_to_id)} phonemes")
-        print(f"   Articulatory classes: {len(self.manner_to_id)}")
-    
+
+        logger.info("Dataset initialized: %d samples from %s", len(self.df), manifest_path)
+        logger.info("Vocabulary: %d phonemes", len(self.phn_to_id))
+        logger.info("Articulatory classes: %d", len(self.manner_to_id))
+
     def _validate_and_clean_manifest(self) -> None:
         """
         Validate manifest data quality and remove invalid samples.
@@ -121,18 +116,18 @@ class TorgoNeuroSymbolicDataset(Dataset):
         Modifies self.df in-place.
         """
         initial_count = len(self.df)
-        
+
         # Required columns
         required_cols = ['path', 'phonemes', 'speaker', 'label']
         missing_cols = [col for col in required_cols if col not in self.df.columns]
         if missing_cols:
             raise ValueError(f"Manifest missing required columns: {missing_cols}")
-        
+
         # Remove empty phoneme sequences
         self.df = self.df[
             self.df["phonemes"].fillna("").str.strip() != ""
         ].reset_index(drop=True)
-        
+
         dropped = initial_count - len(self.df)
         if dropped > 0:
             warnings.warn(
@@ -140,7 +135,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
                 f"({dropped/initial_count*100:.1f}%)",
                 UserWarning
             )
-        
+
         # Check for duplicates (warn but don't remove - may be legitimate multi-mic)
         if self.df.duplicated(subset=['path']).any():
             n_duplicates = self.df.duplicated(subset=['path']).sum()
@@ -149,12 +144,12 @@ class TorgoNeuroSymbolicDataset(Dataset):
                 f"This may indicate multi-microphone recordings.",
                 UserWarning
             )
-    
-    def _load_processor(self, processor_id: str):
+
+    def _load_processor(self, processor_id: str) -> "AutoFeatureExtractor":
         if "hubert" in processor_id.lower():
-            print(f"📦 Loading HuBERT feature extractor: {processor_id}")
+            logger.info("Loading HuBERT feature extractor: %s", processor_id)
             return AutoFeatureExtractor.from_pretrained(processor_id)
-        
+
         # Try AutoProcessor first, fall back to feature extractor
         try:
             return AutoProcessor.from_pretrained(processor_id)
@@ -164,7 +159,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
                 UserWarning
             )
             return AutoFeatureExtractor.from_pretrained(processor_id)
-    
+
     def _build_vocabularies(self) -> None:
         """
         Build phoneme and articulatory class vocabularies from manifest.
@@ -187,26 +182,26 @@ class TorgoNeuroSymbolicDataset(Dataset):
             for phoneme in phonemes_str.split()
             if phoneme.strip()
         ))
-        
+
         # Create phoneme vocabulary with special tokens
         self.phn_to_id = {
             '<BLANK>': 0,  # CTC blank token
             '<PAD>': 1,    # Padding token
             '<UNK>': 2,    # Unknown token
         }
-        
+
         # Add regular phonemes starting from index 3
         for i, phoneme in enumerate(phonemes_list):
             self.phn_to_id[phoneme] = i + 3
-        
+
         # Create reverse mapping
         self.id_to_phn = {idx: phn for phn, idx in self.phn_to_id.items()}
-        
+
         # Store special token IDs for convenience
         self.blank_id = 0
         self.pad_id = 1
         self.unk_id = 2
-        
+
         # Build articulatory class vocabularies (manner/place/voice)
         self.manner_to_id = self._build_articulatory_vocab("manner_classes", fallback="articulatory_classes")
         self.place_to_id = self._build_articulatory_vocab("place_classes")
@@ -242,13 +237,13 @@ class TorgoNeuroSymbolicDataset(Dataset):
             '<UNK>': 1,
             'other': 2,
         }
-        for i, art in enumerate(art_classes):
+        for art in art_classes:
             if art in vocab:
                 continue
-            vocab[art] = i + 3
+            vocab[art] = len(vocab)
 
         return vocab
-    
+
     def _calculate_phoneme_weights(self) -> torch.Tensor:
         """
         Calculate inverse-frequency weights for phoneme class balancing.
@@ -265,14 +260,14 @@ class TorgoNeuroSymbolicDataset(Dataset):
             all_phonemes.extend([
                 normalize_phoneme(p) for p in str(row).split() if p.strip()
             ])
-        
+
         # Frequency counts
         counts = pd.Series(all_phonemes).value_counts()
         median_freq = float(counts.median()) if not counts.empty else 1.0
-        
+
         # Initialize weights to ones
         weights = torch.ones(len(self.phn_to_id), dtype=torch.float32)
-        
+
         # Assign inverse-frequency weights (sqrt-damped)
         for phn, phn_id in self.phn_to_id.items():
             if phn in counts:
@@ -282,16 +277,16 @@ class TorgoNeuroSymbolicDataset(Dataset):
             else:
                 # Unseen phonemes get median weight
                 weights[phn_id] = 1.0
-        
+
         # Adjust special tokens
         # BLANK: Higher weight to discourage over-insertion
         weights[self.phn_to_id['<BLANK>']] *= 1.2
         # PAD: Higher weight since ignored in loss (doesn't affect training)
         weights[self.phn_to_id['<PAD>']] *= 1.5
-        
+
         # Clamp for numerical stability
         weights = torch.clamp(weights, min=0.7, max=3.0)
-        
+
         return weights
 
     def _calculate_articulatory_weights(self) -> Dict[str, torch.Tensor]:
@@ -322,13 +317,13 @@ class TorgoNeuroSymbolicDataset(Dataset):
             "place": build_weights("place_classes", self.place_to_id),
             "voice": build_weights("voice_classes", self.voice_to_id),
         }
-    
+
     def get_loss_weights(self) -> torch.Tensor:
         return self.phoneme_weights
 
     def get_articulatory_loss_weights(self) -> Dict[str, torch.Tensor]:
         return self.articulatory_weights
-    
+
     def _load_audio(self, audio_path: str) -> torch.Tensor:
         """
         Load and preprocess audio waveform
@@ -373,26 +368,26 @@ class TorgoNeuroSymbolicDataset(Dataset):
             )
             waveform = torch.zeros(1, self.sampling_rate)
             sample_rate = self.sampling_rate
-        
+
         # Convert stereo to mono (average channels)
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
+
         # Resample if necessary (use functional API to avoid kernel recreation)
         if sample_rate != self.sampling_rate:
             waveform = taF.resample(waveform, sample_rate, self.sampling_rate)
-        
+
         # Truncate long waveforms (VRAM optimization)
         if self.max_audio_samples is not None:
             if waveform.shape[-1] > self.max_audio_samples:
                 waveform = waveform[..., :self.max_audio_samples]
-        
+
         # C2: Do NOT peak-normalize here. HuBERT processor applies its own
         # mean/variance normalization during feature extraction; a manual
         # peak-normalize beforehand causes double normalization that deviates
         # from the pretraining distribution of facebook/hubert-base-ls960.
         waveform = waveform.squeeze(0)
-        
+
         return waveform
 
     def _build_cache_namespace(self) -> str:
@@ -465,9 +460,9 @@ class TorgoNeuroSymbolicDataset(Dataset):
                     tmp_path.unlink()
             except Exception:
                 pass
-    
+
     def _encode_phonemes(self, phonemes_str: str) -> List[int]:
-        
+
         phoneme_list = [
             normalize_phoneme(phn) for phn in phonemes_str.split() if phn.strip()
         ]
@@ -576,12 +571,12 @@ class TorgoNeuroSymbolicDataset(Dataset):
             return ["other"] * target_len
 
         return tokens
-    
+
     def __len__(self) -> int:
         """Return dataset size."""
         return len(self.df)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]: # Get dataset items by index
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:  # Get dataset items by index
 
         row = self.df.iloc[idx]
 
@@ -598,13 +593,13 @@ class TorgoNeuroSymbolicDataset(Dataset):
             if self.max_audio_samples is not None and audio_features.numel() > self.max_audio_samples:
                 audio_features = audio_features[:self.max_audio_samples]
             self._store_cached_features(idx, audio_path, audio_features)
-        
+
         seq_len = int(self._seq_lengths[idx].item())
         labels = self._labels_tensor[idx, :seq_len].clone()
         manner = self._manner_tensor[idx, :seq_len].clone()
         place = self._place_tensor[idx, :seq_len].clone()
         voice = self._voice_tensor[idx, :seq_len].clone()
-        
+
         return {
             "input_values": audio_features,
             "labels": labels,
@@ -634,29 +629,29 @@ class NeuroSymbolicCollator:
         processor: Feature processor instance
         pad_id: Padding token ID (default: 1)
     """
-    
-    def __init__(self, processor, pad_id: int = 1, ctc_stride: int = 320):
+
+    def __init__(self, processor: "AutoFeatureExtractor", pad_id: int = 1, ctc_stride: int = 320) -> None:
         self.processor = processor
         self.pad_id = pad_id
         self.ctc_stride = ctc_stride
-    
+
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
         # Extract components
         input_values = [item["input_values"] for item in batch]
         labels = [item["labels"] for item in batch]
         art_labels = [item["articulatory_labels"] for item in batch]
-        
+
         # Pad audio features (use 0.0 for silence)
         input_padded = torch.nn.utils.rnn.pad_sequence(
             input_values, batch_first=True, padding_value=0.0
         )
-        
+
         # Create attention mask (1 for signal, 0 for padding)
         attention_mask = torch.zeros_like(input_padded, dtype=torch.long)
         for i, length in enumerate(len(x) for x in input_values):
             attention_mask[i, :length] = 1
-        
+
         # Pad labels (use -100 to ignore in loss computation)
         labels_padded = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=-100
@@ -679,12 +674,12 @@ class NeuroSymbolicCollator:
             [len(x) // self.ctc_stride for x in input_values], dtype=torch.long
         )
         label_lengths = torch.tensor([len(x) for x in labels], dtype=torch.long)
-        
+
         # Aggregate metadata
         status = torch.stack([item["metadata"]["is_dysarthric"] for item in batch])
         speakers = [item["metadata"]["speaker"] for item in batch]
         transcripts = [item["metadata"]["transcript"] for item in batch]
-        
+
         return {
             "input_values": input_padded,
             "attention_mask": attention_mask,
@@ -698,77 +693,4 @@ class NeuroSymbolicCollator:
         }
 
 
-def create_single_dataloader(
-    manifest_path: str,
-    processor_id: str = "facebook/hubert-base-ls960",
-    batch_size: int = 4,
-    num_workers: int = 4,
-    sampling_rate: int = 16000,
-    max_audio_length: Optional[float] = None
-) -> DataLoader:
 
-    dataset = TorgoNeuroSymbolicDataset(
-        manifest_path=manifest_path,
-        processor_id=processor_id,
-        sampling_rate=sampling_rate,
-        max_audio_length=max_audio_length
-    )
-    
-    collator = NeuroSymbolicCollator(dataset.processor)
-    
-    sample_weights = _compute_sample_weights(dataset.df)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=sampler,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-
-def main() -> None:
-    """Test dataloader module."""
-    from src.utils.config import get_default_config
-    
-    config = get_default_config()
-    manifest_path = config.data.manifest_path
-    
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"Manifest not found at {manifest_path}. "
-            f"Run 'python src/data/manifest.py' to generate it."
-        )
-    
-    # Create dataloader
-    loader = create_single_dataloader(
-        manifest_path=str(manifest_path),
-        processor_id=config.model.hubert_model_id,
-        batch_size=config.training.batch_size,
-        num_workers=config.training.num_workers,
-        sampling_rate=config.data.sampling_rate,
-        max_audio_length=config.data.max_audio_length
-    )
-    
-    # Test batch loading
-    print("\nTesting DataLoader\n")
-    
-    for batch in loader:
-        print(f"✅ Batch loaded successfully")
-        print(f"   Input shape: {batch['input_values'].shape}")
-        print(f"   Labels shape: {batch['labels'].shape}")
-        print(f"   Attention mask shape: {batch['attention_mask'].shape}")
-        print(f"   Dysarthric labels: {batch['status'].tolist()}")
-        print(f"   Speakers: {batch['speakers']}")
-        break
-    
-    
-if __name__ == "__main__":
-    main()

@@ -111,7 +111,6 @@ def test2_learnable_constraint_gradient() -> None:
         phn_to_id=phn_to_id,
         id_to_phn=id_to_phn,
         symbolic_config=cfg.symbolic,
-        learnable=True,
     )
     logits = torch.randn(2, 10, len(phn_to_id))
     out = layer(logits)
@@ -226,8 +225,9 @@ def test7_compact_progress_callback_output() -> None:
         }
 
     class DummyConfig:
-        class training:
+        class TrainingConfig:
             max_epochs = 25
+        training = TrainingConfig
 
     class DummyModule:
         current_epoch = 3
@@ -240,7 +240,7 @@ def test7_compact_progress_callback_output() -> None:
         cb.on_validation_epoch_end(DummyTrainer(), DummyModule())
 
     out = buffer.getvalue()
-    assert "📈 Epoch" in out and "val/per" in out and "blank=" in out, (
+    assert "Epoch" in out and "val/per" in out and "blank=" in out, (
         f"Unexpected compact callback output: {out!r}"
     )
 

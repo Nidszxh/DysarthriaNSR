@@ -129,7 +129,7 @@ class LearnableConstraintMatrix(nn.Module):
         # distribution than C_static because softmax re-normalises.  Dividing
         # by init_temperature < 1.0 preserves the peakedness of the prior so
         # that softmax(logit_C / T) ≈ C_static at epoch 0.
-        log_init = init_matrix.clamp(1e-8).log() / init_temperature
+        log_init = init_matrix.clamp(1e-6).log() / init_temperature
         self.logit_C = nn.Parameter(log_init)
 
     @property
@@ -148,7 +148,7 @@ class LearnableConstraintMatrix(nn.Module):
             [B, T, |V|] constrained probabilities (row-normalised)
         """
         P_c = torch.matmul(P_neural, self.C)
-        return P_c / P_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return P_c / P_c.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
 # Symbolic Constraint Layer  (refactored to use LearnableConstraintMatrix)
@@ -173,7 +173,6 @@ class SymbolicConstraintLayer(nn.Module):
         id_to_phn: Dict[int, str],
         symbolic_config: SymbolicConfig,
         constraint_weight: float = 0.05,
-        learnable: bool = True,
         use_learnable_matrix: bool = True,
     ):
         super().__init__()
@@ -239,7 +238,7 @@ class SymbolicConstraintLayer(nn.Module):
                         decay_factor=self.config.distance_decay_factor,
                     )
 
-        row_sums = C.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        row_sums = C.sum(dim=1, keepdim=True).clamp_min(1e-6)
         return C / row_sums
 
     def forward(
@@ -264,7 +263,7 @@ class SymbolicConstraintLayer(nn.Module):
             P_constrained = self.learnable_matrix(P_neural)
         else:
             P_constrained = torch.matmul(P_neural, self.static_constraint_matrix)
-            P_constrained = P_constrained / P_constrained.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            P_constrained = P_constrained / P_constrained.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # Adaptive β based on severity
         if speaker_severity is not None:
@@ -274,7 +273,7 @@ class SymbolicConstraintLayer(nn.Module):
 
         # Weighted fusion
         P_final = beta_adaptive * P_constrained + (1 - beta_adaptive) * P_neural
-        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # Phase 3 Fix B: blank-frame constraint masking.
         # ~85% of CTC frames are blank-dominant.  Applying C to those frames only
@@ -284,7 +283,7 @@ class SymbolicConstraintLayer(nn.Module):
         blank_threshold = getattr(self.config, 'blank_constraint_threshold', 0.25)
         non_blank_mask = (P_neural[:, :, 0] < blank_threshold).unsqueeze(-1)  # [B, T, 1]
         P_final = torch.where(non_blank_mask, P_final, P_neural)
-        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # Track rule activations (inference only)
         shift_metric = None
@@ -308,10 +307,11 @@ class SymbolicConstraintLayer(nn.Module):
 
     def _compute_adaptive_beta(self, speaker_severity: torch.Tensor) -> torch.Tensor:
         """
-        β_adaptive = clamp(β_base + slope * severity/5.0, 0.0, 0.8)
+        β_adaptive = clamp(β_base + slope * severity / norm_constant, 0.0, 0.8)
         Higher severity → heavier reliance on symbolic constraints.
         """
-        sev_norm = speaker_severity.float() / 5.0
+        norm = float(getattr(self.config, 'severity_normalization_constant', 5.0))
+        sev_norm = speaker_severity.float() / norm
         beta_adaptive = self.beta + self.config.severity_beta_slope * sev_norm
         return torch.clamp(beta_adaptive, 0.0, 0.8).view(-1, 1, 1)
 
@@ -472,9 +472,9 @@ class SpecAugmentLayer(nn.Module):
     """
     SpecAugment applied to HuBERT hidden states [B, T, D] during training.
 
-    Applies independent random time and frequency masks per batch item.
-    Masked positions are zeroed (zero is close to the mean of layer-normalised
-    representations and is the standard default for hidden-state SpecAugment).
+    Applies independent random time and frequency masks per batch item using
+    fully vectorized broadcasting — no Python loops, no CPU/GPU syncs.
+    Masked positions are zeroed.
 
     Applied only when model.training is True; a no-op at eval/inference time.
 
@@ -497,56 +497,31 @@ class SpecAugmentLayer(nn.Module):
         self.time_mask_length = time_mask_length
         self.freq_mask_prob   = freq_mask_prob
         self.freq_mask_length = freq_mask_length
-        # Dedicated RNG makes mask sampling reproducible independent of Python random state.
-        self._rng = torch.Generator()
-        self._rng.manual_seed(torch.initial_seed())
-
-    def set_seed(self, seed: int) -> None:
-        """Set deterministic RNG seed for SpecAugment mask sampling."""
-        self._rng.manual_seed(int(seed))
-
-    def _randint_inclusive(self, low: int, high: int, device: torch.device = None) -> int:
-        """Inclusive integer sampling helper backed by torch.Generator."""
-        if high <= low:
-            return int(low)
-        # [PERF] Use on-device RNG when possible to avoid host-device sync.
-        if device is not None and device.type != 'cpu':
-            return int(torch.randint(low, high + 1, (1,), device=device).item())
-        return int(torch.randint(low, high + 1, (1,), generator=self._rng).item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[FIX-7] SpecAugment uses self.training only, decoupled from HuBERT freeze.
-
-        Previously tied to _hubert_is_frozen, which disabled augmentation during
-        warmup (epoch 0) even though downstream modules (classifier, adapter,
-        constraint layer) were actively training. Now active whenever model is
-        in training mode, providing regularization throughout all stages.
-        """
         if not self.training:
             return x
 
         B, T, D = x.shape
-        x = x.clone()
+        device = x.device
 
-        # ─ Time masking — independent masks per sample (§2.3 fix) ─────────
-        # [PERF] Mask tensor is built as a zeros_like so it lives on the same device
-        #        as x without any explicit .to() call.
+        # ── Time masking — fully vectorized ──
         n_time_masks = max(1, int(T * self.time_mask_prob))
-        for b in range(B):
-            for _ in range(n_time_masks):
-                t_len = self._randint_inclusive(1, self.time_mask_length, device=x.device)
-                t0 = self._randint_inclusive(0, max(0, T - t_len), device=x.device)
-                x[b, t0:t0 + t_len, :] = 0.0
+        t_starts = torch.randint(0, T, (B, n_time_masks, 1), device=device)
+        t_lens = torch.randint(1, self.time_mask_length + 1, (B, n_time_masks, 1), device=device)
+        t_idx = torch.arange(T, device=device).view(1, 1, T)
+        t_masks = (t_idx >= t_starts) & (t_idx < t_starts + t_lens)
+        time_mask = t_masks.any(dim=1, keepdim=True).transpose(1, 2)  # [B, T, 1]
 
-        # ─ Frequency masking — independent masks per sample ────────────────
+        # ── Frequency masking — fully vectorized ──
         n_freq_masks = max(1, int(D * self.freq_mask_prob))
-        for b in range(B):
-            for _ in range(n_freq_masks):
-                f_len = self._randint_inclusive(1, self.freq_mask_length, device=x.device)
-                f0 = self._randint_inclusive(0, max(0, D - f_len), device=x.device)
-                x[b, :, f0:f0 + f_len] = 0.0
+        f_starts = torch.randint(0, D, (B, n_freq_masks, 1), device=device)
+        f_lens = torch.randint(1, self.freq_mask_length + 1, (B, n_freq_masks, 1), device=device)
+        f_idx = torch.arange(D, device=device).view(1, 1, D)
+        f_masks = (f_idx >= f_starts) & (f_idx < f_starts + f_lens)
+        freq_mask = f_masks.any(dim=1, keepdim=True)  # [B, 1, D]
 
-        return x
+        return x * (~time_mask).float() * (~freq_mask).float()
 
 
 # Phoneme Classifier Head (unchanged)
@@ -621,16 +596,13 @@ class PhonemeClassifier(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        return_features: bool = False,
     ):
         x = self.projection(hidden_states)
         x = self.layer_norm(x)
         x = self.activation(x)
         x = self.dropout(x)
         logits = self.classifier(x)
-        if return_features:
-            return logits, x
-        return logits
+        return logits, x
 
 
 # Full NeuroSymbolicASR Model
@@ -747,7 +719,6 @@ class NeuroSymbolicASR(nn.Module):
             id_to_phn=id_to_phn,
             symbolic_config=symbolic_config,
             constraint_weight=model_config.constraint_weight_init,
-            learnable=model_config.constraint_learnable,
             use_learnable_matrix=model_config.use_learnable_constraint,
         )
         if model_config.use_learnable_constraint:
@@ -781,11 +752,6 @@ class NeuroSymbolicASR(nn.Module):
         """True when every HuBERT parameter has requires_grad=False."""
         return not any(p.requires_grad for p in self.hubert.parameters())
 
-    def _unfreeze_all_hubert(self) -> None:
-        """Enable gradients for all HuBERT parameters."""
-        for param in self.hubert.parameters():
-            param.requires_grad = True
-
     def freeze_encoder(self) -> None:
         """Freeze the entire HuBERT encoder (CNN + all transformer layers)."""
         for param in self.hubert.parameters():
@@ -803,12 +769,6 @@ class NeuroSymbolicASR(nn.Module):
                 for param in self.hubert.encoder.layers[idx].parameters():
                     param.requires_grad = True
             logger.info("Unfroze encoder layers %s", layers)
-
-    def unfreeze_after_warmup(self) -> None:
-        """Progressive unfreezing: re-enables upper layers after warmup epochs."""
-        self._unfreeze_all_hubert()
-        self._configure_frozen_layers()
-        logger.info("Unfroze HuBERT encoder (keeping configured frozen layers)")
 
     # Forward pass
 
@@ -904,7 +864,7 @@ class NeuroSymbolicASR(nn.Module):
 
         # ── Phoneme Classifier ────────────────────────────────────────────────
         logits_neural, shared_features = self.phoneme_classifier(
-            hidden_states, return_features=True
+            hidden_states
         )
 
         # ── Articulatory Auxiliary Heads (utterance-level via GAP) ──────────────
@@ -929,14 +889,16 @@ class NeuroSymbolicASR(nn.Module):
             output_lengths = self.hubert._get_feat_extract_output_lengths(
                 audio_lengths
             ).long()
+            if _downsample_applied:
+                output_lengths = (output_lengths + 1) // 2
         else:
-            pre_downsample_T = hidden_states.size(1)
+            # attention_mask is always provided by the collator, so this path
+            # is a safety fallback. hidden_states has already been downsampled
+            # if _downsample_applied is True — no double-downsampling.
             output_lengths = torch.full(
-                (hidden_states.size(0),), pre_downsample_T,
+                (hidden_states.size(0),), hidden_states.size(1),
                 dtype=torch.long, device=hidden_states.device,
             )
-        if _downsample_applied:
-            output_lengths = (output_lengths + 1) // 2
         output_lengths = output_lengths.clamp(max=hidden_states.size(1))
 
         # ── Q7: Neural-only short-circuit ─────────────────────────────────────
@@ -1005,9 +967,6 @@ class NeuroSymbolicASR(nn.Module):
         return result
 
     # Helpers
-
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def get_constraint_matrix(self) -> torch.Tensor:
         """Return the current constraint matrix (learned or static)."""

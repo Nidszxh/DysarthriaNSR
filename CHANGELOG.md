@@ -5,6 +5,124 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-06-11
+
+### Full Eval Results
+
+- **Canonical paper result** (v4_final, beam width=25, 20 MC samples, temperature calibration): macro-speaker PER=**0.137** (95% CI: [0.081, 0.208]), WER=0.120, I/D=1.9×. Per-neural (greedy sub-path): 0.134. Per-constrained (beam): 0.137. Symbolic Δ NOT significant (p=0.1114). Constraint precision: 6.1% helpful, 89.0% neutral, 4.9% harmful.
+- **Articulatory accuracy**: manner=80.5%, place=90.4%, voice=95.8%
+- **Uncertainty**: entropy mean=0.399, confidence mean=0.893
+- **Temperature calibration**: M05 τ=1.25, M01 τ=1.01
+- **Conclusion**: The full system (0.137 beam) ties the neural-only ablation (0.1346); the symbolic layer's value is in clinical interpretability rather than PER improvement.
+
+### Fixed
+
+- **CTC forced alignment batching** (`train.py::_compute_ce_loss_aligned`): replaced B per-sample `TAF.forced_align` calls with a single batched call. If the batched call fails, all samples gracefully fall back to `align_labels_to_logits`. Inner per-label loop optimized to zero `.item()` calls — uses tensor `prev_i`, `torch.where`, `seq.cpu()` one-time transfer, list instead of dict for label lookup.
+
+- **Gradient norm computation** (`train.py`): changed from `torch.cat` (giant temp tensor ~760 MB) to incremental L2 norm formula. Eliminates OOM risk on 8 GB GPU.
+
+- **BlankPriorKLLoss per-sample targets** (`src/models/losses.py`): changed from batch-mean severity target to per-sample KL targets. Controls get q=0.80, dysarthric get q=0.70 regardless of batch composition.
+
+- **Memory cache size** (`src/data/dataloader.py`): reduced `memory_cache_size` default from 2048 to 256. Per-worker cache drops from ~800 MB to ~100 MB; LRU cache provides near-zero benefit for shuffled train access.
+
+- **B1** (`evaluate.py`:923-924): removed bogus `n_ins` increment on substitution — was inflating insertion counts.
+
+- **B2** (`evaluate.py`:1824-1830): neural PER changed from per-utterance mean to per-speaker macro-mean — `delta_per` now compares apples-to-apples with constrained.
+
+- **B3** (`src/models/losses.py`:67-74): added `torch.nan_to_num(z, nan=0.0)` after `F.normalize` in `OrdinalContrastiveLoss` — prevents NaN from all-padding frames.
+
+- **B4** (`src/data/dataloader.py`:240-243): fixed non-contiguous articulatory vocab IDs — `i+3` changed to `len(vocab)`.
+
+- **N1 — Epsilon values** (`src/models/model.py`, `src/models/losses.py`, `src/models/uncertainty.py`, `train.py`): changed all `1e-8` epsilons to `1e-6` for BF16 numerical safety.
+
+- **Swallowed exception** (`train.py`:1058-1059): `except Exception: pass` changed to `except RuntimeError: logger.warning(..., exc_info=True)`.
+
+- **T1** (`tests/test_training_step.py`:178-220): rewrite fallback test to mock `TAF.forced_align` as raising — original never hit the fallback path.
+
+- **T2** (`tests/test_dataloader.py`:56): `assert != 0` changed to `assert == -100` — was checking wrong condition.
+
+- **T3** (`scripts/smoke_test.py`:243): removed emoji from assertion — fails on non-UTF-8 terminals.
+
+- **Callback output** (`train.py`:1501-1518): `_CompactFoldProgressCallback` now `print()`s in addition to `logger.info()`; emoji removed from log message.
+
+- **Config round-trip safety** (`src/utils/config.py`): `get_default_config()` now returns `copy.deepcopy(_default_config)` — prevents test/mutation leakage.
+
+### Changed
+
+- **`--ablation` default** (`run_pipeline.py`:420,725): changed from `"full"` to `None` — only overrides config when explicitly passed. Ablation mode falls back to config file or default.
+
+- **Unknown YAML key warning** (`src/utils/config.py`): added `logger.warning(...)` for unknown keys in `load_config` — no longer silently ignored.
+
+### Removed
+
+- **Dead code — model** (`src/models/model.py`): removed `_unfreeze_all_hubert`, `unfreeze_after_warmup`, `count_parameters`, `set_seed` stub, and unconditional `return_features=False` branch.
+
+- **Dead code — dataloader** (`src/data/dataloader.py`): removed `create_single_dataloader` + `main()` — never called from pipeline or tests.
+
+- **Dead config fields** (`src/utils/config.py`): removed `constraint_learnable`, `log_gradients`, `log_model_architecture`, `save_predictions`, `save_confusion_matrix`, `save_attention_maps`, `temperature_default` — zero external references.
+
+## [0.5.0] — 2026-06-09
+
+### Fixed
+
+- **CTC forced alignment fallback** (`train.py::_compute_ce_loss_aligned`): replaced silent label-drop with proportional interpolation (`align_labels_to_logits`) when `torchaudio.functional.forced_align` produces no valid frames.
+  - Previously dropped the sample from CE supervision without notification, silently reducing effective CE supervision.
+
+- **StratifiedMicroBatchSampler zero-length guard** (`train.py`): added `len()` guard against `n_ctrl == 0` (division by zero).
+  - Previously crashed when a batch had zero control speakers.
+
+- **Stratified sampler DataLoader kwargs** (`train.py::create_dataloaders`): filtered out `batch_size`, `shuffle`, `sampler`, `drop_last` when `batch_sampler` is provided.
+  - Previously raised `ValueError` from PyTorch for mutually exclusive DataLoader arguments.
+
+- **Logging format error** (`train.py::_MetricLoggerCallback.on_validation_epoch_end`): fixed `%8s` → `width` for blank probability metric in epoch summary.
+
+- **Lazy forced_align import** (`train.py:521`): hoisted `from torchaudio.functional import forced_align` from per-batch hot path to module-level `import torchaudio.functional as TAF`.
+  - Eliminated ~50ms redundant import overhead on every training step across all epochs.
+
+- **Dead dir() guard** (`run_pipeline.py:544`): removed `'val_loader' in dir()` — unnecessary when `val_loader` is unconditionally assigned from return value.
+
+### Changed
+
+- **All print() → logger.info()** (`train.py`): converted 29 `print()` calls in `_CompactFoldProgressCallback` and `run_loso()` to `logger.info()` for structured log capture.
+  - Enables log-level filtering and consistent MLflow/console output formatting.
+
+- **Staged loss weight scheduling** (`train.py::on_train_epoch_start`): added 3-stage warmup for `lambda_ordinal` (0.01→0.03→0.05 across epochs 10/20) and `lambda_symbolic_kl` (0.1→0.3→0.5 across epochs 5/15).
+  - Prevents ordinal and symbolic constraints from interfering with basic phoneme discrimination during early training.
+
+- **Weighted loss breakdown logging** (`train.py::_MetricLoggerCallback.on_train_epoch_end`): logs each loss component's raw magnitude × λ with percentage of weighted total.
+  - Enables one-shot hyperparameter balance audit without running separate diagnostic runs.
+
+- **Configurable severity constant** (`src/utils/config.py:SymbolicConfig`): added `severity_normalization_constant: float = 5.0`; propagated to `_compute_adaptive_beta`, `_get_batch_severity`, and `evaluate_model` fallback.
+  - Allows tuning beta scaling without hardcoded TORGO ceiling assumption.
+
+- **Config roundtrip YAML fix** (`src/utils/config.py::to_dict`): converts `tuple` to `list` for safe YAML serialization.
+  - Previously produced `!!python/tuple` tags that broke config reload.
+
+- **Third-party logger suppression** (`run_pipeline.py`): set `huggingface_hub`, `httpx`, `httpcore`, `transformers`, `pytorch_lightning`, `urllib3`, `requests` to `WARNING`; added `warnings.filterwarnings` for HF_TOKEN unauthenticated request warning.
+
+### Added
+
+- **Per-speaker temperature calibration** (`evaluate.py`): added `calibrate_speaker_temperatures` function and `--calibrate-temperature` CLI flag.
+  - Enables temperature scaling tuned per held-out speaker for improved beam-search calibration.
+
+- **Row entropy penalty** (`src/models/losses.py:SymbolicKLLoss`): added `constraint_entropy_penalty_weight` (default 0.05) to regularize constraint matrix row entropy toward static prior.
+  - Discourages degenerate row distributions in the learnable constraint matrix.
+
+- **Stratified micro-batch sampler** (`train.py`): added `StratifiedMicroBatchSampler` with 3:1 dysarthric/control interleaving, gated by `use_stratified_micro_batch` + `stratified_dysarthric_ratio` in `TrainingConfig`.
+  - Ensures every micro-batch sees both dysarthric and control samples for stable severity adaptation.
+
+### Removed
+
+- **Dead code**: removed duplicate `lambda_ce: float = 0.05` (overridden by `0.15`); removed unused `import pandas as pd` from `evaluate.py`; removed unused `NeuroSymbolicCollator` import from `run_pipeline.py`; removed 4 lazy imports inside hot loops (hoisted to module level).
+
+- **Heuristic test runs**: removed 6 temporary loss-audit directories from `checkpoints/` and `results/`.
+
+### Hyperparameter Audit (empirical, epoch 3)
+
+Raw loss magnitudes confirmed balanced: CTC=3.60 (79.9%), CE=3.76 (15.6%), Art=1.45 (3.2%),
+BlankKL=0.06 (0.3%), Ordinal=1.38 (1.9%), SymKL=0.27 (3.7%). No loss term is dominated or silent.
+All λ values left at existing defaults.
+
 ## [0.4.0] — 2026-05-13
 
 ### Fixed

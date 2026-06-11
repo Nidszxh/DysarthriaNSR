@@ -1,5 +1,6 @@
 import hashlib
 import concurrent.futures
+import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass, field
@@ -11,14 +12,15 @@ import pandas as pd
 from datasets import Audio, load_dataset
 from tqdm import tqdm
 
-try:
-    from src.utils.constants import PHONEME_DETAILS
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.utils.constants import PHONEME_DETAILS
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from src.utils.constants import PHONEME_DETAILS
+
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
+
 
 @dataclass(frozen=True)
 class DataPaths:
@@ -27,12 +29,13 @@ class DataPaths:
     data_dir: Path = field(init=False)
     raw_dir: Path = field(init=False)
     processed_dir: Path = field(init=False)
-    
+
     def __post_init__(self):
         # Set derived paths to match the finalized project structure
         object.__setattr__(self, "data_dir", self.root / "data")
         object.__setattr__(self, "raw_dir", self.data_dir / "raw")
         object.__setattr__(self, "processed_dir", self.data_dir / "processed")
+
 
 MIN_PHONEME_COUNT = 2
 MAX_PHONEMES_PER_SEC = 20
@@ -40,14 +43,16 @@ MAX_PHONEMES_PER_SEC = 20
 
 class SymbolicProcessor:
     """Handles G2P and phoneme-to-articulatory mapping."""
+
     def __init__(self):
         try:
-            import g2p_en, nltk
+            import g2p_en
+            import nltk
             nltk.download('averaged_perceptron_tagger_eng', quiet=True)
             self.g2p = g2p_en.G2p()
         except Exception:
             self.g2p = None
-            print("⚠️ g2p_en not found. Phoneme extraction will be skipped.")
+            logger.warning("g2p_en not found. Phoneme extraction will be skipped.")
 
     @lru_cache(maxsize=2048)
     def get_features(self, text: str) -> Dict[str, object]:
@@ -84,6 +89,7 @@ class SymbolicProcessor:
             "count": len(phonemes),
         }
 
+
 def calculate_audio_metrics(audio_path: Path) -> Dict:
     """Extracts RMS energy and duration. Designed for parallel execution."""
     try:
@@ -91,11 +97,11 @@ def calculate_audio_metrics(audio_path: Path) -> Dict:
         y, sr = librosa.load(str(audio_path), sr=None)
         if len(y) == 0:
             return {"rms": 0.0, "duration": 0.0}
-        
+
         rms = np.mean(librosa.feature.rms(y=y))
         duration = len(y) / sr
         return {
-            "rms": round(float(rms), 6), 
+            "rms": round(float(rms), 6),
             "duration": round(float(duration), 3)
         }
     except Exception:
@@ -103,38 +109,39 @@ def calculate_audio_metrics(audio_path: Path) -> Dict:
 
 # --- MAIN PIPELINE ---
 
+
 def main():
     paths = DataPaths()
     paths.processed_dir.mkdir(parents=True, exist_ok=True)
     processor = SymbolicProcessor()
-    
+
     # 1. Load Metadata with DECODING DISABLED
-    print(f"Loading Metadata (Cache: {paths.data_dir})")
+    logger.info("Loading Metadata (Cache: %s)", paths.data_dir)
     # By using decode=False here, 'audio' stays a dict with a 'path' key
     ds = load_dataset("abnerh/TORGO-database", cache_dir=str(paths.data_dir))
     ds = ds.cast_column("audio", Audio(decode=False))
-    
+
     # 2. Index Local Files
-    print(f"Indexing {paths.raw_dir}/audio...")
+    logger.info("Indexing %s/audio...", paths.raw_dir)
     local_files = {f.name: f for f in paths.raw_dir.rglob("*.wav")}
-    print(f"Found {len(local_files)} local files.")
-    
+    logger.info("Found %d local files.", len(local_files))
+
     # 3. Match Metadata to Local Files
     matched_samples = []
     for split in ds.keys():
         for sample in tqdm(ds[split], desc=f"Matching {split}"):
             audio_info = sample.get("audio", {})
             hf_raw_path = audio_info.get("path", "")
-        
+
             if hf_raw_path:
                 # Replicate the hashing logic from your download script
                 path_hash = hashlib.md5(hf_raw_path.encode()).hexdigest()[:8]
                 speaker = sample.get('speaker_id', 'unknown')
                 original_name = Path(hf_raw_path).name
-            
+
                 # This matches the filename format: {speaker}_{hash}_{name}
                 expected_filename = f"{speaker}_{path_hash}_{original_name}"
-            
+
                 if expected_filename in local_files:
                     matched_samples.append({
                         "metadata": sample,
@@ -143,26 +150,26 @@ def main():
                     })
 
     if not matched_samples:
-        print("\nZero matches. Debugging path strings...")
+        logger.warning("Zero matches. Debugging path strings...")
         test_sample = ds['train'][0]['audio']
-        print(f"Metadata Audio Dict: {test_sample}")
-        print(f"Sample Filename: {Path(test_sample.get('path', '')).name}")
+        logger.warning("Metadata Audio Dict: %s", test_sample)
+        logger.warning("Sample Filename: %s", Path(test_sample.get('path', '')).name)
         return
 
-    print(f"Matched {len(matched_samples)} local files.")
+    logger.info("Matched %d local files.", len(matched_samples))
 
     # 4. Parallel Audio Metrics Extraction
-    print(f"Analyzing audio metrics...")
+    logger.info("Analyzing audio metrics...")
     with concurrent.futures.ProcessPoolExecutor() as executor:
         local_paths = [s["local_path"] for s in matched_samples]
         metrics_results = list(tqdm(
-            executor.map(calculate_audio_metrics, local_paths), 
+            executor.map(calculate_audio_metrics, local_paths),
             total=len(local_paths),
             desc="Audio Analysis"
         ))
 
     # 5. Assemble Final Manifest
-    print("Generating symbolic phoneme sequences...")
+    logger.info("Generating symbolic phoneme sequences...")
     rows = []
     for bundle, metrics in zip(matched_samples, metrics_results):
         if metrics["duration"] < 0.1:
@@ -171,7 +178,7 @@ def main():
         meta = bundle["metadata"]
         path = bundle["local_path"]
         transcript = meta.get("transcription", "").strip().upper()
-        
+
         features = processor.get_features(transcript)
         if features["count"] < MIN_PHONEME_COUNT:
             continue
@@ -210,11 +217,11 @@ def main():
     df = pd.DataFrame(rows)
     out_path = paths.processed_dir / "torgo_neuro_symbolic_manifest.csv"
     df.to_csv(out_path, index=False)
-    
-    print(f"\nMANIFEST GENERATION COMPLETE")
-    print(f"Output: {out_path}")
-    print(f"Total Samples: {len(df)}")
-    print(f"Total Hours:   {df['duration'].sum() / 3600:.2f} hrs")
+
+    logger.info("MANIFEST GENERATION COMPLETE")
+    logger.info("Output: %s", out_path)
+    logger.info("Total Samples: %d", len(df))
+    logger.info("Total Hours: %.2f hrs", df['duration'].sum() / 3600)
 
 
 if __name__ == "__main__":

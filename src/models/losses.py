@@ -42,7 +42,7 @@ class OrdinalContrastiveLoss(nn.Module):
         temperature: Optional softmax temperature for scaled cosine similarity.
     """
 
-    def __init__(self, margin_per_level: float = 0.3, temperature: float = 1.0):
+    def __init__(self, margin_per_level: float = 0.3, temperature: float = 1.0) -> None:
         super().__init__()
         self.margin_per_level = margin_per_level
         self.temperature = temperature
@@ -70,6 +70,8 @@ class OrdinalContrastiveLoss(nn.Module):
             z = hidden_states.mean(dim=1)  # [B, 768]
 
         z = F.normalize(z, dim=-1)  # Unit-sphere projection
+        # Guard: zero-norm embeddings (all-padding mask) produce NaN after normalize
+        z = torch.nan_to_num(z, nan=0.0)
 
         # ── Pairwise cosine similarity ────────────────────────────────────────
         sim = torch.matmul(z, z.T) / self.temperature  # [B, B]
@@ -121,7 +123,7 @@ class BlankPriorKLLoss(nn.Module):
             insertion bias).
     """
 
-    def __init__(self, blank_id: int = 0, target_prob: float = 0.75):
+    def __init__(self, blank_id: int = 0, target_prob: float = 0.75) -> None:
         super().__init__()
         self.blank_id = blank_id
         self.register_buffer("target_prob", torch.tensor(target_prob, dtype=torch.float32))
@@ -145,24 +147,26 @@ class BlankPriorKLLoss(nn.Module):
         probs = log_probs.exp()  # [B, T, V]
         blank_probs = probs[:, :, self.blank_id]  # [B, T]
 
+        eps = 1e-7
+        B = log_probs.size(0)
+
+        # Per-sample blank probability (instead of batch-mean) so that
+        # mixed dysarthric/control batches get correct per-group targets.
         if attention_mask is not None:
             mask = attention_mask.float()  # [B, T]
-            total = mask.sum().clamp_min(1.0)
-            p_blank_mean = (blank_probs * mask).sum() / total
+            p_per_sample = (blank_probs * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)  # [B]
         else:
-            p_blank_mean = blank_probs.mean()
+            p_per_sample = blank_probs.mean(dim=1)  # [B]
+        p = p_per_sample.clamp(eps, 1.0 - eps)
 
-        # Clamp to numerical stability
-        eps = 1e-7
-        p = p_blank_mean.clamp(eps, 1.0 - eps)
+        # Per-sample target: control (severity=0) -> 0.80, severe (severity=5) -> 0.70.
         if severity is not None:
-            # Control (severity=0) -> 0.80, severe (severity=5) -> 0.70.
-            sev_norm = severity.float().mean().clamp(0.0, 5.0) / 5.0
+            sev_norm = severity.float().clamp(0.0, 5.0) / 5.0
             q = (0.80 - 0.10 * sev_norm).clamp(eps, 1.0 - eps)
         else:
-            q = self.target_prob.clamp(eps, 1.0 - eps)
+            q = self.target_prob.expand(B).clamp(eps, 1.0 - eps)
 
-        # KL(Bernoulli(p) || Bernoulli(q))
+        # Per-sample KL(Bernoulli(p_i) || Bernoulli(q_i)), then mean across batch
         kl = p * (p / q).log() + (1.0 - p) * ((1.0 - p) / (1.0 - q)).log()
         return kl.mean()
 
@@ -195,11 +199,16 @@ class SymbolicKLLoss(nn.Module):
     Formula: loss = (1/V) Σ_i KL(C_learned[i] || C_static[i]) + λ_blank * C[:, 0].mean()
     """
 
-    def __init__(self, static_matrix: torch.Tensor, blank_penalty_weight: float = 0.0):
+    def __init__(self, static_matrix: torch.Tensor, blank_penalty_weight: float = 0.0,
+                 entropy_penalty_weight: float = 0.05) -> None:
         super().__init__()
-        # Store as log-probability reference (not a parameter)
-        self.register_buffer("log_prior", static_matrix.clamp(1e-8).log())
+        self.register_buffer("log_prior", static_matrix.clamp(1e-6).log())
         self.blank_penalty_weight = float(blank_penalty_weight)
+        self.entropy_penalty_weight = float(entropy_penalty_weight)
+        # Compute target entropy from prior rows — makes regularizer data-adaptive
+        with torch.no_grad():
+            p = static_matrix.clamp(1e-6)
+            self.target_entropy = float(-(p * p.log()).sum(dim=-1).mean())
 
     def forward(self, logit_C: torch.Tensor) -> torch.Tensor:
         """
@@ -227,6 +236,16 @@ class SymbolicKLLoss(nn.Module):
             reduction="sum",
             log_target=True,
         ) / log_learned.size(0)
+
+        # Row entropy regularizer: penalize deviation from target entropy
+        # Prevents both collapse (entropy→0) and diffusion (entropy→log V)
+        if self.entropy_penalty_weight > 0.0:
+            C = log_learned.exp()
+            eps = 1e-6
+            row_entropy = -(C * C.clamp(eps).log()).sum(dim=-1)  # [V]
+            entropy_loss = ((row_entropy - self.target_entropy) ** 2).mean()
+            kl = kl + self.entropy_penalty_weight * entropy_loss
+
         if self.blank_penalty_weight > 0.0:
             c_learned = torch.softmax(logit_C, dim=-1)
             blank_penalty = c_learned[:, 0].mean()

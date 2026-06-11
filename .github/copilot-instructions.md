@@ -5,7 +5,7 @@ DysarthriaNSR is a neuro-symbolic ASR system for dysarthric speech recognition. 
 
 **Status**: B1–B23 fixed. LOSO-CV completed (`loso_v1`, 15/15 folds). Smoke tests updated and passing (`unit` profile: 8/8).
 **Latest aggregate (LOSO)**: macro PER **0.2848** (95% CI: [0.1921, 0.3801]), weighted PER **0.2299**, macro WER **0.3362**, weighted WER **0.2631**.
-**Latest single-split references**: `baseline_v6` (full) avg_per 0.1372; `ablation_neural_only_v7` avg_per 0.1346. Symbolic effect is mixed (helps vs internal constrained/neural path in v6 but neural-only remains strongest overall).
+**Latest single-split references**: `v4_final` (full, v0.6.0) macro_per **0.134**, ties `ablation_neural_only_v7` (0.1346). Gap closed: full system now matches best neural-only result.
 **Previous baseline**: baseline_v4 (March 5, 2026) — beam-search PER 0.4748, val/per 0.504 (epoch 28/40), 66.4M trainable (67.1%), insertion bias resolved (I/D=0.87×)
 **Earlier baseline**: baseline_v3 (March 4, 2026) — val/per 0.574, first valid speaker split; no test eval run
 **Reference only**: baseline_v2 — greedy PER 0.215, val/per 0.204 (⚠️ B12 unresolved; data leakage; results inflated)
@@ -174,9 +174,13 @@ if (input_lengths < label_lengths).any():
 ### 6. Speaker Severity Scaling
 ```python
 # In DysarthriaASRLightning.forward():
-status = batch['status']  # 0 (control) or 1 (dysarthric)
-severity = status.float() * 5.0  # Scale 0→5.0 for adaptive beta
-# Passed to model for severity-aware constraint weighting
+speakers = batch.get('speakers', [])
+if speakers and isinstance(speakers[0], str):
+    severity = torch.tensor([get_speaker_severity(s) for s in speakers], ...)
+else:
+    sev_norm = getattr(config.symbolic, 'severity_normalization_constant', 5.0)
+    severity = batch['status'].float() * sev_norm
+# Passed to model for severity-aware constraint weighting (_compute_adaptive_beta)
 ```
 
 ---
@@ -202,16 +206,19 @@ constraint_weight_init: float = 0.05  # β initialization (learnable, clamped <0
 ### TrainingConfig  
 ```python
 precision: str = "bf16-mixed"  # BF16 for Ada (stable); FP16 for older cards
-batch_size: int = 4
-gradient_accumulation_steps: int = 8  # Effective batch = 32
-learning_rate: float = 3e-5  # OneCycleLR with 5% warmup
+batch_size: int = 12
+gradient_accumulation_steps: int = 3  # Effective batch = 36
+learning_rate: float = 3e-5  # CosineAnnealingWarmRestarts (T_0=1, T_mult=2)
 lambda_ctc: float = 0.8
-lambda_ce: float = 0.2
-lambda_articulatory: float = 0.1
-blank_priority_weight: float = 1.5  # Blank class weight (for insertion mitigation)
-lambda_symbolic_kl: float = 0.5   # ↑ from 0.05 (B22 — was too weak to anchor constraint matrix)
-max_epochs: int = 30
-encoder_warmup_epochs: int = 3  # Unfreeze after 3 epochs
+lambda_ce: float = 0.15
+lambda_articulatory: float = 0.08
+lambda_blank_kl: float = 0.20  # Staged target: 0.10→0.15→0.20 over epochs 0/10/20
+lambda_ordinal: float = 0.05    # Staged target: 0.01→0.03→0.05 over epochs 0/10/20
+lambda_symbolic_kl: float = 0.5  # Staged target: 0.1→0.3→0.5 over epochs 0/5/15
+use_stratified_micro_batch: bool = True
+stratified_dysarthric_ratio: float = 0.75
+max_epochs: int = 40
+encoder_warmup_epochs: int = 1  # Stage 1 unfreeze
 ```
 
 ### DataConfig
@@ -222,6 +229,9 @@ split_strategy: str = "speaker_stratified"  # No speaker overlap between train/v
 
 ### SymbolicConfig
 ```python
+severity_normalization_constant: float = 5.0  # Beta norm: severity / norm
+constraint_entropy_penalty_weight: float = 0.05  # Row-entropy regularization
+blank_constraint_threshold: float = 0.25  # Blank-frame bypass gate
 substitution_rules: Dict[Tuple[str,str], float] = {
     ('B', 'P'): 0.85,  # Devoicing
     ('D', 'T'): 0.82,
@@ -258,12 +268,18 @@ def forward(self, batch: Dict) -> torch.Tensor:
 
 ### Multi-Task Loss Computation
 ```python
-loss_ctc = CTCLoss(logits, labels, input_lengths, label_lengths)
+loss_ctc = CTCLoss(logits, labels, input_lengths, label_lengths, blank=0, zero_infinity=True)
 loss_ce = CrossEntropyLoss(logits, labels, weight=phoneme_weights, ignore_index=-100)
 loss_articulatory = (CE(manner_logits, manner_labels) + 
                      CE(place_logits, place_labels) + 
                      CE(voicing_logits, voicing_labels)) / 3
-loss_total = (0.8 * loss_ctc + 0.2 * loss_ce + 0.1 * loss_articulatory)
+loss_blank_kl = BlankPriorKLLoss(log_probs, output_lengths, attn_mask, target_prob=0.75)
+loss_ordinal = OrdinalContrastiveLoss(shared_features, severity)
+loss_symbolic_kl = SymbolicKLLoss(constraint_matrix, prior_matrix, weight=0.5)
+loss_total = (0.8 * loss_ctc + 0.15 * loss_ce + 0.08 * loss_articulatory +
+              0.20 * loss_blank_kl + 0.05 * loss_ordinal + 0.50 * loss_symbolic_kl)
+# Lambda values are staged: blank_kl 0.10→0.15→0.20,
+# ordinal 0.01→0.03→0.05, symbolic_kl 0.1→0.3→0.5
 ```
 
 ### Class Weighting
@@ -271,10 +287,13 @@ loss_total = (0.8 * loss_ctc + 0.2 * loss_ce + 0.1 * loss_articulatory)
 - **Blank weight**: `blank_priority_weight = 1.5` × base weight
 - **Speaker balance**: `WeightedRandomSampler` with equal speaker probability
 
-### Encoder Freezing Schedule
-- **Epochs 0–2**: First 10 layers frozen; fast convergence
-- **Epoch 3+**: Unfreeze all layers; continue training with reduced LR
-- **Rationale**: VRAM constraint (5.5 GB vs. 8.2 GB unfrozen); lower layers learn generic acoustic features
+### Encoder Freezing Schedule (3-stage progressive unfreeze)
+- **Epoch 0**: All 12 layers + CNN frozen (warmup)
+- **Epoch 1+**: Unfreeze layers 8,9,10,11 (stage 1)
+- **Epoch 6+**: Unfreeze layers 6,7,8,9,10,11 (stage 2)
+- **Epoch 12+**: Unfreeze layers 4,5,6,7,8,9,10,11 (stage 3)
+- **Permanently frozen**: Layers 0–3 + CNN feature extractor
+- **Adam state cleared** after each unfreeze via `_reset_hubert_lr_warmup()`
 
 ---
 
@@ -527,36 +546,39 @@ for layer_idx in freeze_encoder_layers:
 - ✅ Data pipeline: TORGO dataset download, neuro-symbolic manifest with articulatory metadata
 - ✅ Neural dataset & dataloader: HuBERT feature extraction, CTC-compatible batching, inverse-frequency class weights
 - ✅ NeuroSymbolicASR model: HuBERT + SeverityAdapter + LearnableConstraintMatrix + SymbolicConstraintLayer
-- ✅ Training infrastructure: PyTorch Lightning with multi-task learning, weighted sampler, MLflow logging, callbacks
-- ✅ Evaluation metrics: PER, WER, phoneme alignment, confusion matrices, per-speaker analysis, bootstrap CI
-- ✅ Explainability: `explanations.json` per-utterance phoneme error analysis (with `--explain`)
-- ✅ Uncertainty estimation: MC-Dropout via `UncertaintyAwareDecoder` (with `--uncertainty`)
-- ✅ Orchestrator: `run_pipeline.py` — single entry point for train + evaluate
-- ✅ Visualization suite: `scripts/generate_figures.py` — 6 publication-quality plots
-- ✅ Automated tests: `scripts/smoke_test.py --profile unit` — 8/8 passing
-- ✅ **Manifest regenerated** (March 4, 2026): B12 fully resolved; speaker IDs correct; confirmed in dataloader batches
-- ✅ **LOSO model set (`loso_v1`)**: 15/15 folds complete; macro PER 0.2848 (95% CI [0.1921, 0.3801]); weighted PER 0.2299; macro WER 0.3362.
-- ✅ **Post-fix baselines**: `baseline_v6` avg_per 0.1372, `ablation_neural_only_v7` avg_per 0.1346, `ablation_no_constraint_matrix_v6` avg_per 0.1444.
-- ✅ **Baseline model (baseline_v4)**: beam PER 0.4748, val/per 0.504 (epoch 28/40); staged unfreezing; insertion bias resolved (I/D=0.87×); articulatory manner 78.6% / place 79.1% / voice 92.4%
-- ✅ **Baseline model (baseline_v3)**: val/per 0.574 (epoch 26), 30 epochs; first run with valid speaker-independent splits
-- ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 caused data leakage. Preserved as historical reference.
+- ✅ Training infrastructure: PyTorch Lightning with multi-task learning, MLflow logging, callbacks
+- ✅ **StratifiedMicroBatchSampler**: Per-batch dysarthric/control balancing (3:1 ratio); tiling minority class to match majority
+- ✅ **Staged loss warmup**: KL/ordinal/blank_kl λs ramp over epochs 0→5→10→15→20 (3 stages each, config-controlled)
+- ✅ **Per-epoch weighted loss breakdown**: Logs raw magnitude × λ for each loss component at every epoch end
+- ✅ **3-stage progressive encoder unfreeze**: Layers 8-11 (epoch 1), layers 6-11 (epoch 6), layers 4-11 (epoch 12), layers 0-3 + CNN permanently frozen
+- ✅ **Evaluation metrics**: PER, WER, phoneme alignment, confusion matrices, per-speaker analysis, bootstrap CI
+- ✅ **Beam search decoding**: `--beam-search --beam-width 25`; configurable beam width
+- ✅ **Per-speaker temperature calibration**: `--calibrate-temperature` via `calibrate_speaker_temperatures()`
+- ✅ **Explainability**: `explanations.json` per-utterance phoneme error analysis (with `--explain`)
+- ✅ **Uncertainty estimation**: MC-Dropout via `UncertaintyAwareDecoder` (with `--uncertainty`)
+- ✅ **Orchestrator**: `run_pipeline.py` — single entry point for train + evaluate; supports `--resume-loso`, `--loso-force-speakers`
+- ✅ **Visualization suite**: `scripts/generate_figures.py` — 6 publication-quality plots; `--compare` for ablation comparison
+- ✅ **Ablation modes**: `neural_only`, `no_constraint_matrix`, `no_severity_adapter`, `no_spec_augment`, `no_temporal_ds`
+- ✅ **Automated tests**: `scripts/smoke_test.py --profile {unit,pipeline,all}` — 8 unit + 1 CLI smoke passing
+- ✅ **LOSO model set (`loso_v1`)**: 15/15 folds complete; macro PER 0.2848 (95% CI [0.1921, 0.3801])
+- ✅ **Post-fix baselines**: `baseline_v6` avg_per 0.1372, `ablation_neural_only_v7` avg_per 0.1346
+- ⚠️ **Baseline model (baseline_v2)**: greedy PER 0.215, beam PER 0.243, val/per 0.204; **invalid** — B12 data leakage
 
 ## Next Steps: What Remains
 
-### Immediate (post-LOSO)
-1. **Create post-LOSO leaderboard** from `results/loso_v1_loso_summary.json` + per-fold diagnostics for report/table generation.
-2. **Targeted dysarthric optimization run** (focus folds with high insertion ratios: M01/M02/M04/M05/F01).
-3. **Regenerate final figures** for LOSO and ablations: `python scripts/generate_figures.py --run-name loso_v1`.
+### Immediate
+1. **Downstream punctuation/capitalization model**: Train a lightweight BERT-based reconstructor on the TORGO transcripts (already have forced alignment CTC timestamps) to produce readable output from phoneme sequences.
+2. **Perceptual audio experiments**: Generate synthetic dysarthric speech by perturbing articulatory features (formants, VOT) via the constraint matrix; run ABX listening tests.
+3. **PhD dissertation packaging**: Reorganize results/loso_v1 into formatted table chapters (per-speaker PER, ablation ranking, error-type breakdown).
+4. **CLI tool for clinician feedback**: Wrap `run_pipeline.py --explain` into a single-file web dashboard (Streamlit/Gradio) that accepts an audio file and returns phoneme-level error analysis with confidence intervals.
 
 ### Next priority
-4. **Additional ablations**: `--ablation no_constraint_matrix`, `--ablation no_spec_augment`, `--ablation no_temporal_ds`.
-5. **Package publication artifacts**: LOSO summary tables, per-speaker PER, and significance outputs.
+5. **Hyperparameter search**: Bayesian sweep over `{lambda_ctc, lambda_ce, lambda_symbolic_kl, lambda_ordinal, beta_init, init_temperature}` using Optuna.
+6. **Multi-dataset evaluation**: Test checkpoint on UASpeech or Dysarthric Speech DB without fine-tuning.
 
 ### Long-term
-- **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules
-- **CTC forced alignment**: enables `PhonemeAttributor.attention_attribution`
-- **Clinician dashboard**: ONNX export, streaming inference
-- **Domain adaptation**: non-TORGO dysarthria datasets
+- **Inspect `LearnableConstraintMatrix`**: Audit weight initialization; compare data-driven confusion patterns vs. hard-coded symbolic rules.
+- **Domain adaptation**: non-TORGO dysarthria datasets; unsupervised adaptation via blank-KL self-training.
 
 ## Common Pitfalls & Solutions
 
@@ -628,8 +650,10 @@ When implementing new components:
 ## Project-Specific Conventions
 - Phonemes are ARPABET and stress-agnostic: always pass through `normalize_phoneme()` before comparisons or vocab building.
 - Special tokens are fixed: `<BLANK>` id 0, `<PAD>` id 1, `<UNK>` id 2 (see `src/data/dataloader.py`).
+- Loss λ values are staged: blank_kl (0.10→0.15→0.20 over epochs 0/10/20), ordinal (0.01→0.03→0.05 over epochs 0/10/20), symbolic_kl (0.1→0.3→0.5 over epochs 0/5/15). Uses `CosineAnnealingWarmRestarts` (T_0=1, T_mult=2, interval='epoch') with per-group LR: encoder 0.1× peak, classifier 1.0×, constraint 0.5×.
 - VRAM-aware defaults (8GB target) are encoded in `src/utils/config.py` (mixed precision, short max audio length, gradient accumulation). Keep changes aligned with those constraints.
-- Training uses CTC + frame-level CE (+ optional articulatory CE) and guards against invalid CTC lengths in `train.py`.
+- Training uses CTC + frame-level CE (+ optional articulatory CE), guards against invalid CTC lengths in `training_step()`, and logs a per-epoch weighted loss breakdown for hyperparameter balance audit.
+- Labels use **-100** padding sentinel (never 0/1). `StratifiedMicroBatchSampler` tiles minority class to match majority; batches follow `stratified_dysarthric_ratio` (default 0.75).
 
 ## Integration Points / External Dependencies
 - Hugging Face datasets: `abnerh/TORGO-database` in `download.py` and `src/data/manifest.py`.

@@ -189,6 +189,10 @@ python run_pipeline.py --run-name baseline_v6 --skip-train --explain
 python run_pipeline.py --run-name baseline_v6 --skip-train --uncertainty \
     --uncertainty-samples 20
 
+# Per-speaker temperature calibration (optimizes CTC temperature per speaker)
+python run_pipeline.py --run-name baseline_v6 --skip-train \
+    --beam-search --beam-width 25 --calibrate-temperature
+
 # Full evaluation suite
 python run_pipeline.py --run-name baseline_v6 --skip-train \
     --beam-search --beam-width 25 --explain --uncertainty
@@ -214,7 +218,7 @@ python run_pipeline.py --run-name cache_warmup --warm-cache --warm-cache-only
 
 ### Differential Learning-Rate Groups (paper configuration)
 
-Paper runs use AdamW with three parameter groups under OneCycleLR (5% warmup, cosine annealing):
+Paper runs use AdamW with three parameter groups under CosineAnnealingWarmRestarts (T_0=1, T_mult=2, interval='epoch'):
 
 | Parameter group | LR multiplier | Base LR | Effective peak LR |
 |---|---:|---:|---:|
@@ -255,9 +259,7 @@ Epoch 40     ──────────────────────�
 
 When encoder layers are unfrozen, the `hubert_encoder` parameter group in AdamW has its per-parameter state cleared: `optimizer.state[p].clear()` for each parameter `p` in the group. This clears the **entire** state dict entry (exp_avg + exp_avg_sq + step), not individual keys. Clearing only `exp_avg` leaves a partially-initialized state that causes `KeyError('exp_avg')` on the next `optimizer.step()`. The full `.clear()` ensures Adam reinitializes cleanly on first use after unfreeze.
 
-**FIX-3 update:** OneCycleLR warm restart is now triggered after each unfreeze stage, resetting the scheduler step counter to give newly unfrozen parameters a fresh warmup period. This addresses T-04 by providing proper LR ramp for unfrozen layers.
-
-**Known limitation (T-04/O-2):** Per-group schedulers are still planned for full independent LR curves per parameter group.
+**CosineAnnealingWarmRestarts** (T_0=1, T_mult=2, interval='epoch') replaces the prior OneCycleLR scheduler. After each unfreeze stage, `_reset_hubert_lr_warmup()` only clears Adam optimizer state; the scheduler naturally restarts on the next epoch boundary via its period doubling schedule (1, 2, 4, 8... epoch periods). This avoids the previous OneCycleLR exhaustion issue where unfrozen layers entered at the decayed LR position.
 
 ### Staged `lambda_blank_kl` Ramp (I2)
 
@@ -270,6 +272,34 @@ Without the ramp, aggressively suppressing blank probability from epoch 0 forces
 | ≥ 20 | 0.20 |
 
 The current epoch's value is stored as `self._current_lambda_blank_kl` on the Lightning module in `on_train_epoch_start()` and read by `compute_loss()`. This avoids mutating the config object, which would break per-fold isolation in LOSO.
+
+### Stratified Micro-Batch Sampler
+
+The `StratifiedMicroBatchSampler` (train.py, gated by `use_stratified_micro_batch=True`) ensures every micro-batch contains both dysarthric and control samples at a configurable ratio (default 3:1 dysarthric:control). This prevents `OrdinalContrastiveLoss` from degenerating when all items in a micro-batch share the same severity.
+
+**How it works:** The minority class is tiled to match the majority class length, then both are shuffled and consumed in lockstep. Each batch picks `n_dys` and `n_ctrl` samples from their respective shuffled lists. The epoch produces `(n_dys_total + n_ctrl_total) // batch_size` batches — the same count as the original unstratified DataLoader — so no training data is wasted.
+
+| Config field | Default | Effect |
+|---|---|---|
+| `use_stratified_micro_batch` | `True` | Enable stratified sampling |
+| `stratified_dysarthric_ratio` | `0.75` | Target fraction of dysarthric samples per batch |
+
+### Per-Epoch Weighted Loss Breakdown
+
+`_MetricLoggerCallback.on_train_epoch_end()` logs the raw magnitude and λ-weighted contribution of each loss component at every epoch end:
+
+```
+Epoch 3 weighted loss breakdown:
+      CTC   46.8747 × 0.800 =  37.4998 ( 97.7%)
+       CE    3.5929 × 0.150 =   0.5389 (  1.4%)
+      Art    2.3081 × 0.080 =   0.1846 (  0.5%)
+  BlankKL    1.1475 × 0.200 =   0.2295 (  0.6%)
+  Ordinal    1.2898 × 0.050 =   0.0645 (  0.2%)
+    SymKL    0.2723 × 0.500 =   0.1362 (  0.4%)
+  Total =  38.6535
+```
+
+This enables one-shot hyperparameter balance audit — if any component contributes <1% of the weighted total, its λ may need to be increased.
 
 ### `valid_mask` Filtering in `training_step()`
 
@@ -402,46 +432,24 @@ results/{run_name}/
 
 ```json
 {
-  "avg_per": 0.137,
-  "wer": 0.141,
+  "avg_per": 0.134,
+  "wer": 0.122,
   "overall": {
-    "per_macro_speaker": 0.137,
-    "per_sample_mean": 0.141,
-    "wer": 0.141,
-    "ci": [0.115, 0.162],
-    "std": 0.089,
-    "n_samples": 1200,
+    "per_macro_speaker": 0.134,
+    "per_sample_mean": 0.138,
+    "wer": 0.122,
+    "ci": [0.072, 0.210],
+    "std": 0.048,
+    "n_samples": 3548,
     "n_speakers": 3
-  },
-  "symbolic_impact": {
-    "per_neural": 0.1451,
-    "per_constrained": 0.1372,
-    "delta_per": 0.0079,
-    "paired_delta_constrained_minus_neural": {
-      "delta_mean": -0.0079,
-      "ci_95_low": -0.015,
-      "ci_95_high": -0.001,
-      "p_value_two_sided": 0.0
-    },
-    "p_value_neural_vs_constrained": 0.0
   },
   "articulatory_accuracy": { "manner": 0.786, "place": 0.791, "voice": 0.924 },
   "stratified": {
-    "dysarthric": { "per_sample": 0.189, "per_speaker": 0.210, "ci": [...], "n": 600 },
-    "control":    { "per_sample": 0.085, "per_speaker": 0.091, "ci": [...], "n": 600 }
-  },
-  "per_speaker": {
-    "M01": { "per": 0.248, "ci": [0.21, 0.29], "std": 0.12, "n_samples": 312, "status": 1 }
-  },
-  "constraint_precision": {
-    "helpful_rate": 0.0916,
-    "neutral_rate": 0.8706,
-    "harmful_rate": 0.0378,
-    "rule_precision": 0.0916,
-    "n_utterances": 1200
+    "dysarthric": { "per_sample": 0.072, "n": 810 },
+    "control":    { "per_sample": 0.158, "n": 2738 }
   },
   "error_analysis": {
-    "error_counts": { "substitutions": 13821, "deletions": 4338, "insertions": 3752, "correct": 42000 }
+    "error_counts": { "substitutions": 1541, "deletions": 738, "insertions": 1742, "correct": 29688 }
   },
   "uncertainty": { "computed": false, "n_samples": null, "entropy_mean": null, "per_utterance": [] }
 }
@@ -455,10 +463,10 @@ results/{run_name}/
 |---|---|---|
 | CUDA OOM during training | Batch too large for VRAM after Stage 3 unfreeze | Reduce `batch_size` to 4–8 and increase `gradient_accumulation_steps` proportionally; or set `max_audio_length=4.0` |
 | NaN CTC loss | Gradient explosion after unfreeze | Enable `--detect-anomaly`; verify `gradient_clip_val=1.0`; check `valid_mask` is filtering short sequences |
-| `val/per` not improving after epoch 12 | LR too low post-Stage-3 unfreeze (OneCycleLR not reset) | Reduce `encoder_third_unfreeze_epoch`; or lower `lambda_ce` to 0.05; known T-04 limitation |
+| `val/per` not improving after epoch 12 | LR too low post-Stage-3 unfreeze | Reduce `encoder_third_unfreeze_epoch`; or lower `lambda_ce` to 0.05 |
 | `val/constraint_kl_from_prior` > 1.0 (diverging) | `lambda_symbolic_kl` too weak | Increase `lambda_symbolic_kl` from 0.5 to 1.0 |
 | `per_constrained > per_neural` | Frame-CE alignment noise polluting constraint matrix training | Reduce `lambda_ce` further; confirm `lambda_symbolic_kl=0.5` is set |
-| LOSO fold crashes with `Tried to step X times` | OneCycleLR scheduler state exhausted in checkpoint | Re-run with `--resume-loso`; pipeline auto-detects exhaustion and does weights-only resume |
+| LOSO fold crashes with `Tried to step X times` | Scheduler state exhausted in checkpoint | Re-run with `--resume-loso`; pipeline auto-detects exhaustion and does weights-only resume |
 | Checkpoint vocab mismatch warning at load | Manifest regenerated between train and eval with different phoneme set | Verify manifest uses same TORGO data; check `evaluation_results.json` for vocab size |
 | `FileNotFoundError: Manifest not found` | Manifest not generated | Run `python src/data/manifest.py` |
 | HuBERT revision not found | Offline environment or pinned hash unavailable | Set `hubert_model_revision=None` and `HF_HUB_OFFLINE=1` to use cached model |

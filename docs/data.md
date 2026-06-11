@@ -197,7 +197,7 @@ voiced, voiceless, vowel
 
 ### Feature Cache
 
-Processed `input_values` tensors are cached to an LRU disk cache (`data/processed/feature_cache/{namespace}/{sha1}.pt`) and an in-process LRU memory cache (default 2048 entries, LRU eviction via `OrderedDict`). The cache namespace is a 12-character SHA-1 hash of: `processor_id + sampling_rate + max_audio_samples + manifest_name`. This ensures cache invalidation when any of these parameters change. Corrupt cache files are treated as misses and silently overwritten. Cache writes use atomic `.tmp` rename with a unique suffix (`pid.worker_id.thread_id`) to prevent multi-worker collisions.
+Processed `input_values` tensors are cached to an LRU disk cache (`data/processed/feature_cache/{namespace}/{sha1}.pt`) and an in-process LRU memory cache (default 256 entries, LRU eviction via `OrderedDict`). The cache namespace is a 12-character SHA-1 hash of: `processor_id + sampling_rate + max_audio_samples + manifest_name`. This ensures cache invalidation when any of these parameters change. Corrupt cache files are treated as misses and silently overwritten. Cache writes use atomic `.tmp` rename with a unique suffix (`pid.worker_id.thread_id`) to prevent multi-worker collisions.
 
 ### `_build_sequence_cache()` + Tensor Materialization
 

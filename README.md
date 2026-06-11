@@ -32,11 +32,12 @@ Figure highlights:
 | Model | Macro PER | Weighted PER | Single-split PER | Notes |
 |---|---|---|---|---|
 | `loso_v1` (full system, LOSO) | **0.2848** (95% CI: [0.1921, 0.3801]) | **0.2299** | — | Publication result, 15/15 folds |
-| `baseline_v6` (full system) | 0.1372 | — | 0.1372 | per_constrained; post-fix reference |
-| `ablation_neural_only_v7` | **0.1346** | — | 0.1346 | **Best single-split PER** |
+| `v4_final` (full system, v0.6.0) | **0.137** (95% CI: [0.081, 0.208]) | 0.140 | 0.137 | **Paper result** (beam width 25; per_neural=0.134) |
+| `ablation_neural_only_v7` | **0.1346** | — | 0.1346 | Neural-only ablation |
+| `baseline_v6` (full system) | 0.1372 | — | 0.1372 | per_constrained; earlier reference |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | 0.1444 | SeverityAdapter only |
 
-**Honest note on the symbolic constraint story:** Within `baseline_v6`, the constrained path improves over the model's own internal neural sub-path (per_constrained=0.1372 < per_neural=0.1451, p=0.0 by bootstrap paired test), with 9.16% of utterances benefiting from constraint application versus only 3.78% harmed. However, a fully independent neural-only ablation (`ablation_neural_only_v7`) still achieves the best global single-split PER at 0.1346. The symbolic constraint helps within the jointly-trained system but has not yet demonstrated consistent global superiority over pure HuBERT. The next decisive analysis for SPCOM positioning is dysarthric-stratified LOSO interpretation (especially M01, M02, M04, M05, F01), not additional random single-split comparisons.
+**Symbolic constraint update (v0.6.0):** The full system (`v4_final`) achieves **0.137 macro-speaker PER** (beam search, width 25) with **0.120 WER** and **1.9× I/D ratio** on the held-out test set (3,548 utterances). The symbolic constraint provides **no statistically significant PER benefit** vs the internal neural sub-path (per_neural=0.134 greedy vs per_constrained=0.137 beam, paired p=0.1114), with a **6.1% helpful / 89.0% neutral / 4.9% harmful** precision profile — the constraint is mostly harmless but its PER impact is marginal. The architecture's value lies in its clinical interpretability: per-phoneme confusion analysis, articulatory breakdown (manner=80.5%, place=90.4%, voice=95.8%), per-speaker severity analysis, uncertainty estimation (entropy=0.399, confidence=0.893), and temperature calibration. Dysarthric-stratified LOSO interpretation remains the decisive analysis for SPCOM positioning.
 
 Single-split results are computed on approximately 2 test speakers and are not publication-valid statistics. All single-split figures are development references only.
 
@@ -77,15 +78,19 @@ python src/data/manifest.py
 ### Run Commands
 
 ```bash
-# Standard single-split training + evaluation (baseline reference)
-python run_pipeline.py --run-name baseline_v6
+# Best single-split training + evaluation (v0.6.0 fixes, ties neural-only)
+python run_pipeline.py --run-name v4_final
 
-# Eval-only with beam search, explainability, and uncertainty estimation
-python run_pipeline.py --run-name baseline_v6 --skip-train \
-    --beam-search --beam-width 25 --explain --uncertainty
+# Full evaluation with beam search, explainability, uncertainty & temperature calibration
+python run_pipeline.py --run-name v4_final --skip-train \
+    --beam-search --beam-width 25 --explain --uncertainty \
+    --uncertainty-samples 20 --calibrate-temperature
 
 # Neural-only ablation (bypasses SeverityAdapter + SymbolicConstraintLayer)
 python run_pipeline.py --run-name ablation_neural_only_v7 --ablation neural_only
+
+# Full system baseline (earlier reference)
+python run_pipeline.py --run-name baseline_v6
 
 # Full LOSO cross-validation (~32h on RTX 4060; this produces the publication result)
 python run_pipeline.py --run-name loso_v1 --loso

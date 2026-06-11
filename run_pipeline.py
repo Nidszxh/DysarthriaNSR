@@ -39,6 +39,7 @@ import argparse
 import logging
 import re
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -50,7 +51,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from src.utils.config import Config, get_default_config, get_project_root
-from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+from src.data.dataloader import TorgoNeuroSymbolicDataset
 from src.data.warm_feature_cache import warm_feature_cache
 from src.models.model import NeuroSymbolicASR
 from train import (
@@ -67,6 +68,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Silence noisy third-party loggers
+for _lib in ("huggingface_hub", "huggingface_hub.file_download",
+             "huggingface_hub.hf_api", "huggingface_hub.utils._http",
+             "httpx", "httpcore", "transformers", "pytorch_lightning",
+             "urllib3", "requests"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
+# HF messages are mostly benign (HF_TOKEN, HTTP 404 probes); suppress them
+for _hf_logger in ("huggingface_hub", "huggingface_hub.utils._http",
+                   "huggingface_hub.file_download", "huggingface_hub.hf_api",
+                   "huggingface_hub.utils._auth"):
+    logging.getLogger(_hf_logger).setLevel(logging.ERROR)
+# Suppress HF_TOKEN warning (benign; user can set env var if desired)
+warnings.filterwarnings('ignore', message='.*unauthenticated requests.*',
+                        category=UserWarning)
 log = logging.getLogger(__name__)
 
 
@@ -83,13 +98,13 @@ def _load_dataset(config: Config) -> TorgoNeuroSymbolicDataset:
     )
 
 
-def _build_test_loader(
+def _build_eval_loaders(
     config: Config,
     dataset: TorgoNeuroSymbolicDataset,
-) -> torch.utils.data.DataLoader:
-    """Return the test DataLoader by running the same deterministic split as train()."""
-    _, _, test_loader = create_dataloaders(config, dataset)
-    return test_loader
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    """Return (test_loader, val_loader) via a single deterministic split."""
+    _, val_loader, test_loader = create_dataloaders(config, dataset)
+    return test_loader, val_loader
 
 
 def _resolve_checkpoint(run_name: str) -> Path:
@@ -185,6 +200,7 @@ def run_training(
     config: Config,
     loso: bool,
     resume_loso: bool,
+    resume: Optional[str],
     loso_force_speakers: Optional[list[str]],
     loso_use_beam_search: bool,
     loso_beam_width: int,
@@ -204,6 +220,10 @@ def run_training(
         If True, run Leave-One-Speaker-Out CV via ``run_loso()``.
         Each fold is trained and evaluated independently inside run_loso.
         No single model is returned in this mode.
+    resume:
+        If set, resume normal training from this checkpoint path.
+        ``"last.ckpt"`` resolves to ``checkpoints/{run_name}/last.ckpt``;
+        other relative paths resolve similarly; absolute paths used as-is.
     limit_train_batches:
         If set, passed to ``train()`` to cap batches per epoch (smoke mode).
 
@@ -256,7 +276,19 @@ def run_training(
         return None, None
 
     log.info("=== Starting single-run training (run_name=%s) ===", config.experiment.run_name)
-    best_model, _trainer = train(config, limit_train_batches=limit_train_batches)
+    ckpt_path: Optional[str] = None
+    if resume:
+        ckpt_dir = get_project_root() / "checkpoints" / config.experiment.run_name
+        _resolved = Path(resume)
+        if _resolved.is_absolute():
+            ckpt_path = str(_resolved)
+        else:
+            ckpt_path = str(ckpt_dir / _resolved)
+        if not Path(ckpt_path).exists():
+            log.error("Resume checkpoint not found: %s", ckpt_path)
+            sys.exit(1)
+        log.info("Resuming from checkpoint: %s", ckpt_path)
+    best_model, _trainer = train(config, limit_train_batches=limit_train_batches, ckpt_path=ckpt_path)
     # Reload the dataset so the test_loader for comprehensive eval is built fresh
     # (train() discards the dataset after returning; we need vocab + splits again)
     dataset = _load_dataset(config)
@@ -278,6 +310,7 @@ def run_evaluation(
     lm_scorer: Optional["BigramLMScorer"] = None,
     lm_weight: float = 0.0,
     ablation_mode: str = "full",
+    val_loader: Optional[torch.utils.data.DataLoader] = None,
 ) -> Dict:
     """
     Execute the evaluation stage via ``evaluate_model()``.
@@ -334,6 +367,8 @@ def run_evaluation(
         lm_scorer=lm_scorer,
         lm_weight=lm_weight,
         ablation_mode=ablation_mode,
+        val_loader=val_loader,
+        config=config,
     )
 
     log.info(
@@ -382,7 +417,8 @@ def run_auto(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Forwarded training overrides
-    config.training.ablation_mode = args.ablation
+    if args.ablation is not None:
+        config.training.ablation_mode = args.ablation
     config.training.use_loso = args.loso
     if args.no_gradient_checkpointing:
         config.model.use_gradient_checkpointing = False
@@ -393,6 +429,10 @@ def run_auto(args: argparse.Namespace) -> None:
     if args.check_val_every_n_epoch is not None:
         config.training.check_val_every_n_epoch = args.check_val_every_n_epoch
 
+    # Temperature calibration flag
+    if args.calibrate_temperature:
+        config.experiment.use_temperature_calibration = True
+
     # Print VRAM banner AFTER all overrides are applied so ablation mode is correct.
     config.print_vram_status()
     if args.max_epochs is not None:
@@ -400,12 +440,15 @@ def run_auto(args: argparse.Namespace) -> None:
     if args.early_stopping_patience is not None:
         config.training.early_stopping_patience = args.early_stopping_patience
 
-    # Smoke mode: cap batches and epochs; never surfaced as a public flag
+    # Fast mode / smoke mode: cap batches for quick iteration
     limit_train_batches: Optional[int] = None
     if args.smoke:
         config.training.max_epochs = 1
         limit_train_batches = 5
         log.info("Smoke mode: max_epochs=1, limit_train_batches=5")
+    elif args.limit_train_batches is not None:
+        limit_train_batches = args.limit_train_batches
+        log.info("Fast mode: limit_train_batches=%d", limit_train_batches)
 
     # Q4: anomaly detection for NaN/Inf gradient debugging
     if getattr(args, "detect_anomaly", False):
@@ -458,6 +501,7 @@ def run_auto(args: argparse.Namespace) -> None:
             config=config,
             loso=args.loso,
             resume_loso=args.resume_loso,
+            resume=getattr(args, "resume", None),
             loso_force_speakers=loso_force_speakers,
             loso_use_beam_search=args.beam_search,
             loso_beam_width=args.beam_width,
@@ -495,8 +539,10 @@ def run_auto(args: argparse.Namespace) -> None:
         lightning_model = _load_lightning_model(ckpt_path, config, dataset)
         model_to_eval = lightning_model.model
 
-    # Build test DataLoader (deterministic split matches training)
-    test_loader = _build_test_loader(config, dataset)
+    # Build test + val DataLoaders via a single deterministic split
+    test_loader, val_loader = _build_eval_loaders(config, dataset)
+    if not config.experiment.use_temperature_calibration:
+        val_loader = None
 
     # Build bigram LM from training phoneme sequences (if LM weight requested)
     _lm_scorer: Optional[BigramLMScorer] = None
@@ -514,7 +560,7 @@ def run_auto(args: argparse.Namespace) -> None:
             
             # Get val speakers - check if val_loader exists, otherwise use dataset's val speakers
             val_speakers = set()
-            if 'val_loader' in dir() and val_loader is not None:
+            if val_loader is not None:
                 if hasattr(val_loader.dataset, 'df'):
                     val_speakers = set(val_loader.dataset.df['speaker'].unique())
                 elif hasattr(val_loader.dataset, 'speaker_to_indices'):
@@ -561,6 +607,7 @@ def run_auto(args: argparse.Namespace) -> None:
         ),
         lm_scorer=_lm_scorer,
         lm_weight=args.lm_weight,
+        val_loader=val_loader,
     )
 
 
@@ -675,12 +722,11 @@ def _build_parser() -> argparse.ArgumentParser:
     train_grp.add_argument(
         "--ablation",
         type=str,
-        default="full",
+        default=None,
         choices=["full", "neural_only", "symbolic_only", "no_art_heads",
                  "no_constraint_matrix", "no_spec_augment", "no_temporal_ds",
                  "no_severity_adapter"],
-        metavar="STR",
-        help="Ablation mode.",
+        help="Ablation mode (default: config value or full if not specified)",
     )
     train_grp.add_argument(
         "--loso",
@@ -696,6 +742,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Resume LOSO from results/{run_name}_loso_progress.json and "
              "checkpoints/{run_name}_loso_<speaker>/last.ckpt when present.",
+    )
+    train_grp.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        nargs="?",
+        const="last.ckpt",
+        metavar="PATH",
+        help="Resume normal (non-LOSO) training from a checkpoint. "
+             "Without PATH, uses checkpoints/{run_name}/last.ckpt. "
+             "Specify a filename relative to checkpoints/{run_name}/ "
+             "or an absolute path. Example: --resume or "
+             "--resume epoch=11-val_per=0.512.ckpt",
     )
     train_grp.add_argument(
         "--loso-force-speakers",
@@ -740,6 +799,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="INT",
         help="Override config.training.gradient_accumulation_steps.",
+    )
+    train_grp.add_argument(
+        "--limit-train-batches",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Cap training batches per epoch for fast iteration (e.g., 200).",
     )
     train_grp.add_argument(
         "--check-val-every-n-epoch",
@@ -797,6 +863,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="INT",
         dest="uncertainty_samples",
         help="Number of MC-Dropout forward passes for uncertainty estimation.",
+    )
+    eval_grp.add_argument(
+        "--calibrate-temperature",
+        action="store_true",
+        default=False,
+        help="Enable per-speaker temperature calibration on the val set before evaluation. "
+             "Requires a val split; temperatures are saved to results/{run_name}/speaker_temperatures.json.",
     )
 
     return parser

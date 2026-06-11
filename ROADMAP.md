@@ -1,8 +1,8 @@
 # DysarthriaNSR — Project Roadmap
 
-> **Last updated:** March 20, 2026  
-> **Current baseline:** `baseline_v6` — avg_per=0.137, per_neural=0.145, per_constrained=0.137  
-> **Neural-only ablation:** `ablation_neural_only_v7` — avg_per=0.135 (best single-split result to date)
+> **Last updated:** June 11, 2026  
+> **Current baseline:** `v4_final` — macro_per=0.137 (beam, 95% CI: [0.081, 0.208]), per_neural=0.134, WER=0.120, I/D=1.9×  
+> **Neural-only ablation:** `ablation_neural_only_v7` — avg_per=0.1346
 
 ---
 
@@ -107,8 +107,9 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 | Item | Status | Detail |
 |------|--------|--------|
+| `v4_final` (full system, v0.6.0) | ✅ | macro_per=0.137 (beam), per_neural=0.134, per_constrained=0.137 (symbolic Δ NOT significant, p=0.1114) |
+| `ablation_neural_only_v7` | ✅ | avg_per=0.1346 (ties v4_final) |
 | `baseline_v6` (constrained) | ✅ | avg_per=0.137, per_neural=0.145, per_constrained=0.137 |
-| `ablation_neural_only_v7` | ✅ | avg_per=0.135 (best single-split) |
 | `ablation_no_constraint_matrix_v6` | ✅ | avg_per=0.144 (eliminates learnable C, keeps SeverityAdapter) |
 | Symbolic sweep | ❌ | Planned: vary `constraint_weight_init ∈ {0.01, 0.03, 0.05}` under fixed seed |
 | LOSO-level symbolic stratified analysis | ⚠️ | Next SPCOM positioning priority: verify dysarthric-strata gains vs neural-only reference |
@@ -122,13 +123,13 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | ID | Component | Issue | Evidence | Mitigation |
 |----|-----------|-------|----------|------------|
 | C-3 | Experimental design | Small-split statistical fragility addressed via LOSO 15/15 | `loso_v1_loso_summary.json` | ✅ Resolved |
-| §2.1 | `model.py`, `train.py` | Neural-only ablation marginally beats full constrained model (0.135 vs 0.137) | `ablation_neural_only_v7` | ⚠️ Reframed: symbolic helps internal neural sub-path but not vs pure HuBERT |
+| §2.1 | `model.py`, `train.py` | Full system (v4_final, 0.137 beam) ties neural-only (0.1346) — symbolic Δ NOT significant (p=0.1114). The constraint contributes negligible PER benefit but retains clinical interpretability. | `v4_final` full eval | ✅ Documented: symbolic impact marginal; value is in interpretability |
 
 ### Major (Research Validity)
 
 | ID | Component | Issue | Status |
 |----|-----------|-------|--------|
-| T-05 | `sequence_utils.py` | Frame-CE `align_labels_to_logits` pads/truncates without forced alignment | ⚠️ Mitigated: `lambda_ce=0.10` |
+| T-05 | `sequence_utils.py` | Frame-CE `align_labels_to_logits` pads/truncates without forced alignment | ⚠️ Mitigated: `lambda_ce=0.15` + batched `TAF.forced_align` |
 | — | `evaluation` | Confusion matrices from greedy CTC without forced alignment — phoneme boundaries unvalidated | ⚠️ Documented limitation |
 | §4.5 | Stratification | Severity buckets collapse to dysarthric/control (all controls severity=0.0) | ⚠️ Documented |
 
@@ -138,7 +139,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 |----|-----------|-------|--------|
 | §5.4 | `manifest.py`, `model.py` | `PHONEME_DETAILS` and `PHONEME_FEATURES` defined independently (manual sync risk) | ✅ Fixed: centralized in `src/utils/constants.py` |
 | §5.5 | `config.py` | `ModelConfig.num_phonemes` now aligned with runtime vocab convention | ✅ Fixed |
-| §5.6 | `dataloader.py` | `create_single_dataloader` now mirrors speaker-level weighting policy | ✅ Fixed |
+| §5.6 | `dataloader.py` | `create_single_dataloader` removed (D9 — dead code; `create_dataloaders` is the sole entry point) | ✅ Fixed |
 | §8.2 | `rule_tracker.py` | `rule_precision()` not wired into `evaluate_model` output | ⚠️ Proxy added |
 | §3.10 | `train.py` | OneCycleLR not reset after progressive unfreezing; momentum reset applied as workaround | ⚠️ Partial fix via `_reset_hubert_lr_warmup()` |
 | §9.3 | `tests/` | Limited integration coverage for resume/orchestration edge paths | ⚠️ Partial: `tests/test_training_step.py`, `tests/test_evaluate_model.py`, and smoke eval test added; LOSO resume path still untested |
@@ -174,6 +175,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | Milestone | Target Date | Status |
 |-----------|-------------|--------|
 | All B1–B23 fixes implemented | Feb 2026 | ✅ Done |
+| `v4_final` trained | Jun 11, 2026 | ✅ Done (0.134 macro PER, ties neural-only) |
 | `baseline_v6` trained | Mar 12, 2026 | ✅ Done |
 | Neural-only ablation evaluated | Mar 13, 2026 | ✅ Done |
 | Full LOSO-CV sweep | Mar 2026 | ✅ Completed |
@@ -190,4 +192,4 @@ mlflow ui --backend-store-uri file://$(pwd)/mlruns
 # then open http://127.0.0.1:5000
 ```
 
-Key tracked runs: `baseline_v4`, `baseline_v5`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`, `loso_v1`.
+Key tracked runs: `v4_final`, `baseline_v6`, `ablation_neural_only_v7`, `ablation_no_constraint_matrix_v6`, `loso_v1`.

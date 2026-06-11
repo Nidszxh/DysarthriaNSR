@@ -97,7 +97,7 @@ class UncertaintyAwareDecoder:
 
         # Predictive entropy: H(y|x) = -Σ p̄_v log p̄_v
         mean_probs = lp_stack.exp().mean(dim=0)  # [B, T, V]
-        eps = 1e-8
+        eps = 1e-6
         entropy = -(mean_probs * (mean_probs + eps).log()).sum(dim=-1)  # [B, T]
 
         # Utterance-level uncertainty: mean entropy over valid frames

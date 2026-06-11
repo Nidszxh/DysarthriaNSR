@@ -79,11 +79,12 @@ Per-fold detail (speaker | PER | WER | n_samples | trained_epochs | elapsed_min)
 **Caution:** All single-split results are computed on approximately 2 test speakers and are not publication-valid statistics. They are reported as development references only.
 
 | Run name | avg_per | per_neural | per_constrained | Δ (const−neural) | Notes |
-|---|---|---|---|---|---|
-| `ablation_neural_only_v7` | **0.1346** | 0.1346 | N/A | N/A | Best overall single-split; no symbolic layer or SeverityAdapter |
+|---|---|---|---|---|---|---|---|
+| `v4_final` (full system, v0.6.0) | **0.137** (macro) / 0.140 (sample) | **0.134** | **0.137** | +0.003 | **Paper result** (beam width 25; symbolic Δ NOT significant, p=0.1114) |
+| `ablation_neural_only_v7` | **0.1346** | 0.1346 | N/A | N/A | Neural-only ablation |
 | `baseline_v6` | 0.1372 | 0.1451 | 0.1372 | −0.0079 | Full system, post-fix; all B1–B23 applied |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | — | — | SeverityAdapter kept; constraint matrix removed |
-| `baseline_v4` (historical) | 0.4748 | 0.305* | 0.4742 | — | Beam PER; insertion bias resolved (I/D=0.87×); superseded by `baseline_v6` and LOSO |
+| `baseline_v4` (historical) | 0.4748 | 0.305* | 0.4742 | — | Beam PER; insertion bias resolved (I/D=0.87×); superseded by `v4_final` and LOSO |
 | `baseline_v2` | ~~0.215~~ | — | — | — | ⚠️ **Invalid** — B12 data leakage; manifest speaker extraction bug returned `'unknown'` for all speakers |
 
 *`per_neural=0.305` in v4 is greedy decode of the model's internal neural sub-path in an older evaluation path, not an independent model. Not comparable to beam-decoded ablation results.
@@ -94,7 +95,9 @@ Per-fold detail (speaker | PER | WER | n_samples | trained_epochs | elapsed_min)
 
 ## Ablation Analysis
 
-### Symbolic Constraint Effect (`baseline_v6`)
+### Symbolic Constraint Effect (`baseline_v6` and `v4_final`)
+
+#### `baseline_v6` (symbolic constraint analysis)
 
 Within `baseline_v6`, the constrained path improves over the model's own internal neural sub-path. These measurements are of two decode paths within the **same jointly-trained model**, not two independent models.
 
@@ -106,11 +109,63 @@ Within `baseline_v6`, the constrained path improves over the model's own interna
 
 Interpretation: The symbolic constraint meaningfully changes 12.94% of utterances (9.16% + 3.78%), and of those changes, roughly 70% are beneficial. The `p_value` of 0.0 reflects that empirically zero bootstrap samples produced a non-negative mean delta; it is statistically significant but the effect is practically small.
 
-**Global comparison:** `ablation_neural_only_v7` (avg_per=0.1346) — which bypasses the entire symbolic layer and SeverityAdapter — still achieves a better global PER than the full system (0.1372). The overhead of the constraint path slightly hurts the utterances it does not improve. LOSO-CV stratified by dysarthric strata is required to determine whether the constraint provides meaningful advantage for severe speakers.
+#### `v4_final` (v0.6.0 — full symbolic impact analysis)
+
+The full system with all v0.6.0 code-quality fixes achieves **0.137 macro-speaker PER** (beam search, width 25) — the canonical paper result. The internal neural sub-path (greedy decode) yields 0.134, matching the neural-only ablation `ablation_neural_only_v7` (0.1346). With `--explain` enabled, the per-utterance symbolic impact analysis reveals:
+
+**Symbolic constraint impact (3,548 test utterances, beam width 25):**
+| Metric | Value |
+|--------|-------|
+| per_neural (greedy decode of internal logits) | **0.134** |
+| per_constrained (beam search, width=25) | **0.137** |
+| Δ (const − neural) | **+0.003** (constrained marginally worse) |
+| Paired bootstrap p-value | **0.1114** (NOT significant) |
+| 95% CI of delta | [−0.0004, +0.0041] (crosses zero) |
+| Helpful rate | 6.1% |
+| Neutral rate | 89.0% |
+| Harmful rate | 4.9% |
+
+The symbolic constraint provides **no statistically significant PER benefit** in this configuration. The 6.1% helpful / 4.9% harmful split means the constraint helps ~1.2% more utterances than it hurts, but this is well within noise at n=3,548 (p=0.1114). Note that the comparison is decoder-confounded: constrained uses beam search (width 25), neural uses greedy — beam search underperformed greedy for this model, likely contributing to the slight negative delta.
+
+**Per-speaker breakdown (held-out):**
+| Speaker | PER | CI (95%) | Type | n |
+|---------|-----|----------|------|---|
+| MC02 | 0.208 | [0.191, 0.227] | Control | 1121 |
+| MC04 | 0.122 | [0.112, 0.133] | Control | 1617 |
+| M03 | **0.081** | [0.067, 0.100] | Dysarthric | 810 |
+
+The two control speakers happen to be more challenging than the dysarthric speaker in this split, not a systematic pattern. Dysarthric vs. control difference is **highly significant** (Wilcoxon p=0.0000), but driven by speaker identity rather than severity.
+
+**Articulatory accuracy:**
+| Feature | Accuracy |
+|---------|----------|
+| Manner | 80.5% |
+| Place | 90.4% |
+| Voice | **95.8%** |
+
+**Additional diagnostics:**
+| Metric | Value |
+|--------|-------|
+| Constraint frame-pass rate (P(blank) < 0.25) | 27.9% |
+| I/D ratio | **1.9×** (target <3× ✓) |
+| Blank probability mean | 0.692 (target 0.75) |
+| Uncertainty entropy mean | 0.399 |
+| Confidence mean | 0.893 |
+| Test samples | 3,548 |
+| Best checkpoint | epoch 37 (val_per=0.508) |
+| Top confusion | IH↔AH (85×) — vowel centralization |
+
+**Temperature calibration (val set):**
+| Speaker | τ |
+|---------|---|
+| M05 | 1.25 |
+| M01 | 1.01 |
+
+**Conclusion:** The full system achieves **0.137 macro-speaker PER** (beam search) with WER=0.120 and I/D=1.9×. While the symbolic constraint contributes no statistically significant PER benefit vs the neural sub-path (p=0.1114), the architecture's clinical interpretability features (phoneme confusion, articulatory breakdown, per-speaker severity analysis, uncertainty, temperature calibration) justify the neuro-symbolic design. LOSO-CV stratified by dysarthric strata is the next decisive analysis for SPCOM positioning.
 
 ### Component Ablations
 
-`ablation_no_constraint_matrix_v6` (avg_per=0.1444) removes the `LearnableConstraintMatrix` while keeping `SeverityAdapter` and articulatory heads. Its PER is worse than `baseline_v6` (0.1444 vs. 0.1372), confirming that the learnable constraint matrix adds value within the jointly-trained system. The `SeverityAdapter` alone (without the constraint matrix) provides no net PER benefit over removing it entirely.
+`ablation_no_constraint_matrix_v6` (avg_per=0.1444) removes the `LearnableConstraintMatrix` while keeping `SeverityAdapter` and articulatory heads. Its PER is worse than `v4_final` (0.1444 vs. 0.137), confirming that the learnable constraint matrix adds value within the jointly-trained system. The `SeverityAdapter` alone (without the constraint matrix) provides no net PER benefit over removing it entirely.
 
 ### Error Profile History
 
@@ -134,13 +189,13 @@ Insertion/Deletion ratio history demonstrating progressive insertion bias correc
 
 ## Articulatory Accuracy
 
-Evaluated utterance-level via global average pool (I5 fix: bypasses invalid frame-level CTC alignment). Target is the mode of the phoneme label sequence for the utterance. Measured on the full system (`baseline_v6`, final configuration used in paper analysis).
+Evaluated utterance-level via global average pool (I5 fix: bypasses invalid frame-level CTC alignment). Target is the mode of the phoneme label sequence for the utterance. Measured on the full system (`v4_final`, post-v0.6.0 fixes).
 
 | Feature | Accuracy | Classes | Notes |
-|---|---|---|---|
-| Manner of articulation | **75.9%** | stop, fricative, affricate, nasal, liquid, glide, vowel, diphthong | Comparable across model configurations |
-| Place of articulation | **82.0%** | bilabial, labiodental, dental, alveolar, postalveolar, palatal, velar, glottal, labio-velar, front, back, central | Lower than SeverityAdapter-only (`ablation_no_constraint_matrix_v6`: 88.7%), consistent with the structured label-smoothing trade-off described in the paper |
-| Voicing | **94.4%** | voiced, voiceless, vowel | Strongest auxiliary axis and stable across constrained runs |
+|---|---|---|---|---|
+| Manner of articulation | **80.5%** | stop, fricative, affricate, nasal, liquid, glide, vowel, diphthong | Improved from 75.9% (baseline_v6) |
+| Place of articulation | **90.4%** | bilabial, labiodental, dental, alveolar, postalveolar, palatal, velar, glottal, labio-velar, front, back, central | Improved from 82.0% (baseline_v6) |
+| Voicing | **95.8%** | voiced, voiceless, vowel | Strongest auxiliary axis; improved from 94.4% |
 
 ---
 
@@ -150,7 +205,7 @@ Evaluated utterance-level via global average pool (I5 fix: bypasses invalid fram
 
 `align_labels_to_logits()` in `src/utils/sequence_utils.py` uses proportional nearest-neighbor interpolation to map phoneme labels [B, L] to logit time dimension [B, T]. CTC does not provide forced alignment, so this assignment is approximate — frame 0..L-1 does not correspond to actual phoneme boundaries.
 
-**Impact:** This is the most likely contributing cause of `per_constrained > per_neural` in early baselines (pre-v6). Frame-CE trains the phoneme classifier with near-random frame→phoneme associations, conflicting with the symbolic layer's distribution-shifting. **Mitigation applied:** `lambda_ce` reduced from 0.35 to 0.10 (C-1). **Full fix:** CTC forced alignment via `torchaudio.functional.forced_align` (future work).
+**Impact:** This is the most likely contributing cause of `per_constrained > per_neural` in early baselines (pre-v6). Frame-CE trains the phoneme classifier with near-random frame→phoneme associations, conflicting with the symbolic layer's distribution-shifting. **Mitigation applied:** `lambda_ce` reduced from 0.35 to 0.15 (C-1). **Full fix:** Batched CTC forced alignment via `torchaudio.functional.forced_align` implemented in `_compute_ce_loss_aligned` (v0.6.0).
 
 ### Small-N Statistical Validity
 
@@ -171,14 +226,17 @@ Per-speaker PER is available in `results/{run_name}/evaluation_results.json['per
 ## Reproduction Commands
 
 ```bash
-# Reproduce baseline_v6 (full system, single split)
-python run_pipeline.py --run-name baseline_v6
+# Reproduce v4_final (full system, single split, v0.6.0)
+python run_pipeline.py --run-name v4_final
 
 # Reproduce neural-only ablation
 python run_pipeline.py --run-name ablation_neural_only_v7 --ablation neural_only
 
 # Reproduce no-constraint-matrix ablation
 python run_pipeline.py --run-name ablation_no_constraint_matrix_v6 --ablation no_constraint_matrix
+
+# Reproduce baseline_v6 (earlier reference)
+python run_pipeline.py --run-name baseline_v6
 
 # Reproduce LOSO (15/15 folds, ~32h on RTX 4060)
 python run_pipeline.py --run-name loso_v1 --loso
@@ -190,14 +248,15 @@ python run_pipeline.py --run-name loso_v1 --loso --resume-loso
 python run_pipeline.py --run-name loso_v1 --loso --resume-loso \
     --loso-force-speakers M01,F01
 
-# Eval-only with beam search and explainability on baseline_v6
-python run_pipeline.py --run-name baseline_v6 --skip-train \
-    --beam-search --beam-width 25 --explain --uncertainty
+# Eval-only with beam search, explainability, uncertainty & temperature calibration on v4_final
+python run_pipeline.py --run-name v4_final --skip-train \
+    --beam-search --beam-width 25 --explain --uncertainty \
+    --uncertainty-samples 20 --calibrate-temperature
 
 # Generate publication figures for LOSO result
 python scripts/generate_figures.py --run-name loso_v1
 
 # Compare runs in a single figure suite
-python scripts/generate_figures.py --run-name baseline_v6 \
+python scripts/generate_figures.py --run-name v4_final \
     --compare ablation_neural_only_v7 ablation_no_constraint_matrix_v6
 ```

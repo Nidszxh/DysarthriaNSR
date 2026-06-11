@@ -1,6 +1,6 @@
 # Change Reference — DysarthriaNSR v0.4.0
 
-> This document provides a structured reference for all changes implemented in v0.4.0. For a high-level summary, see [CHANGELOG.md](../CHANGELOG.md). For inline code documentation, see the `# [FIX-N]` comment blocks in the source files.
+> **v0.5.0 changes are documented in [CHANGELOG.md](../CHANGELOG.md).** This file is a detailed reference for v0.4.0 only. For inline code documentation, see the `# [FIX-N]` comment blocks in the source files.
 
 ---
 

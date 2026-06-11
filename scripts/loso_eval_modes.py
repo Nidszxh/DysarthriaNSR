@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from evaluate import evaluate_model
 from src.data.dataloader import TorgoNeuroSymbolicDataset
 from src.models.model import NeuroSymbolicASR
+from src.utils import resolve_best_fold_checkpoint
 from src.utils.config import Config, get_project_root
 from train import DysarthriaASRLightning, create_loso_splits
 
@@ -41,32 +42,6 @@ def _split_speaker_id(spk: str) -> Tuple[str, int]:
 def _speaker_sort_key(speaker: str) -> Tuple[str, int, str]:
     prefix, number = _split_speaker_id(speaker)
     return prefix, number, str(speaker)
-
-
-def _resolve_best_fold_checkpoint(ckpt_dir: Path) -> Optional[Path]:
-    if not ckpt_dir.exists():
-        return None
-
-    scored = list(ckpt_dir.glob("epoch=*-val_per=*.ckpt"))
-    if scored:
-        pattern = re.compile(r"val_per=([0-9]+(?:\.[0-9]+)?)")
-        best_path: Optional[Path] = None
-        best_score = float("inf")
-
-        for checkpoint_path in scored:
-            match = pattern.search(checkpoint_path.name)
-            if not match:
-                continue
-            score = float(match.group(1))
-            if score < best_score:
-                best_score = score
-                best_path = checkpoint_path
-
-        if best_path is not None:
-            return best_path
-
-    last_checkpoint = ckpt_dir / "last.ckpt"
-    return last_checkpoint if last_checkpoint.exists() else None
 
 
 def _load_config(base_run_name: str, config_path: Optional[Path]) -> Config:
@@ -138,7 +113,7 @@ def _discover_folds(project_root: Path, base_run_name: str) -> Dict[str, FoldSpe
         if not speaker:
             continue
 
-        checkpoint_path = _resolve_best_fold_checkpoint(checkpoint_dir)
+        checkpoint_path = resolve_best_fold_checkpoint(checkpoint_dir)
         if checkpoint_path is None:
             continue
 

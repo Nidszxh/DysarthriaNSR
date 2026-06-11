@@ -11,7 +11,7 @@ import pytest
 import pandas as pd
 import torch
 
-from src.data.dataloader import NeuroSymbolicCollator, _compute_sample_weights
+from src.data.dataloader import NeuroSymbolicCollator, compute_sample_weights
 
 
 def _make_sample(audio_len: int, label_len: int, speaker: str = "M01", is_dysarthric: int = 1):
@@ -53,7 +53,7 @@ class TestNeuroSymbolicCollator:
         # All padding positions should be -100
         short_label = batch["labels"][0]
         pad_values = short_label[3:]  # positions beyond original length
-        assert (pad_values != 0).all(), "Found 0-padded labels — must be -100"
+        assert (pad_values == -100).all(), f"Found {pad_values.unique().tolist()} padding — must be -100"
 
     def test_batch_shapes_consistent(self):
         """All tensor outputs should have consistent batch dimension."""
@@ -126,7 +126,7 @@ class TestSampleWeighting:
             }
         )
 
-        weights = _compute_sample_weights(df)
+        weights = compute_sample_weights(df)
 
         assert weights == pytest.approx([0.5, 0.5, 1.0])
 
@@ -137,6 +137,6 @@ class TestSampleWeighting:
             }
         )
 
-        weights = _compute_sample_weights(df)
+        weights = compute_sample_weights(df)
 
         assert weights == pytest.approx([0.5, 0.5, 1.0])

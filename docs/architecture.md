@@ -193,7 +193,9 @@ log_probs_constrained = log(P_final.clamp_min(1e-6))
 |---|---|---|
 | `constraint_weight_init` | `0.05` | Initial β_base (learnable, clamped < 0.8) |
 | `severity_beta_slope` | `0.2` | Rate of β increase per normalized severity unit |
+| `severity_normalization_constant` | `5.0` | Normalization for adaptive β: `severity / norm` |
 | `blank_constraint_threshold` | `0.25` | Blank-dominance gate threshold (FIX-1: lowered from 0.5) |
+| `constraint_entropy_penalty_weight` | `0.05` | Row-entropy MSE penalty for constraint matrix |
 | `min_rule_confidence` | `0.05` | Minimum β for rule activation logging (C5 fix) |
 
 **`_track_activations()` (B4b fix):** Wrapped in `torch.no_grad()` to prevent building an unused gradient graph during inference. Capped at 100 indices per call; `SymbolicRuleTracker` caps total activations at `_MAX_ACTIVATIONS = 50,000` (H-5 fix).
@@ -206,8 +208,8 @@ Controlled via `--ablation` flag (stored in `config.training.ablation_mode`):
 
 | Mode | SeverityAdapter | SymbolicConstraintLayer | Art Heads | Best single-split PER | Notes |
 |---|---|---|---|---|---|
-| `full` | ✅ | ✅ learnable C | ✅ | 0.1372 | Default production mode |
-| `neural_only` | ❌ | ❌ bypassed entirely | ❌ | **0.1346** | Pure HuBERT+classifier; **globally best single-split** |
+| `full` | ✅ | ✅ learnable C | ✅ | **0.137** | **Paper result** (beam width 25; v4_final, v0.6.0) |
+| `neural_only` | ❌ | ❌ bypassed entirely | ❌ | **0.1346** | Pure HuBERT+classifier; ties full system |
 | `no_constraint_matrix` | ✅ | ❌ log-softmax of neural logits | ✅ | 0.1444 | Isolates SeverityAdapter contribution |
 | `no_severity_adapter` | ❌ | ✅ learnable C | ✅ | — | Tests symbolic constraint without severity conditioning (FIX-9) |
 | `no_art_heads` | ✅ | ✅ | ❌ | — | Tests articulatory head contribution |
@@ -215,7 +217,7 @@ Controlled via `--ablation` flag (stored in `config.training.ablation_mode`):
 | `no_temporal_ds` | ✅ (no DS) | ✅ | ✅ | — | Tests TemporalDownsampler contribution |
 | `symbolic_only` | ✅ | ✅ | ✅ | — | CTC/CE disabled (λ=0); tests pure symbolic signal |
 
-**Note:** `neural_only` achieves the best single-split PER (0.1346) across all evaluated configurations. See [experiments.md](experiments.md) for full analysis.
+**Note:** The full system (`v4_final`, v0.6.0) achieves **0.137 macro-speaker PER** (beam search, width 25; 95% CI: [0.081, 0.208]) — the canonical paper result. The internal neural sub-path (greedy) yields 0.134, matching `neural_only` (0.1346). The symbolic constraint provides a **non-significant PER impact** (per_neural=0.134 vs per_constrained=0.137, p=0.1114), with a 6.1%/89.0%/4.9% helpful/neutral/harmful split. Best checkpoint at epoch 37 (val_per=0.508). Test speakers: MC02 (0.208), MC04 (0.122), M03 (0.081). See [experiments.md](experiments.md) for full analysis.
 
 ---
 
@@ -241,7 +243,7 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | Loss | Formula | λ (current) | File | Notes |
 |---|---|---|---|---|
 | `CTCLoss` | CTC(log_probs_constrained, labels) | **0.80** | `train.py` | `zero_infinity=True`; uses exact `output_lengths` from model, not approximate `input_lengths` from collator |
-| Frame-CE | CrossEntropyLoss(logits_neural, aligned_labels) | **0.10** | `train.py` | Applied to neural logits, not constrained log-probs (C1 fix); reduced from 0.35 to mitigate frame-alignment noise |
+| Frame-CE | CrossEntropyLoss(logits_neural, aligned_labels) | **0.15** | `train.py` | Applied to neural logits, not constrained log-probs (C1 fix); reduced from 0.35 to mitigate frame-alignment noise |
 | Articulatory CE | (CE(manner)+CE(place)+CE(voice))/3 | **0.08** | `train.py` | Utterance-level via GAP + mode label (I5 fix); reduced from 0.15 |
 | `OrdinalContrastiveLoss` | Pairwise cosine hinge with ordinal margin | **0.05** | `src/models/losses.py` | Continuous TORGO severity scores; zero-gradient guard for batch_size=1 (B8 fix) |
 | `BlankPriorKLLoss` | KL(Bernoulli(p̄_blank) ∥ Bernoulli(0.75)) | staged **0.10→0.15→0.20** | `src/models/losses.py` | target_prob=0.75 (B2/T-03 fix: 0.85 overshoots); staged warmup (I2) |
@@ -256,6 +258,22 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | 0–9 | 0.10 | Gentle push; prevents early CTC collapse while phoneme head learns boundaries |
 | 10–19 | 0.15 | Moderate push |
 | ≥ 20 | 0.20 | Full target |
+
+**Staged `lambda_ordinal` schedule:**
+
+| Epoch range | λ_ordinal | Purpose |
+|---|---|---|
+| 0–9 | 0.01 | Minimal ordinal signal while CTC learns basic phoneme discrimination |
+| 10–19 | 0.03 | Moderate push |
+| ≥ 20 | 0.05 | Full target |
+
+**Staged `lambda_symbolic_kl` schedule:**
+
+| Epoch range | λ_symbolic_kl | Purpose |
+|---|---|---|
+| 0–4 | 0.1 | Gentle KL anchor; prevents early constraint matrix drift |
+| 5–14 | 0.3 | Moderate anchor |
+| ≥ 15 | 0.5 | Full target (B22 fix) |
 
 ---
 
@@ -273,8 +291,7 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `hidden_dim` | `512` | PhonemeClassifier hidden size |
 | `num_phonemes` | `None` (runtime set at init) | Set to `len(phn_to_id)` at init; TORGO runs typically resolve to 47 |
 | `classifier_dropout` | `0.1` | Dropout in classifier and adapter |
-| `constraint_weight_init` | `0.05` | Initial β_base for symbolic blending |
-| `constraint_learnable` | `True` | Enable learnable β parameter |
+| `constraint_weight_init` | `0.05` | Initial β_base for symbolic blending (β is always an `nn.Parameter`) |
 | `use_articulatory_distance` | `True` | Use articulatory distance for `C_static` fallback |
 | `use_learnable_constraint` | `True` | Enable `LearnableConstraintMatrix` (Proposal P2) |
 | `use_severity_adapter` | `True` | Enable cross-attention `SeverityAdapter` (Proposal P3) |
@@ -304,7 +321,7 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `encoder_third_unfreeze_epoch` | `12` | Stage 3 unfreeze trigger epoch |
 | `gradient_clip_val` | `1.0` | Gradient norm clipping |
 | `lambda_ctc` | `0.8` | CTC loss weight |
-| `lambda_ce` | `0.10` | Frame-CE loss weight |
+| `lambda_ce` | `0.15` | Frame-CE loss weight |
 | `lambda_articulatory` | `0.08` | Articulatory CE weight |
 | `lambda_ordinal` | `0.05` | Ordinal contrastive weight |
 | `lambda_blank_kl` | `0.20` | Blank-prior KL weight (final stage) |
@@ -313,8 +330,20 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `early_stopping_patience` | `8` | Epochs without improvement before stopping (single-split/ablation runs) |
 | `loso_early_stopping_patience` | `22` | Epochs without improvement for full-system LOSO runs (FIX-4: higher due to fold variance) |
 | `frame_ce_start_epoch` | `15` | Epoch at which frame-CE loss activates (FIX-2: gated to allow CTC boundary learning first) |
+| `use_stratified_micro_batch` | `True` | Enable `StratifiedMicroBatchSampler` for per-batch dysarthric/control balance |
+| `stratified_dysarthric_ratio` | `0.75` | Target dysarthric fraction per micro-batch |
+| `lambda_ordinal` | `0.05` | Ordinal contrastive weight (final stage) |
+| `lambda_symbolic_kl` | `0.50` | Symbolic KL anchor weight (final stage) |
+| `ordinal_stage1_end` | `10` | Epoch at which ordinal reaches stage 2 |
+| `ordinal_stage2_end` | `20` | Epoch at which ordinal reaches full target |
+| `ordinal_stage1_value` | `0.01` | Ordinal λ during epochs 0–9 |
+| `ordinal_stage2_value` | `0.03` | Ordinal λ during epochs 10–19 |
+| `symbolic_kl_stage1_end` | `5` | Epoch at which symbolic KL reaches stage 2 |
+| `symbolic_kl_stage2_end` | `15` | Epoch at which symbolic KL reaches full target |
+| `symbolic_kl_stage1_value` | `0.1` | Symbolic KL λ during epochs 0–4 |
+| `symbolic_kl_stage2_value` | `0.3` | Symbolic KL λ during epochs 5–14 |
 
-**Optimizer LR groups (paper setting):** HuBERT encoder uses `0.1×` peak LR, classifier+adapter uses `1.0×`, and the constraint layer uses `0.5×` under the same OneCycle schedule.
+**Optimizer LR groups (paper setting):** HuBERT encoder uses `0.1×` peak LR, classifier+adapter uses `1.0×`, and the constraint layer uses `0.5×` under the same CosineAnnealingWarmRestarts schedule (T_0=1, T_mult=2, interval='epoch').
 | `ablation_mode` | `full` | Active ablation mode |
 
 ---

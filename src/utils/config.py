@@ -1,9 +1,18 @@
+import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import torch
 import yaml
+
+logger = logging.getLogger(__name__)
+
+# REFACTOR LOG
+# [FIX-T05] Added use_forced_alignment, forced_alignment_fallback_warn,
+#         frame_ce_start_epoch=0, lambda_ce=0.15 config fields for CTC
+#         forced alignment frame-CE loss (replaces proportional interpolation).
 
 
 def get_project_root() -> Path:
@@ -109,7 +118,6 @@ class ModelConfig:
     
     # Symbolic Neural-Fusion
     constraint_weight_init: float = 0.05
-    constraint_learnable: bool = True
     use_articulatory_distance: bool = True
 
     # --- Phase 3: Architectural additions (audit Proposals P2, P3) ---
@@ -145,12 +153,20 @@ class TrainingConfig:
     learning_rate: float = 3e-5
     weight_decay: float = 0.01
     optimizer: str = "AdamW" 
-    lr_scheduler: str = "onecycle"
+    # [FIX-T04] Replaced OneCycleLR with CosineAnnealingWarmRestarts
+    # OneCycleLR's step counter cannot be rewound; warm restarts provide proper
+    # LR cycling per unfreeze stage.
+    lr_scheduler: str = "cosine_warm_restarts"
+    cosine_T0: int = 1          # epochs until first restart (matches encoder_warmup_epochs)
+    cosine_T_mult: int = 2      # each cycle is 2× the previous
+    cosine_eta_min_ratio: float = 0.001  # eta_min = lr * this ratio
     warmup_steps: int = 250
     warmup_ratio: float = 0.05
     
     batch_size: int = 12   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 36 with gradient accumulation
     gradient_accumulation_steps: int = 3   # Effective batch=36 (12×3)
+    use_stratified_micro_batch: bool = True
+    stratified_dysarthric_ratio: float = 0.75
     max_epochs: int = 40
     encoder_warmup_epochs: int = 1          # Unfreeze top layers after 1 epoch (was 3) — spend less time VRAM-idle
     encoder_second_unfreeze_epoch: int = 6  # Stage 2: unfreeze layers 6-11 at epoch 6
@@ -167,18 +183,28 @@ class TrainingConfig:
 
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
-    lambda_ce: float = 0.05
     # [FIX-2] Frame-CE gated behind epoch 15 to allow CTC boundary learning first
     # CTC lacks forced alignment, so frame labels are approximate proportional assignments.
     # Early frame-CE was training classifier with noisy associations that conflicted
     # with symbolic layer distribution-shifting. CTC-only for first 15 epochs fixes this.
     # Audit §1.2: frame-CE was polluting constraint matrix training.
-    frame_ce_start_epoch: int = 15
+    # [FIX-T05] Frame-CE now uses CTC forced alignment (torchaudio.functional.forced_align),
+    # so the gate can be disabled (frame_ce_start_epoch=0) and lambda_ce increased.
+    frame_ce_start_epoch: int = 0
+    use_forced_alignment: bool = True
+    forced_alignment_fallback_warn: bool = True
+    lambda_ce: float = 0.15
     lambda_articulatory: float = 0.08  # T-01: reduced from 0.15 — articulatory accuracy already ~78–92%; marginal gain is low
 
     # --- Phase 2: New loss weights (audit Proposals P1, P2, R3) ---
     # Ordinal contrastive severity loss (Proposal P1)
     lambda_ordinal: float = 0.05
+    # Staged lambda_ordinal warmup — ordinal loss is most meaningful after basic
+    # phoneme discrimination is established (epoch 10+).
+    ordinal_stage1_end: int = 10
+    ordinal_stage1_value: float = 0.01
+    ordinal_stage2_end: int = 20
+    ordinal_stage2_value: float = 0.03
     # Blank-prior KL regularisation (fix CTC insertion pathology)
     lambda_blank_kl: float = 0.20   # Full-stage target (epochs 20+); gentler than old 0.35
     blank_target_prob: float = 0.75   # B2/T-03 fix: 0.82 overshoots deletion rate; 0.75 allows slightly more phoneme emission (audit §3.3 / §4-T03)
@@ -195,6 +221,12 @@ class TrainingConfig:
     # §3.8 fix: 0.05 with batchmean/V=47 rows → effective per-row weight ≈0.001,
     # too weak to prevent degenerate constraint matrix.  0.5 gives ~0.01 per row.
     lambda_symbolic_kl: float = 0.5
+    # Staged lambda_symbolic_kl warmup — gentle constraint at first, full after
+    # the neural head stabilises (epoch 15+).
+    symbolic_kl_stage1_end: int = 5
+    symbolic_kl_stage1_value: float = 0.1
+    symbolic_kl_stage2_end: int = 15
+    symbolic_kl_stage2_value: float = 0.3
 
     # Logging & Checkpointing
     monitor_metric: str = "val/per"
@@ -236,7 +268,12 @@ class DataConfig:
 
 @dataclass
 class ExperimentConfig:
-    """MLflow and Experiment Tracking."""
+    """Experiment settings (MLflow + runtime config).
+
+    Only fields that are read via direct attribute access must be kept.
+    Fields accessed via getattr(..., default) are safe to remove —
+    we keep temperature_calibration_range for YAML round-trip consistency.
+    """
     experiment_name: str = "DysarthriaNSR"
     run_name: str = "rtx4060_optimized_v1"
     tracking_uri: str = field(default_factory=lambda: (
@@ -244,16 +281,11 @@ class ExperimentConfig:
         or f"file://{ProjectPaths().mlruns_dir.resolve()}"
     ))
     log_every_n_steps: int = 20
-    log_gradients: bool = False
-    log_model_architecture: bool = True
-    save_predictions: bool = True
-    save_confusion_matrix: bool = True
-    save_attention_maps: bool = False
-    # --- Phase 6: explainability output ---
     generate_explanations: bool = True
-    # --- Phase 7: uncertainty ---
     compute_uncertainty: bool = False
     uncertainty_n_samples: int = 20
+    use_temperature_calibration: bool = False
+    temperature_calibration_range: tuple = (0.5, 3.0)
     seed: int = 42
     deterministic: bool = True
 
@@ -281,9 +313,14 @@ class SymbolicConfig:
     min_rule_confidence: float = 0.05  # C5: lowered to 0.05; β ≈ 0.05–0.20 at typical operating range
     severity_threshold_mild: float = 2.0
     severity_threshold_severe: float = 4.0
+    constraint_entropy_penalty_weight: float = 0.05
     track_rule_activations: bool = True
     generate_confusion_matrix: bool = True
     severity_beta_slope: float = 0.2
+    # TORGO severity range spans [0.0, 4.9]; 5.0 is the ceiling for the
+    # binary status → severity fallback.  Used to normalise severity values
+    # into [0, 1] for adaptive beta and severity adapter conditioning.
+    severity_normalization_constant: float = 5.0
     # [FIX-1] Blank-frame constraint threshold lowered from 0.5 → 0.25
     # Previously ~85% of CTC frames bypassed the constraint, producing near-zero
     # gradient signal to logit_C and beta. 0.25 allows constraint to act on
@@ -295,7 +332,7 @@ class SymbolicConfig:
 # --- Master Config Handler ---
 
 class Config:
-    def __init__(self):
+    def __init__(self) -> None:
         self.paths = ProjectPaths()
         self.model = ModelConfig()
         self.training = TrainingConfig()
@@ -312,11 +349,11 @@ class Config:
         # constructed, so printing the banner here would always show 'Ablation: full'.
         # Call config.print_vram_status() explicitly after all overrides are applied.
 
-    def print_vram_status(self):
+    def print_vram_status(self) -> None:
         """Print the RTX 4060 VRAM safety report.  Call AFTER all config overrides."""
         self._print_vram_status()
 
-    def _print_vram_status(self):
+    def _print_vram_status(self) -> None:
         """Prints a rough VRAM safety report for the 4060's 8GB limit.
 
         This is an estimate, not runtime telemetry. It intentionally reports a
@@ -381,7 +418,7 @@ class Config:
             "model": self.model.__dict__,
             "training": self.training.__dict__,
             "data": {k: str(v) if isinstance(v, Path) else v for k, v in self.data.__dict__.items()},
-            "experiment": {k: str(v) if isinstance(v, Path) else v for k, v in self.experiment.__dict__.items()},
+            "experiment": {k: list(v) if isinstance(v, tuple) else v for k, v in self.experiment.__dict__.items()},
             "symbolic": {k: v for k, v in self.symbolic.__dict__.items() if k != 'substitution_rules'},
         }
         # Flatten rules for YAML (Tuples are not YAML standard)
@@ -390,12 +427,12 @@ class Config:
         data["severity_map"] = dict(TORGO_SEVERITY_MAP)
         return data
 
-    def save(self, path: Path):
+    def save(self, path: Path) -> None:
         """Saves config to YAML."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             yaml.dump(self.to_dict(), f, default_flow_style=False)
-        print(f"✅ Config saved to {path}")
+        logger.info("Config saved to %s", path)
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -416,10 +453,11 @@ class Config:
         with open(path, 'r') as f:
             data = yaml.safe_load(f) or {}
 
-        def _apply(target_obj, section: dict) -> None:
+        def _apply(target_obj: object, section: dict) -> None:
             """Recursively apply YAML section onto a dataclass instance."""
             for key, value in section.items():
                 if not hasattr(target_obj, key):
+                    logger.warning("Unknown config key '%s' ignored in %s", key, path)
                     continue
                 current = getattr(target_obj, key)
                 if isinstance(current, Path):
@@ -457,4 +495,4 @@ def get_default_config() -> "Config":
     global _default_config
     if _default_config is None:
         _default_config = Config()
-    return _default_config
+    return copy.deepcopy(_default_config)

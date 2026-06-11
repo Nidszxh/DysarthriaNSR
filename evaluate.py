@@ -13,65 +13,111 @@ Key Features:
 - Statistical significance testing
 """
 
+import logging
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from torch.utils.data import DataLoader
 
 import editdistance
 import jiwer
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import seaborn as sns
 import torch
 from scipy import stats
 
-try:
-    from rapidfuzz.distance import Levenshtein as _RFLevenshtein
-except Exception:
-    _RFLevenshtein = None
+from rapidfuzz.distance import Levenshtein as _RFLevenshtein
 
-# Import project modules
-try:
-    from src.utils.config import normalize_phoneme, get_project_root
-except ImportError:
-    project_root = Path(__file__).resolve().parent
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-    try:
-        from src.utils.config import normalize_phoneme, get_project_root
-    except ImportError:
-        # Fallback: define normalize_phoneme locally
-        def normalize_phoneme(phn: str) -> str:
-            return str(phn).rstrip('012')
-        
-        def get_project_root() -> Path:
-            return project_root
+from src.utils.config import Config, normalize_phoneme, get_project_root, get_speaker_severity
+from src.utils.sequence_utils import align_labels_to_logits as _align_labels_to_logits
 
-try:
-    from src.utils.sequence_utils import align_labels_to_logits as _align_labels_to_logits
-except ImportError:
-    # Inline fallback — should not happen in a correctly installed package
-    def _align_labels_to_logits(labels: torch.Tensor, time_steps_logits: int) -> torch.Tensor:
-        batch_size, t = labels.shape
-        if t == time_steps_logits:
-            return labels
-        indices = (
-            torch.arange(time_steps_logits, device=labels.device, dtype=torch.float32)
-            * (t / float(time_steps_logits))
-        ).long().clamp(0, t - 1)
-        aligned = labels[:, indices]
-        pad_mask = (labels == -100)
-        if pad_mask.any():
-            pad_fraction = pad_mask.float().mean(dim=1)
-            n_pad = (pad_fraction * time_steps_logits).long()
-            for b in range(batch_size):
-                n = int(n_pad[b].item())
-                if n > 0:
-                    aligned[b, time_steps_logits - n:] = -100
-        return aligned
+logger = logging.getLogger(__name__)
+
+
+def calibrate_speaker_temperatures(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    phn_to_id: Dict[str, int],
+    device: str,
+    temperature_range: Tuple[float, float] = (0.5, 3.0),
+    target_blank: float = 0.75,
+    ablation_mode: str = "full",
+) -> Dict[str, float]:
+    """Find optimal CTC temperature per speaker via blank-prob matching on val set.
+
+    Args:
+        model: Trained model
+        val_loader: Validation dataloader (held-out calibration set)
+        phn_to_id: Phoneme → ID mapping
+        device: Device to run calibration on
+        temperature_range: (min, max) temperature bounds for optimization
+        target_blank: Target mean blank probability (default 0.75)
+        ablation_mode: Ablation mode passed to model forward (default "full")
+
+    Returns:
+        Dict mapping speaker_id -> optimal temperature
+    """
+    from scipy.optimize import minimize_scalar
+    import torch.nn.functional as F
+
+    model.eval()
+    speaker_logits = defaultdict(list)
+    blank_id = phn_to_id.get('<BLANK>', 0)
+
+    with torch.no_grad():
+        for batch in val_loader:
+            input_values = batch['input_values'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+
+            speakers_batch = batch.get('speakers', [])
+            if speakers_batch and isinstance(speakers_batch[0], str):
+
+                severity = torch.tensor(
+                    [get_speaker_severity(s) for s in speakers_batch],
+                    dtype=torch.float32, device=device
+                )
+            else:
+                severity = batch['status'].float().to(device) * 5.0
+
+            outputs = model(
+                input_values=input_values,
+                attention_mask=attention_mask,
+                speaker_severity=severity,
+                ablation_mode=ablation_mode,
+            )
+
+            logits = outputs['logits_neural']  # [B, T, V] — pre-softmax
+            output_lengths = outputs.get('output_lengths')
+
+            if output_lengths is None:
+                output_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=device)
+
+            for i, spk in enumerate(speakers_batch):
+                T = int(output_lengths[i].item())
+                speaker_logits[spk].append(logits[i, :T].cpu())
+
+    temperatures = {}
+
+    for spk, logit_list in speaker_logits.items():
+        all_logits = torch.cat(logit_list, dim=0)  # [total_frames, V]
+
+        def objective(tau):
+            scaled = all_logits / tau
+            probs = F.softmax(scaled, dim=-1)
+            blank_mass = probs[:, blank_id].mean().item()
+            return (blank_mass - target_blank) ** 2
+
+        result = minimize_scalar(
+            objective,
+            bounds=temperature_range,
+            method='bounded',
+        )
+        temperatures[spk] = float(result.x)
+
+    return temperatures
 
 
 # DECODING UTILITIES
@@ -161,7 +207,7 @@ class BeamSearchDecoder:
     Implements efficient beam search for CTC outputs using prefix merging.
     Significantly more accurate than greedy decoding for ambiguous sequences.
     """
-    
+
     def __init__(
         self,
         beam_width: int = 10,
@@ -170,15 +216,17 @@ class BeamSearchDecoder:
         lm_scorer: Optional["BigramLMScorer"] = None,
         lm_weight: float = 0.0,
     ) -> None:
-        self.beam_width        = beam_width
-        self.blank_id          = blank_id
+        self.beam_width = beam_width
+        self.blank_id = blank_id
         self.length_norm_alpha = length_norm_alpha
-        self.lm_scorer         = lm_scorer    # Optional bigram LM for shallow fusion
-        self.lm_weight         = lm_weight    # λ; 0.0 = acoustic-only
+        self.lm_scorer = lm_scorer    # Optional bigram LM for shallow fusion
+        self.lm_weight = lm_weight    # λ; 0.0 = acoustic-only
+
     def decode(
         self,
         log_probs: np.ndarray,
-        id_to_phn: Dict[int, str]
+        id_to_phn: Dict[int, str],
+        temperature: float = 1.0
     ) -> Tuple[List[str], float]:
         """
         Decode log probabilities to phoneme sequence using beam search.
@@ -203,6 +251,8 @@ class BeamSearchDecoder:
         # only BLANK contributes to p_blank, while PAD/UNK are excluded from
         # search-space normalization entirely.
         log_probs = np.asarray(log_probs, dtype=np.float64)
+        if temperature != 1.0:
+            log_probs = log_probs / temperature
         T, num_classes = log_probs.shape
 
         blank_id = int(self.blank_id)
@@ -262,12 +312,12 @@ class BeamSearchDecoder:
                         # Omitting p_non_blank underestimates long same-token
                         # runs and can bias beam search toward blank/deletions.
                         new_prefix = prefix
-                        new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
+                        new_p_nb = np.logaddexp(p_b, p_nb) + c_lp
                         new_lm_acc = lm_nb_acc if p_nb >= p_b else lm_b_acc
                     else:
                         # New token → extend prefix, update LM accumulator
                         new_prefix = prefix + (c,)
-                        new_p_nb   = np.logaddexp(p_b, p_nb) + c_lp
+                        new_p_nb = np.logaddexp(p_b, p_nb) + c_lp
                         src_lm_for_nb = lm_nb_acc if p_nb >= p_b else lm_b_acc
                         if use_lm and len(prefix) > 0:
                             # Incremental bigram score for this single new token
@@ -295,10 +345,10 @@ class BeamSearchDecoder:
         # §3.3 fix: length norm applied to acoustic score only; LM bonus is
         # per-token so it should NOT be divided by sequence length.
         def _norm_score(prefix: tuple, p_b: float, p_nb: float, lm_b: float, lm_nb: float) -> float:
-            acoustic  = np.logaddexp(p_b, p_nb)
+            acoustic = np.logaddexp(p_b, p_nb)
             lm_s = lm_nb if p_nb >= p_b else lm_b
-            lm_bonus  = (self.lm_weight * lm_s) if use_lm else 0.0
-            length    = max(len(prefix), 1)
+            lm_bonus = (self.lm_weight * lm_s) if use_lm else 0.0
+            length = max(len(prefix), 1)
             return acoustic / (length ** self.length_norm_alpha) + lm_bonus
 
         best_prefix, (p_b, p_nb, _lm_b, _lm_nb) = max(
@@ -306,14 +356,14 @@ class BeamSearchDecoder:
             key=lambda x: _norm_score(x[0], x[1][0], x[1][1], x[1][2], x[1][3])
         )
         best_score = np.logaddexp(p_b, p_nb)
-        
+
         # Convert IDs to phonemes (skip special tokens)
         phonemes = [
             normalize_phoneme(id_to_phn[idx])
             for idx in best_prefix
             if idx in id_to_phn and id_to_phn[idx] not in ['<BLANK>', '<PAD>', '<UNK>']
         ]
-        
+
         return phonemes, best_score
 
 
@@ -322,6 +372,9 @@ def greedy_decode(
     phn_to_id: Dict[str, int],
     id_to_phn: Dict[int, str],
     output_lengths: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+    speaker_temperatures: Optional[Dict[str, float]] = None,
+    speakers: Optional[List[str]] = None,
 ) -> List[List[str]]:
     """
     Greedy CTC decoding with correct collapse and padding-frame masking.
@@ -333,23 +386,40 @@ def greedy_decode(
       4. Real token   → emit and update prev_id.
 
     Args:
-        logits:         Model output [batch, time, num_classes].
-                        May be raw logits or log-probs — argmax is identical.
-        phn_to_id:      Phoneme → ID mapping.
-        id_to_phn:      ID → Phoneme mapping.
-        output_lengths: Valid frame count per sample [batch].  When supplied,
-                        frames beyond output_lengths[i] are not decoded,
-                        preventing padding-frame noise from being emitted as
-                        spurious phoneme insertions.
+        logits:              Model output [batch, time, num_classes].
+                             May be raw logits or log-probs — argmax is identical.
+        phn_to_id:           Phoneme → ID mapping.
+        id_to_phn:           ID → Phoneme mapping.
+        output_lengths:      Valid frame count per sample [batch].  When supplied,
+                             frames beyond output_lengths[i] are not decoded,
+                             preventing padding-frame noise from being emitted as
+                             spurious phoneme insertions.
+        temperature:         Temperature for scaling logits before argmax.
+                             If speaker_temperatures is provided, this is used as
+                             fallback for unknown speakers.
+        speaker_temperatures: Optional dict mapping speaker_id -> temperature.
+        speakers:            Optional list of speaker IDs for the batch (aligned with batch).
 
     Returns:
         List of phoneme sequences (one per batch sample).
     """
     blank_id = phn_to_id.get('<BLANK>', 0)
-    pad_id   = phn_to_id.get('<PAD>',   1)
+    pad_id = phn_to_id.get('<PAD>',   1)
 
     predictions = []
-    pred_ids = torch.argmax(logits, dim=-1)  # [B, T]
+
+    # Apply temperature scaling before argmax
+    if temperature != 1.0 or speaker_temperatures:
+        scaled_logits = logits.clone()
+        for i in range(logits.size(0)):
+            temp = temperature
+            if speaker_temperatures is not None and speakers is not None and i < len(speakers):
+                temp = speaker_temperatures.get(speakers[i], temperature)
+            if temp != 1.0:
+                scaled_logits[i] = scaled_logits[i] / temp
+        pred_ids = torch.argmax(scaled_logits, dim=-1)
+    else:
+        pred_ids = torch.argmax(logits, dim=-1)  # [B, T]
 
     for i, seq in enumerate(pred_ids):
         # Truncate to valid (non-padded) frames only.
@@ -405,7 +475,7 @@ def decode_references(
         List of phoneme sequences
     """
     references = []
-    
+
     for seq in labels:
         phonemes = []
         for phone_id in seq.cpu().numpy():
@@ -416,7 +486,7 @@ def decode_references(
             if phoneme not in ['<BLANK>', '<PAD>', '<UNK>']:
                 phonemes.append(phoneme)
         references.append(phonemes)
-    
+
     return references
 
 
@@ -431,7 +501,7 @@ def compute_per(prediction: List[str], reference: List[str]) -> float:
     """
     if len(reference) == 0:
         return 1.0 if len(prediction) > 0 else 0.0
-    
+
     distance = editdistance.eval(prediction, reference)
     per = distance / len(reference)
     return float(per)
@@ -458,19 +528,19 @@ def compute_per_with_ci(
     """
     if len(per_scores) == 0:
         return 0.0, (0.0, 0.0)
-    
+
     mean_per = float(np.mean(per_scores))
-    
+
     # Bootstrap confidence interval
     bootstrap_means = []
     for _ in range(n_bootstrap):
         sample = np.random.choice(per_scores, size=len(per_scores), replace=True)
         bootstrap_means.append(np.mean(sample))
-    
+
     alpha = 1 - confidence_level
     ci_lower = float(np.percentile(bootstrap_means, alpha/2 * 100))
     ci_upper = float(np.percentile(bootstrap_means, (1 - alpha/2) * 100))
-    
+
     return mean_per, (ci_lower, ci_upper)
 
 
@@ -551,8 +621,8 @@ def compute_wer_texts(
     def _norm(s: str) -> str:
         return ' '.join(s.lower().split())
 
-    refs  = [_norm(r) for r in references_text]
-    hyps  = [_norm(p) for p in predictions_text]
+    refs = [_norm(r) for r in references_text]
+    hyps = [_norm(p) for p in predictions_text]
 
     # jiwer 4.x can compute corpus WER directly from two lists of strings
     return float(jiwer.wer(refs, hyps))
@@ -567,20 +637,26 @@ def decode_predictions(
     output_lengths: Optional[torch.Tensor] = None,
     lm_scorer: Optional[BigramLMScorer] = None,
     lm_weight: float = 0.0,
+    temperature: float = 1.0,
+    speaker_temperatures: Optional[Dict[str, float]] = None,
+    speakers: Optional[List[str]] = None,
 ) -> List[List[str]]:
     """
     Decode model logits into phoneme sequences.
 
     Args:
-        log_probs:      Model output [batch, time, num_classes].
-        phn_to_id:      Phoneme → ID mapping.
-        id_to_phn:      ID → Phoneme mapping.
-        use_beam_search: If True use CTC beam search; otherwise greedy.
-        beam_width:     Beam width for beam search.
-        output_lengths: Valid frame count per sample [batch] (from model).
-                        Prevents padding-frame noise from becoming insertions.
-        lm_scorer:      Optional BigramLMScorer for shallow-fusion LM rescoring.
-        lm_weight:      LM weight λ for shallow fusion (0.0 = disabled).
+        log_probs:           Model output [batch, time, num_classes].
+        phn_to_id:           Phoneme → ID mapping.
+        id_to_phn:           ID → Phoneme mapping.
+        use_beam_search:     If True use CTC beam search; otherwise greedy.
+        beam_width:          Beam width for beam search.
+        output_lengths:      Valid frame count per sample [batch] (from model).
+                             Prevents padding-frame noise from becoming insertions.
+        lm_scorer:           Optional BigramLMScorer for shallow-fusion LM rescoring.
+        lm_weight:           LM weight λ for shallow fusion (0.0 = disabled).
+        temperature:         Temperature for scaling logits before decoding.
+        speaker_temperatures: Optional dict mapping speaker_id -> temperature.
+        speakers:            Optional list of speaker IDs for the batch (aligned with batch).
     """
     if use_beam_search:
         # §3.1 fix: `config` is not in scope here; use hardcoded default 0.6
@@ -601,14 +677,21 @@ def decode_predictions(
                 if output_lengths is not None
                 else log_probs.size(1)
             )
+            temp = temperature
+            if speaker_temperatures is not None and speakers is not None and i < len(speakers):
+                temp = speaker_temperatures.get(speakers[i], temperature)
             seq, _ = decoder.decode(
                 log_probs[i, :valid_len].float().cpu().numpy(),
-                id_to_phn
+                id_to_phn,
+                temperature=temp
             )
             predictions.append(seq)
         return predictions
     else:
-        return greedy_decode(log_probs, phn_to_id, id_to_phn, output_lengths=output_lengths)
+        return greedy_decode(
+            log_probs, phn_to_id, id_to_phn, output_lengths=output_lengths,
+            temperature=temperature, speaker_temperatures=speaker_temperatures, speakers=speakers
+        )
 
 
 # ERROR ANALYSIS
@@ -679,16 +762,16 @@ def phoneme_alignment(
         except Exception:
             # Safety-first: keep original pure-Python path on any unexpected error.
             pass
-    
+
     # DP matrix: dp[i][j] = min edit distance for pred[:i] and ref[:j]
     dp = [[0] * (n + 1) for _ in range(m + 1)]
-    
+
     # Initialize base cases
     for i in range(m + 1):
         dp[i][0] = i  # All deletions
     for j in range(n + 1):
         dp[0][j] = j  # All insertions
-    
+
     # Fill DP table
     for i in range(1, m + 1):
         for j in range(1, n + 1):
@@ -700,11 +783,11 @@ def phoneme_alignment(
                     dp[i][j-1],    # Insertion
                     dp[i-1][j-1]   # Substitution
                 )
-    
+
     # Backtrack to reconstruct alignment
     alignment = []
     i, j = m, n
-    
+
     while i > 0 or j > 0:
         if i == 0:
             alignment.append(('insert', None, ref[j-1]))
@@ -726,16 +809,16 @@ def phoneme_alignment(
                 ]
                 options.sort()
                 _, op, new_i, new_j = options[0]
-                
+
                 if op == 'substitute':
                     alignment.append((op, pred[i-1], ref[j-1]))
                 elif op == 'delete':
                     alignment.append((op, pred[i-1], None))
                 else:  # insert
                     alignment.append((op, None, ref[j-1]))
-                
+
                 i, j = new_i, new_j
-    
+
     return alignment[::-1]  # Reverse to get forward order
 
 
@@ -764,14 +847,14 @@ def analyze_phoneme_errors(
     """
     confusion = defaultdict(lambda: defaultdict(int))
     error_counts = {'substitutions': 0, 'deletions': 0, 'insertions': 0, 'correct': 0}
-    
+
     substitution_pairs = []
     deletion_phonemes = []
     insertion_phonemes = []
-    
+
     for i, (pred, ref) in enumerate(zip(predictions, references)):
         alignment = alignments[i] if alignments is not None else phoneme_alignment(pred, ref)
-        
+
         for op, pred_ph, ref_ph in alignment:
             if op == 'correct':
                 error_counts['correct'] += 1
@@ -786,10 +869,10 @@ def analyze_phoneme_errors(
             elif op == 'insert':
                 error_counts['insertions'] += 1
                 insertion_phonemes.append(pred_ph)
-    
+
     # Most common confusions
     common_confusions = Counter(substitution_pairs).most_common(20)
-    
+
     return {
         'confusion_matrix': dict(confusion),
         'error_counts': error_counts,
@@ -834,11 +917,8 @@ def compute_per_phoneme_breakdown(
                 # ref_ph correctly predicted
                 counts[ref_ph]['n_ref'] += 1
             elif op == 'substitute':
-                # ref_ph present in ref but wrongly predicted as pred_ph
                 counts[ref_ph]['n_ref'] += 1
                 counts[ref_ph]['n_sub'] += 1
-                if pred_ph:
-                    counts[pred_ph]['n_ins'] += 1  # spurious prediction
             elif op == 'insert':
                 # ref has ref_ph but prediction missed it → deletion from ASR view
                 # (pred_ph is None in this alignment op)
@@ -968,14 +1048,14 @@ def compute_rule_pair_confusion(
                     sub_counts[f"{ref_ph}->{pred_ph}"] += 1
         return dict(sub_counts)
 
-    neural_subs      = _count_subs(predictions_neural,      references, neural_alignments)
+    neural_subs = _count_subs(predictions_neural,      references, neural_alignments)
     constrained_subs = _count_subs(predictions_constrained, references, constrained_alignments)
 
     result: Dict[str, Dict] = {}
     for (src, tgt), weight in substitution_rules.items():
         key = f"{src}->{tgt}"
         n_neural = neural_subs.get(key, 0)
-        n_const  = constrained_subs.get(key, 0)
+        n_const = constrained_subs.get(key, 0)
         result[key] = {
             'neural_count':      n_neural,
             'constrained_count': n_const,
@@ -1019,17 +1099,17 @@ def stratify_by_phoneme_length(
             return '11-20'
         else:
             return '21+'
-    
+
     results = {
         'dysarthric': defaultdict(list),
         'control': defaultdict(list)
     }
-    
+
     for per, length, status_val in zip(per_scores, phoneme_lengths, status):
         bucket = get_bucket(length)
         group = 'dysarthric' if status_val == 1 else 'control'
         results[group][bucket].append(per)
-    
+
     # Compute means
     stratified = {}
     for group in ['dysarthric', 'control']:
@@ -1040,7 +1120,7 @@ def stratify_by_phoneme_length(
                 'mean_per': float(np.mean(scores)) if scores else 0.0,
                 'n_samples': len(scores)
             }
-    
+
     return stratified
 
 
@@ -1063,8 +1143,6 @@ def compute_severity_stratified_per(
     Returns:
         Mapping bucket -> summary metrics.
     """
-    from src.utils.config import get_speaker_severity
-
     bucket_order = ('normal', 'mild', 'moderate', 'severe', 'profound')
     buckets: Dict[str, List[float]] = {k: [] for k in bucket_order}
     bucket_speakers: Dict[str, List[str]] = {k: [] for k in bucket_order}
@@ -1116,7 +1194,7 @@ def plot_confusion_matrix(
         for pred_ph, count in confusion[ref_ph].items():
             phoneme_counts[ref_ph] += count
             phoneme_counts[pred_ph] += count
-    
+
     top_phonemes = [
         ph for ph, _ in sorted(
             phoneme_counts.items(),
@@ -1124,17 +1202,17 @@ def plot_confusion_matrix(
             reverse=True
         )[:top_k]
     ]
-    
+
     # Build matrix
     matrix = np.zeros((len(top_phonemes), len(top_phonemes)))
     for i, ref_ph in enumerate(top_phonemes):
         for j, pred_ph in enumerate(top_phonemes):
             matrix[i, j] = confusion.get(ref_ph, {}).get(pred_ph, 0)
-    
+
     # Normalize by row (reference phoneme)
     row_sums = matrix.sum(axis=1, keepdims=True)
     matrix_norm = np.divide(matrix, row_sums, out=np.zeros_like(matrix), where=row_sums != 0)
-    
+
     # Plot
     plt.figure(figsize=(14, 12))
     sns.heatmap(
@@ -1150,7 +1228,7 @@ def plot_confusion_matrix(
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"✅ Saved confusion matrix to {save_path}")
 
 
@@ -1160,17 +1238,17 @@ def plot_per_by_length(
 ) -> None:
     """Plot PER stratified by phoneme sequence length."""
     buckets = ['0-5', '6-10', '11-20', '21+']
-    
+
     dysarthric_per = [stratified['dysarthric'][b]['mean_per'] for b in buckets]
     control_per = [stratified['control'][b]['mean_per'] for b in buckets]
-    
+
     x = np.arange(len(buckets))
     width = 0.35
-    
+
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.bar(x - width/2, dysarthric_per, width, label='Dysarthric', color='#e74c3c', alpha=0.8)
     ax.bar(x + width/2, control_per, width, label='Control', color='#3498db', alpha=0.8)
-    
+
     ax.set_xlabel('Phoneme Sequence Length', fontsize=12)
     ax.set_ylabel('PER', fontsize=12)
     ax.set_title('PER Stratified by Phoneme Length', fontsize=14, fontweight='bold')
@@ -1178,18 +1256,18 @@ def plot_per_by_length(
     ax.set_xticklabels(buckets)
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"✅ Saved length-stratified PER plot to {save_path}")
 
 
 def plot_rule_impact(
     stats: Dict,
     save_path: Path,
-    model=None,
+    model: Optional[torch.nn.Module] = None,
     id_to_phn: Optional[Dict[int, str]] = None,
 ) -> None:
     """Visualize the most active symbolic corrections.
@@ -1207,7 +1285,7 @@ def plot_rule_impact(
     """
     if stats and stats.get('top_rules'):
         # Normal path: bar chart of rule activation frequencies
-        rules  = [f"{r[0][0]}->{r[0][1]}" for r in stats['top_rules']]
+        rules = [f"{r[0][0]}->{r[0][1]}" for r in stats['top_rules']]
         counts = [r[1] for r in stats['top_rules']]
         plt.figure(figsize=(10, 6))
         sns.barplot(x=counts, y=rules, palette="viridis")
@@ -1219,7 +1297,7 @@ def plot_rule_impact(
         plt.close()
         return
 
-    # E6 fallback: constraint matrix heatmap 
+    # E6 fallback: constraint matrix heatmap
     if model is None:
         return  # Nothing to show
     try:
@@ -1354,7 +1432,7 @@ def plot_per_phoneme_breakdown(
         return
 
     phonemes = [item[0] for item in sorted_items]
-    per_vals  = [item[1]['per'] for item in sorted_items]
+    per_vals = [item[1]['per'] for item in sorted_items]
 
     fig, ax = plt.subplots(figsize=(max(10, len(phonemes) * 0.45), 6))
     colors = [
@@ -1385,12 +1463,12 @@ def plot_per_phoneme_breakdown(
 # COMPREHENSIVE EVALUATION
 
 def evaluate_model(
-    model,
-    dataloader,
+    model: torch.nn.Module,
+    dataloader: DataLoader,
     device: str,
     phn_to_id: Dict[str, int],
     id_to_phn: Dict[int, str],
-    results_dir: Path = None,
+    results_dir: Optional[Path] = None,
     symbolic_rules: Optional[Dict] = None,
     use_beam_search: bool = False,
     beam_width: int = 10,
@@ -1400,6 +1478,8 @@ def evaluate_model(
     lm_scorer: Optional[BigramLMScorer] = None,
     lm_weight: float = 0.0,
     ablation_mode: str = "full",
+    val_loader: Optional[DataLoader] = None,
+    config: Optional[Config] = None,
 ) -> Dict:
     """
     Comprehensive model evaluation with statistical rigor.
@@ -1420,6 +1500,8 @@ def evaluate_model(
         uncertainty_n_samples: Number of MC-Dropout forward passes (default: 20)
         lm_scorer: Optional BigramLMScorer for beam-search shallow fusion.
         lm_weight: LM weight λ (0.0 = acoustic-only; typical range 0.1–0.5).
+        val_loader: Optional validation dataloader for per-speaker temperature calibration.
+        config: Optional Config object for calibration settings (temperature range, etc.).
 
     Returns:
         Dictionary of evaluation metrics with confidence intervals
@@ -1463,7 +1545,30 @@ def evaluate_model(
         print(f"🔍 Using beam search decoder (width={beam_width}{_lm_tag})")
     else:
         print("🔍 Using greedy decoder")
-    
+
+    # ── Per-speaker temperature calibration ──────────────────────────────────
+    speaker_temperatures: Dict[str, float] = {}
+    if config is not None and val_loader is not None:
+        use_cal = getattr(config.experiment, 'use_temperature_calibration', False)
+        if use_cal:
+            temp_range = getattr(config.experiment, 'temperature_calibration_range', (0.5, 3.0))
+            target_blank = getattr(config.training, 'blank_target_prob', 0.75)
+            print("🔧 Calibrating per-speaker temperatures on val set...")
+            speaker_temperatures = calibrate_speaker_temperatures(
+                model, val_loader, phn_to_id, device,
+                temperature_range=temp_range,
+                target_blank=target_blank,
+                ablation_mode=ablation_mode,
+            )
+            temp_path = results_dir / "speaker_temperatures.json"
+            try:
+                with open(temp_path, 'w') as f:
+                    json.dump(speaker_temperatures, f, indent=2)
+                print(f"📝 Speaker temperatures saved to {temp_path}")
+            except Exception:
+                pass
+            print(f"🔧 Calibrated temperatures for {len(speaker_temperatures)} speakers")
+
     all_predictions = []
     all_references = []
     all_predictions_neural = []
@@ -1503,24 +1608,25 @@ def evaluate_model(
             print(f"⚠️  UncertaintyAwareDecoder unavailable (non-fatal): {exc}")
 
     print("🔍 Running evaluation...")
-    
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Move to device
             input_values = batch['input_values'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels']
-            
+
             # Forward pass — scale severity to [0, 5] to match training regime (bug fix S3)
             speakers_batch = batch.get('speakers', [])
             if speakers_batch and isinstance(speakers_batch[0], str):
-                from src.utils.config import get_speaker_severity
+
                 severity = torch.tensor(
                     [get_speaker_severity(s) for s in speakers_batch],
                     dtype=torch.float32, device=device
                 )
             else:
-                severity = batch['status'].float().to(device) * 5.0  # 0/1 → 0.0/5.0
+                sev_norm = getattr(config.symbolic, 'severity_normalization_constant', 5.0) if config is not None else 5.0
+                severity = batch['status'].float().to(device) * sev_norm  # 0/1 → 0.0/5.0
 
             outputs = model(
                 input_values=input_values,
@@ -1608,9 +1714,11 @@ def evaluate_model(
                         if output_lengths is not None
                         else log_probs_constrained.size(1)
                     )
+                    temp = speaker_temperatures.get(speakers_batch[i], 1.0) if speaker_temperatures else 1.0
                     seq, score = decoder.decode(
                         log_probs_constrained[i, :valid_len].float().cpu().numpy(),
-                        id_to_phn
+                        id_to_phn,
+                        temperature=temp,
                     )
                     predictions.append(seq)
             else:
@@ -1618,17 +1726,23 @@ def evaluate_model(
                 predictions = greedy_decode(
                     log_probs_constrained, phn_to_id, id_to_phn,
                     output_lengths=output_lengths,
+                    temperature=1.0,
+                    speaker_temperatures=speaker_temperatures if speaker_temperatures else None,
+                    speakers=speakers_batch,
                 )
 
             if logits_neural is not None:
                 predictions_neural = greedy_decode(
                     logits_neural, phn_to_id, id_to_phn,
                     output_lengths=output_lengths,
+                    temperature=1.0,
+                    speaker_temperatures=speaker_temperatures if speaker_temperatures else None,
+                    speakers=speakers_batch,
                 )
                 all_predictions_neural.extend(predictions_neural)
-            
+
             references = decode_references(labels, id_to_phn)
-            
+
             all_predictions.extend(predictions)
             all_references.extend(references)
             all_status.extend(batch['status'].cpu().numpy())
@@ -1649,7 +1763,8 @@ def evaluate_model(
                         for _i in range(batch_sz):
                             valid_seq = labels_art[_i][valid_mask_art[_i]]
                             if valid_seq.numel() > 0:
-                                utt_labels[_i] = torch.mode(valid_seq).values
+                                vals, counts = torch.unique(valid_seq, return_counts=True)
+                                utt_labels[_i] = vals[counts.argmax()]
                         mask = utt_labels != -100
                         if mask.any():
                             preds = torch.argmax(logits[mask], dim=-1)
@@ -1665,10 +1780,10 @@ def evaluate_model(
                             preds = torch.argmax(logits, dim=-1)
                             acc = (preds[mask] == labels_art[mask]).float().mean().item()
                             articulatory_results[key].append(acc)
-            
+
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
-    
+
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
 
@@ -1682,7 +1797,7 @@ def evaluate_model(
     # Corpus-level WER (I1 / E2) — join phoneme sequences as space-separated tokens
     print("📝 Computing corpus-level WER...")
     predictions_text = [' '.join(p) for p in all_predictions]
-    references_text  = [' '.join(r) for r in all_references]
+    references_text = [' '.join(r) for r in all_references]
     corpus_wer = compute_wer_texts(predictions_text, references_text)
     print(f"   WER: {corpus_wer:.3f}")
 
@@ -1706,7 +1821,15 @@ def evaluate_model(
         neural_per_scores = [
             compute_per(p, r) for p, r in zip(all_predictions_neural, all_references)
         ]
-    mean_per_neural = float(np.mean(neural_per_scores)) if neural_per_scores else None
+    if neural_per_scores and all_speakers:
+        # Macro-speaker mean (same scheme as constrained path) for fair delta
+        neural_spk_raw = defaultdict(list)
+        for i, spk in enumerate(all_speakers):
+            neural_spk_raw[spk].append(neural_per_scores[i])
+        neural_macro = [float(np.mean(v)) for v in neural_spk_raw.values()]
+        mean_per_neural = float(np.mean(neural_macro)) if neural_macro else None
+    else:
+        mean_per_neural = None
 
     # Constraint precision: per-utterance rate at which the constraint improved,
     # was neutral, or degraded recognition vs. the neural-only path (audit Phase 8).
@@ -1739,14 +1862,14 @@ def evaluate_model(
 
     # Stratified by dysarthric status (sample-level for clinical reporting)
     dysarthric_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 1]
-    control_per    = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
+    control_per = [per_scores[i] for i in range(len(per_scores)) if all_status[i] == 0]
 
     dysarthric_mean, dysarthric_ci = compute_per_with_ci(dysarthric_per)
-    control_mean, control_ci       = compute_per_with_ci(control_per)
+    control_mean, control_ci = compute_per_with_ci(control_per)
 
     # Speaker-macro stratification
     dysarthric_spk_per = [v for spk, v in per_by_speaker.items() if speaker_status_map.get(spk) == 1]
-    control_spk_per    = [v for spk, v in per_by_speaker.items() if speaker_status_map.get(spk) == 0]
+    control_spk_per = [v for spk, v in per_by_speaker.items() if speaker_status_map.get(spk) == 0]
 
     # Stratified by phoneme length
     stratified_by_length = stratify_by_phoneme_length(
@@ -1889,7 +2012,7 @@ def evaluate_model(
         plot_rule_impact(rule_stats, results_dir / 'rule_impact.png',
                          model=model, id_to_phn=id_to_phn)
 
-    # ── Statistical tests (audit Phase 6 / ROADMAP §8) 
+    # ── Statistical tests (audit Phase 6 / ROADMAP §8)
     # Welch t-test dysarthric vs. control (sample-level)
     t_stat, p_val_welch = (
         stats.ttest_ind(dysarthric_per, control_per, equal_var=False)
@@ -1923,14 +2046,13 @@ def evaluate_model(
     # whether Spearman correlation is statistically meaningful.
     spearman_valid = False  # default; will be set below
     try:
-        from src.utils.config import get_speaker_severity
-        sev_scores     = [get_speaker_severity(spk) for spk in per_by_speaker]
-        per_scores_spk = [per_by_speaker[spk]        for spk in per_by_speaker]
+        sev_scores = [get_speaker_severity(spk) for spk in per_by_speaker]
+        per_scores_spk = [per_by_speaker[spk] for spk in per_by_speaker]
         # P3.2: Check for tied ranks (e.g., control speakers with severity=0.0)
         zero_sev_count = sum(1 for s in sev_scores if s == 0.0)
         spearman_valid = (zero_sev_count / len(sev_scores)) <= 0.4 if sev_scores else False
         if n_speakers_eval >= 2:
-            pearson_r,  pearson_p  = stats.pearsonr(sev_scores, per_scores_spk)
+            pearson_r,  pearson_p = stats.pearsonr(sev_scores, per_scores_spk)
             spearman_r, spearman_p = stats.spearmanr(sev_scores, per_scores_spk)
             if not correlation_valid:
                 print(f"ℹ️   Severity ↔ PER correlation computed (n={n_speakers_eval} speakers — "
@@ -1950,7 +2072,7 @@ def evaluate_model(
         from src.explainability import (
             PhonemeAttributor, ArticulatoryConfusionAnalyzer,
         )
-        _attributor   = PhonemeAttributor()
+        _attributor = PhonemeAttributor()
         _art_analyzer = ArticulatoryConfusionAnalyzer()
         for _pred_seq, _ref_seq in zip(all_predictions, all_references):
             _errors = _attributor.alignment_attribution(_pred_seq, _ref_seq)
@@ -1983,7 +2105,7 @@ def evaluate_model(
             for i, (pred_seq, ref_seq) in enumerate(zip(all_predictions, all_references)):
                 errors = _attributed_errors[i] if i < len(_attributed_errors) else []
                 utt_per = compute_per(pred_seq, ref_seq)
-                spk_id  = all_speakers[i] if i < len(all_speakers) else None
+                spk_id = all_speakers[i] if i < len(all_speakers) else None
                 sev_val = float(get_speaker_severity(spk_id)) if spk_id else None
                 explanation = formatter.format_utterance(
                     utterance_id=f"utt_{i:04d}",
@@ -2118,7 +2240,7 @@ def evaluate_model(
     print(f"  Insertions:     {error_analysis['error_counts']['insertions']}")
     ins = error_analysis['error_counts']['insertions']
     dels = error_analysis['error_counts']['deletions']
-    ratio_str = f"{ins/max(dels,1):.1f}×" if dels > 0 else "N/A"
+    ratio_str = f"{ins/max(dels, 1):.1f}×" if dels > 0 else "N/A"
     print(f"  I/D ratio:      {ratio_str}  (target: <3×)")
     print("="*65)
 
@@ -2137,15 +2259,15 @@ def main() -> None:
     # Test PER computation
     pred = ['P', 'B', 'T', 'AH', 'L']
     ref = ['B', 'AH', 'T', 'AH', 'L']
-    
+
     per = compute_per(pred, ref)
     print(f"PER: {per:.3f}")
-    
+
     # Test confidence interval
     per_scores = [0.1, 0.2, 0.15, 0.18, 0.12, 0.25]
     mean, ci = compute_per_with_ci(per_scores)
     print(f"Mean PER: {mean:.3f} (95% CI: [{ci[0]:.3f}, {ci[1]:.3f}])")
-    
+
     # Test alignment
     alignment = phoneme_alignment(pred, ref)
     print("\nAlignment:")
