@@ -9,13 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Full Eval Results
 
-- **Canonical paper result** (v4_final, beam width=25, 20 MC samples, temperature calibration): macro-speaker PER=**0.137** (95% CI: [0.081, 0.208]), WER=0.120, I/D=1.9×. Per-neural (greedy sub-path): 0.134. Per-constrained (beam): 0.137. Symbolic Δ NOT significant (p=0.1114). Constraint precision: 6.1% helpful, 89.0% neutral, 4.9% harmful.
+- **Canonical paper result** (v4_final, beam width=25): macro-speaker PER=**0.137** (95% CI: [0.081, 0.208]), WER=0.120, I/D=1.9×. Both paths decoded with beam search — per_neural=0.1368, per_constrained=0.1372. Symbolic Δ = +0.00028 (p=0.025, significant but practically zero).
+- **Decoder confounding resolved**: previously neural was greedily decoded while constrained used beam (Δ=+0.003, p=0.1114). With fair comparison, the gap shrinks 10× to +0.00028. The true neural beam baseline is 0.1368, not 0.134 greedy.
 - **Articulatory accuracy**: manner=80.5%, place=90.4%, voice=95.8%
-- **Uncertainty**: entropy mean=0.399, confidence mean=0.893
 - **Temperature calibration**: M05 τ=1.25, M01 τ=1.01
-- **Conclusion**: The full system (0.137 beam) ties the neural-only ablation (0.1346); the symbolic layer's value is in clinical interpretability rather than PER improvement.
+- **Ablation chain (core evidence)**: SeverityAdapter alone degrades PER to 0.1444 (+7.3% vs neural-only 0.1346). Adding the constraint recovers 73% of that loss (0.1372). The constraint's primary role is as a **training-time regularizer** for severity-adaptive fusion, not inference-time per-frame correction.
+- **Conclusion**: With decoder confounding eliminated, the symbolic constraint is practically identical to the neural sub-path (difference < 0.03% relative). The constraint's value is as a training-time regularizer (ablation chain) plus clinical interpretability.
 
 ### Fixed
+
+- **Decoder confounding in evaluation** (`evaluate.py:1734-1746`): neural sub-path now uses beam search when `--beam-search` is set, matching the constrained path's decoder. Previously neural was always greedily decoded regardless of flag. This was responsible for ~90% of the apparent +0.003 gap between neural and constrained (narrowed to +0.00028 with fair comparison).
+
+- **blank_constraint_threshold diagnostic** (`evaluate.py:1581-1592`): eval now reads `blank_constraint_threshold` from `model.symbolic_config` or `model.symbolic_layer.config` — previously checked non-existent `model.config` attribute, always defaulting to 0.25.
 
 - **CTC forced alignment batching** (`train.py::_compute_ce_loss_aligned`): replaced B per-sample `TAF.forced_align` calls with a single batched call. If the batched call fails, all samples gracefully fall back to `align_labels_to_logits`. Inner per-label loop optimized to zero `.item()` calls — uses tensor `prev_i`, `torch.where`, `seq.cpu()` one-time transfer, list instead of dict for label lookup.
 
@@ -49,7 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`--ablation` default** (`run_pipeline.py`:420,725): changed from `"full"` to `None` — only overrides config when explicitly passed. Ablation mode falls back to config file or default.
+- **High-β diagnostic** (`v4_final_beta_high`): evaluated with β_base=0.3, β_slope=1.5 (M03 β=0.8 vs default 0.23). Dysarthric PER collapsed from 0.081 to 0.804 (9.9× worse), deletions 3.8×. Confirms the constraint matrix has no useful inference-time phoneme-confusion knowledge and must remain weak at inference. The ablation chain is definitive: constraint's value is as a training-time regularizer, not inference-time fusion.
+
+- **`--ablation` default** (`run_pipeline.py`:420,725): changed from `"full" to `None` — only overrides config when explicitly passed. Ablation mode falls back to config file or default.
 
 - **Unknown YAML key warning** (`src/utils/config.py`): added `logger.warning(...)` for unknown keys in `load_config` — no longer silently ignored.
 

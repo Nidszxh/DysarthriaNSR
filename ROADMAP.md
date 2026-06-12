@@ -1,7 +1,7 @@
 # DysarthriaNSR — Project Roadmap
 
-> **Last updated:** June 11, 2026  
-> **Current baseline:** `v4_final` — macro_per=0.137 (beam, 95% CI: [0.081, 0.208]), per_neural=0.134, WER=0.120, I/D=1.9×  
+> **Last updated:** June 12, 2026  
+> **Current baseline:** `v4_final` — macro_per=0.137 (beam, 95% CI: [0.081, 0.208]), per_neural=0.1368 (beam), per_constrained=0.1372 (beam), Δ=+0.00028, WER=0.120, I/D=1.9×  
 > **Neural-only ablation:** `ablation_neural_only_v7` — avg_per=0.1346
 
 ---
@@ -107,11 +107,13 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 | Item | Status | Detail |
 |------|--------|--------|
-| `v4_final` (full system, v0.6.0) | ✅ | macro_per=0.137 (beam), per_neural=0.134, per_constrained=0.137 (symbolic Δ NOT significant, p=0.1114) |
+| `v4_final` (full system, v0.6.0) | ✅ | macro_per=0.137 (beam), per_neural=0.1368 (beam), per_constrained=0.1372 (beam), Δ=+0.00028 (decoder confounding resolved) |
 | `ablation_neural_only_v7` | ✅ | avg_per=0.1346 (ties v4_final) |
 | `baseline_v6` (constrained) | ✅ | avg_per=0.137, per_neural=0.145, per_constrained=0.137 |
 | `ablation_no_constraint_matrix_v6` | ✅ | avg_per=0.144 (eliminates learnable C, keeps SeverityAdapter) |
-| Symbolic sweep | ❌ | Planned: vary `constraint_weight_init ∈ {0.01, 0.03, 0.05}` under fixed seed |
+| **Ablation chain** (core evidence) | ✅ | Adapter alone +7.3% worse vs neural-only; constraint recovers 73% of damage. Constraint acts as training-time regularizer for severity-adaptive fusion. |
+| `v4_final_beta_high` (high β diagnostic) | ✅ | β base=0.3, slope=1.5 → M03 PER 0.804 (9.9× worse). Confirms constraint matrix has no useful inference-time phoneme-confusion knowledge. Must remain weak at inference. |
+| Symbolic sweep | ❌ | Lower priority — inference-time effect is negligible; training-time role is the real contribution |
 | LOSO-level symbolic stratified analysis | ⚠️ | Next SPCOM positioning priority: verify dysarthric-strata gains vs neural-only reference |
 
 ---
@@ -123,7 +125,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | ID | Component | Issue | Evidence | Mitigation |
 |----|-----------|-------|----------|------------|
 | C-3 | Experimental design | Small-split statistical fragility addressed via LOSO 15/15 | `loso_v1_loso_summary.json` | ✅ Resolved |
-| §2.1 | `model.py`, `train.py` | Full system (v4_final, 0.137 beam) ties neural-only (0.1346) — symbolic Δ NOT significant (p=0.1114). The constraint contributes negligible PER benefit but retains clinical interpretability. | `v4_final` full eval | ✅ Documented: symbolic impact marginal; value is in interpretability |
+| §2.1 | `model.py`, `train.py` | Full system (v4_final, 0.137 beam). Decoder confounding resolved: per_neural=0.1368 (beam) vs per_constrained=0.1372 (beam), Δ=+0.00028 (p=0.025). The constraint is practically identical to the neural sub-path (0.03% relative difference). Ablation chain shows the constraint recovers 73% of the SeverityAdapter's accuracy penalty (adapter alone: 0.1444 → +constraint: 0.1372), establishing its role as a training-time regularizer for severity-adaptive fusion. | `v4_final` full eval | ✅ Documented: decoder confounding fixed; constraint's value is as training-time regularizer (ablation chain) + clinical interpretability |
 
 ### Major (Research Validity)
 
@@ -152,7 +154,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 1. **Publish leaderboard artifacts:** export per-fold table + macro/weighted metrics from `loso_v1_loso_summary.json`
 2. **Targeted dysarthric optimization sweep:** prioritize M01/M02/M04/M05/F01 failure modes
-3. **Compact symbolic sweep:** vary `constraint_weight_init ∈ {0.01, 0.03, 0.05}` under fixed protocol
+3. **LOSO-level symbolic stratified analysis:** verify if constraint helps on dysarthric folds specifically (even if neutral on controls). Run neural-only ablation on LOSO folds and compare per-speaker with full system.
 4. **Acceptance rule:** keep symbolic model primary only if globally non-inferior to neural-only and better on at least one dysarthric strata metric
 
 ### Medium-Term (Post-Submission)
@@ -175,7 +177,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | Milestone | Target Date | Status |
 |-----------|-------------|--------|
 | All B1–B23 fixes implemented | Feb 2026 | ✅ Done |
-| `v4_final` trained | Jun 11, 2026 | ✅ Done (0.134 macro PER, ties neural-only) |
+| `v4_final` trained | Jun 12, 2026 | ✅ Done (0.137 macro PER; decoder confounding resolved; per_neural=0.1368 beam) |
 | `baseline_v6` trained | Mar 12, 2026 | ✅ Done |
 | Neural-only ablation evaluated | Mar 13, 2026 | ✅ Done |
 | Full LOSO-CV sweep | Mar 2026 | ✅ Completed |

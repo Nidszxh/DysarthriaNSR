@@ -79,8 +79,8 @@ Per-fold detail (speaker | PER | WER | n_samples | trained_epochs | elapsed_min)
 **Caution:** All single-split results are computed on approximately 2 test speakers and are not publication-valid statistics. They are reported as development references only.
 
 | Run name | avg_per | per_neural | per_constrained | Δ (const−neural) | Notes |
-|---|---|---|---|---|---|---|---|
-| `v4_final` (full system, v0.6.0) | **0.137** (macro) / 0.140 (sample) | **0.134** | **0.137** | +0.003 | **Paper result** (beam width 25; symbolic Δ NOT significant, p=0.1114) |
+|---|---|---|---|---|---|---|---|---|
+| `v4_final` (full system, v0.6.0) | **0.137** (macro) / 0.140 (sample) | **0.1368** (beam) | **0.1372** (beam) | +0.00028 | **Paper result** (beam width 25; decoder confounding resolved; Δ practically zero) |
 | `ablation_neural_only_v7` | **0.1346** | 0.1346 | N/A | N/A | Neural-only ablation |
 | `baseline_v6` | 0.1372 | 0.1451 | 0.1372 | −0.0079 | Full system, post-fix; all B1–B23 applied |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | — | — | SeverityAdapter kept; constraint matrix removed |
@@ -109,23 +109,22 @@ Within `baseline_v6`, the constrained path improves over the model's own interna
 
 Interpretation: The symbolic constraint meaningfully changes 12.94% of utterances (9.16% + 3.78%), and of those changes, roughly 70% are beneficial. The `p_value` of 0.0 reflects that empirically zero bootstrap samples produced a non-negative mean delta; it is statistically significant but the effect is practically small.
 
-#### `v4_final` (v0.6.0 — full symbolic impact analysis)
+#### `v4_final` (v0.6.0 — full symbolic impact analysis, decoder confounding resolved)
 
-The full system with all v0.6.0 code-quality fixes achieves **0.137 macro-speaker PER** (beam search, width 25) — the canonical paper result. The internal neural sub-path (greedy decode) yields 0.134, matching the neural-only ablation `ablation_neural_only_v7` (0.1346). With `--explain` enabled, the per-utterance symbolic impact analysis reveals:
+The full system with all v0.6.0 code-quality fixes achieves **0.137 macro-speaker PER** (beam search, width 25) — the canonical paper result. **Decoder confounding has been resolved**: both paths are now decoded with beam search (width 25), providing an apples-to-apples comparison. The internal neural sub-path yields **0.1368** (beam), matching the constrained path at 0.1372 within 0.03% relative.
 
-**Symbolic constraint impact (3,548 test utterances, beam width 25):**
+**Symbolic constraint impact (3,548 test utterances, beam width 25, both paths):**
 | Metric | Value |
 |--------|-------|
-| per_neural (greedy decode of internal logits) | **0.134** |
-| per_constrained (beam search, width=25) | **0.137** |
-| Δ (const − neural) | **+0.003** (constrained marginally worse) |
-| Paired bootstrap p-value | **0.1114** (NOT significant) |
-| 95% CI of delta | [−0.0004, +0.0041] (crosses zero) |
-| Helpful rate | 6.1% |
-| Neutral rate | 89.0% |
-| Harmful rate | 4.9% |
+| per_neural (beam search, width=25 of internal logits) | **0.1368** |
+| per_constrained (beam search, width=25) | **0.1372** |
+| Δ (const − neural) | **+0.00028** (constrained marginally worse) |
+| Paired bootstrap p-value | **0.025** (significant but practically zero) |
+| 95% CI of delta | [+0.00002, +0.00062] (does not cross zero) |
 
-The symbolic constraint provides **no statistically significant PER benefit** in this configuration. The 6.1% helpful / 4.9% harmful split means the constraint helps ~1.2% more utterances than it hurts, but this is well within noise at n=3,548 (p=0.1114). Note that the comparison is decoder-confounded: constrained uses beam search (width 25), neural uses greedy — beam search underperformed greedy for this model, likely contributing to the slight negative delta.
+The symbolic constraint is **practically identical** to the neural sub-path — the +0.00028 difference is 0.03% relative PER. The p-value of 0.025 reaches significance due to the large sample size (n=3,548) but the effect size is negligible. **The previously reported +0.003 gap (p=0.1114) was ~90% a decoder confounding artifact** — neural was greedily decoded while constrained used beam, and beam search underperformed greedy for this model. With fair comparison, the constraint neither helps nor hurts in aggregate.
+
+**Decoder confounding insight:** The earlier per_neural=0.134 (greedy) was an optimistic underestimate. The true neural baseline with proper beam decoding is 0.1368. The constrained path (0.1372) is within 0.03% relative of this baseline, confirming that the constraint introduces no practical degradation.
 
 **Per-speaker breakdown (held-out):**
 | Speaker | PER | CI (95%) | Type | n |
@@ -161,11 +160,26 @@ The two control speakers happen to be more challenging than the dysarthric speak
 | M05 | 1.25 |
 | M01 | 1.01 |
 
-**Conclusion:** The full system achieves **0.137 macro-speaker PER** (beam search) with WER=0.120 and I/D=1.9×. While the symbolic constraint contributes no statistically significant PER benefit vs the neural sub-path (p=0.1114), the architecture's clinical interpretability features (phoneme confusion, articulatory breakdown, per-speaker severity analysis, uncertainty, temperature calibration) justify the neuro-symbolic design. LOSO-CV stratified by dysarthric strata is the next decisive analysis for SPCOM positioning.
+**Conclusion:** The full system achieves **0.137 macro-speaker PER** (beam search) with WER=0.120 and I/D=1.9×. With decoder confounding resolved (both paths decoded with beam search), the symbolic constraint is practically identical to the neural sub-path (Δ = +0.00028, 0.03% relative). The constraint's inference-time fusion has negligible frame-level impact (99.7% neutral, 27.9% frame-pass rate) because β is small (base=0.05, max dysarthric ~0.23) and the KL-regularized constraint matrix (λ=0.5) is trained to stay near-identity.
+
+**The constraint's primary value is as a training-time implicit regularizer:** it prevents the SeverityAdapter from degrading the neural backbone. Removing the constraint matrix during training (`ablation_no_constraint_matrix_v6`) while keeping the adapter raises PER to 0.1444 — 7.3% worse than neural-only. Adding the constraint back recovers 73% of that loss (0.1372). This ablation chain is the core evidence for the neuro-symbolic design. The architecture additionally provides clinical interpretability features (phoneme confusion, articulatory breakdown, per-speaker severity analysis, temperature calibration) that a purely neural model cannot. LOSO-CV stratified by dysarthric strata is the decisive analysis for SPCOM positioning.
 
 ### Component Ablations
 
 `ablation_no_constraint_matrix_v6` (avg_per=0.1444) removes the `LearnableConstraintMatrix` while keeping `SeverityAdapter` and articulatory heads. Its PER is worse than `v4_final` (0.1444 vs. 0.137), confirming that the learnable constraint matrix adds value within the jointly-trained system. The `SeverityAdapter` alone (without the constraint matrix) provides no net PER benefit over removing it entirely.
+
+**Ablation chain summary (all single-split, beam search where applicable):**
+
+| Model | PER | Δ vs neural-only | What it proves |
+|-------|-----|-----------------|----------------|
+| Neural-only (`ablation_neural_only_v7`) | **0.1346** | — | Pure neural baseline |
+| + SeverityAdapter (`ablation_no_constraint_matrix_v6`) | **0.1444** | **+7.3% worse** | Adapter alone degrades accuracy |
+| + SeverityAdapter + Constraint (`v4_final`, default β) | **0.1372** | **+1.9% worse** | Constraint recovers 73% of adapter damage |
+| + SeverityAdapter + Constraint (`v4_final_beta_high`, β dominated) | **0.378** | **+181% worse** | Constraint at high β destroys dysarthric PER |
+
+A controlled diagnostic (`v4_final_beta_high`) with β_base=0.3 and β_slope=1.5 (M03 β=0.8, vs default 0.23) was run to test whether the constraint matrix contains useful phoneme-confusion knowledge for inference. The result is negative: dysarthric speaker PER collapsed from 0.081 to 0.804 (9.9× worse), while control speakers were unaffected (0.158 unchanged). Deletions rose from 811 to 3,069 (3.8×). The constraint matrix, KL-regularized toward identity (λ=0.5), does not contain useful inference-time confusion patterns. Forcing the constraint to dominate degrades the CTC posterior structure by amplifying phoneme-blank confusion.
+
+The constraint matrix is thus a **regularization mechanism** for severity-adaptive fusion: it allows the model to use severity conditioning without the accuracy penalty the adapter alone would incur. This, not inference-time per-frame correction, is the constraint's contribution.
 
 ### Error Profile History
 

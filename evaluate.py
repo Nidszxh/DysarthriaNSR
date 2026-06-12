@@ -1580,13 +1580,17 @@ def evaluate_model(
 
     blank_constraint_threshold = 0.25
     try:
-        if hasattr(model, 'config') and hasattr(model.config, 'symbolic'):
+        if hasattr(model, 'symbolic_config'):
+            blank_constraint_threshold = float(
+                getattr(model.symbolic_config, 'blank_constraint_threshold', 0.25)
+            )
+        elif hasattr(model, 'config') and hasattr(model.config, 'symbolic'):
             blank_constraint_threshold = float(
                 getattr(model.config.symbolic, 'blank_constraint_threshold', 0.25)
             )
-        elif hasattr(model, 'model') and hasattr(model.model, 'symbolic_layer'):
+        elif hasattr(model, 'symbolic_layer'):
             blank_constraint_threshold = float(
-                getattr(model.model.symbolic_layer.config, 'blank_constraint_threshold', 0.25)
+                getattr(model.symbolic_layer.config, 'blank_constraint_threshold', 0.25)
             )
     except Exception:
         pass
@@ -1732,13 +1736,29 @@ def evaluate_model(
                 )
 
             if logits_neural is not None:
-                predictions_neural = greedy_decode(
-                    logits_neural, phn_to_id, id_to_phn,
-                    output_lengths=output_lengths,
-                    temperature=1.0,
-                    speaker_temperatures=speaker_temperatures if speaker_temperatures else None,
-                    speakers=speakers_batch,
-                )
+                if use_beam_search:
+                    predictions_neural = []
+                    for i in range(logits_neural.size(0)):
+                        valid_len = (
+                            int(output_lengths[i].item())
+                            if output_lengths is not None
+                            else logits_neural.size(1)
+                        )
+                        temp = speaker_temperatures.get(speakers_batch[i], 1.0) if speaker_temperatures else 1.0
+                        seq, score = decoder.decode(
+                            logits_neural[i, :valid_len].float().cpu().numpy(),
+                            id_to_phn,
+                            temperature=temp,
+                        )
+                        predictions_neural.append(seq)
+                else:
+                    predictions_neural = greedy_decode(
+                        logits_neural, phn_to_id, id_to_phn,
+                        output_lengths=output_lengths,
+                        temperature=1.0,
+                        speaker_temperatures=speaker_temperatures if speaker_temperatures else None,
+                        speakers=speakers_batch,
+                    )
                 all_predictions_neural.extend(predictions_neural)
 
             references = decode_references(labels, id_to_phn)

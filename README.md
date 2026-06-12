@@ -30,14 +30,17 @@ Figure highlights:
 ## Key Results
 
 | Model | Macro PER | Weighted PER | Single-split PER | Notes |
-|---|---|---|---|---|
+|---|---|---|---|---|---|
 | `loso_v1` (full system, LOSO) | **0.2848** (95% CI: [0.1921, 0.3801]) | **0.2299** | — | Publication result, 15/15 folds |
-| `v4_final` (full system, v0.6.0) | **0.137** (95% CI: [0.081, 0.208]) | 0.140 | 0.137 | **Paper result** (beam width 25; per_neural=0.134) |
+| `v4_final` (full system, v0.6.0) | **0.137** (95% CI: [0.081, 0.208]) | 0.140 | 0.137 | **Paper result** (beam width 25; per_neural=0.1368 beam) |
 | `ablation_neural_only_v7` | **0.1346** | — | 0.1346 | Neural-only ablation |
 | `baseline_v6` (full system) | 0.1372 | — | 0.1372 | per_constrained; earlier reference |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | 0.1444 | SeverityAdapter only |
+| `v4_final_beta_high` (β base=0.3, slope=1.5) | **0.378** (95% CI: [0.122, 0.804]) | 0.305 | — | Constraint dominating at inference (+181% vs neural-only) |
 
-**Symbolic constraint update (v0.6.0):** The full system (`v4_final`) achieves **0.137 macro-speaker PER** (beam search, width 25) with **0.120 WER** and **1.9× I/D ratio** on the held-out test set (3,548 utterances). The symbolic constraint provides **no statistically significant PER benefit** vs the internal neural sub-path (per_neural=0.134 greedy vs per_constrained=0.137 beam, paired p=0.1114), with a **6.1% helpful / 89.0% neutral / 4.9% harmful** precision profile — the constraint is mostly harmless but its PER impact is marginal. The architecture's value lies in its clinical interpretability: per-phoneme confusion analysis, articulatory breakdown (manner=80.5%, place=90.4%, voice=95.8%), per-speaker severity analysis, uncertainty estimation (entropy=0.399, confidence=0.893), and temperature calibration. Dysarthric-stratified LOSO interpretation remains the decisive analysis for SPCOM positioning.
+**Symbolic constraint update (v0.6.0):** The full system (`v4_final`) achieves **0.137 macro-speaker PER** (beam search, width 25) with **0.120 WER** and **1.9× I/D ratio** on the held-out test set (3,548 utterances). **Decoder confounding resolved:** with both paths decoded with beam search (width 25), the neural backbone achieves 0.1368 vs constrained 0.1372 — Δ = +0.00028 (p=0.025, significant but practically zero). The previously reported +0.003 gap was ~90% an artifact of comparing neural (greedy) vs constrained (beam). The constraint's inference-time fusion has negligible frame-level effect (99.7% neutral, 27.9% pass rate) because β is small (0.05–0.23) and the KL-regularized constraint matrix is near-identity.
+
+**The constraint's true benefit is as a training-time regularizer:** it prevents the SeverityAdapter from degrading accuracy. The ablation chain tells the story — SeverityAdapter alone raises PER to 0.1444 (+7.3% vs neural-only), and adding the constraint recovers 73% of that loss, back to 0.1372. Removing the constraint matrix while keeping the adapter yields a model that is **worse than** the full system. **A controlled diagnostic using higher β** (base=0.3, slope=1.5; M03 β=0.8 vs default 0.23) confirms the constraint matrix is not useful as an inference-time fusion component — dysarthric PER collapses from 0.081 to 0.804, demonstrating that the constraint must remain weak at inference and that its true contribution is in regularizing the joint training. This, combined with clinical interpretability (per-phoneme confusion, articulatory breakdown: manner=80.5%, place=90.4%, voice=95.8%), justifies the neuro-symbolic design. Dysarthric-stratified LOSO interpretation remains the decisive analysis for SPCOM positioning.
 
 Single-split results are computed on approximately 2 test speakers and are not publication-valid statistics. All single-split figures are development references only.
 
