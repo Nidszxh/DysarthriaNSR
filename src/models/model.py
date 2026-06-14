@@ -276,10 +276,11 @@ class SymbolicConstraintLayer(nn.Module):
         P_final = P_final / P_final.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # Phase 3 Fix B: blank-frame constraint masking.
-        # ~85% of CTC frames are blank-dominant.  Applying C to those frames only
-        # amplifies the blank posterior through the row of C that maps blank→blank,
-        # degrading PER.  Only apply the constrained distribution where the
-        # neural model is not already blank-dominant.
+        # Frames where P_neural[blank] ≥ blank_constraint_threshold (default 0.25)
+        # are blank-dominant.  Applying C to those frames amplifies the blank
+        # posterior through the row of C that maps blank→blank, degrading PER.
+        # Only apply the constrained distribution where neural output is not
+        # already blank-dominant.
         blank_threshold = getattr(self.config, 'blank_constraint_threshold', 0.25)
         non_blank_mask = (P_neural[:, :, 0] < blank_threshold).unsqueeze(-1)  # [B, T, 1]
         P_final = torch.where(non_blank_mask, P_final, P_neural)
@@ -313,7 +314,7 @@ class SymbolicConstraintLayer(nn.Module):
         norm = float(getattr(self.config, 'severity_normalization_constant', 5.0))
         sev_norm = speaker_severity.float() / norm
         beta_adaptive = self.beta + self.config.severity_beta_slope * sev_norm
-        return torch.clamp(beta_adaptive, 0.0, 0.8).view(-1, 1, 1)
+        return torch.clamp(beta_adaptive, 0.0, float(getattr(self.config, 'max_beta', 0.8))).view(-1, 1, 1)
 
     def _track_activations(
         self,
@@ -667,6 +668,8 @@ class NeuroSymbolicASR(nn.Module):
                 if hasattr(self.hubert, "config"):
                     setattr(self.hubert.config, "gradient_checkpointing", True)
                     logger.info("   Gradient checkpointing enabled (legacy mode)")
+                else:
+                    logger.warning("   Gradient checkpointing requested but not available")
         else:
             logger.info("   Gradient checkpointing disabled (speed mode)")
 

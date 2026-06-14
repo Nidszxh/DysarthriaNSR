@@ -66,7 +66,7 @@ from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, Symbolic
 # Import evaluate functions from root level
 from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('once')
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,7 @@ class DysarthriaASRLightning(pl.LightningModule):
 
         # Metrics tracking
         self.validation_step_outputs = []
+        self.test_step_outputs = []
 
         # When LOSO must resume with weights-only (fresh optimizer/scheduler),
         # this offset preserves epoch-aware behavior (staged unfreezing, KL ramp)
@@ -242,12 +243,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         else:
             ce_weights = torch.ones(num_classes, dtype=torch.float32)
 
-        # B2 fix: removed hard ×1.5 multiplier for <BLANK> and <PAD>.
-        # Those were insertion-era heuristics (baseline_v1/v2, I/D=4.6×).
-        # I/D is now 0.87× (resolved in v4); adding extra blank weight compounds
-        # with blank_target_prob KL and natural CTC blank-dominance, producing
-        # triple blank pressure that contributes to deletion/substitution dominance.
-        # blank_priority_weight config field remains (set to 1.0) for future use.
+        # NOTE: dataloader BLANK/PAD multipliers set to 1.0 (removed).
 
         # C1: Use CrossEntropyLoss (accepts raw logits, always non-negative)
         self.ce_loss = nn.CrossEntropyLoss(
@@ -285,7 +281,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             if sl.learnable_matrix is not None:
                 self.symbolic_kl_loss = SymbolicKLLoss(
                     sl.static_constraint_matrix,
-                    blank_penalty_weight=0.1,
+                    blank_penalty_weight=self.config.symbolic.blank_penalty_weight,
                     entropy_penalty_weight=self.config.symbolic.constraint_entropy_penalty_weight,
                 )
 
@@ -321,7 +317,7 @@ class DysarthriaASRLightning(pl.LightningModule):
                 try:
                     loss_fn.weight = loss_fn.weight.to(self.device)
                 except Exception:
-                    pass
+                    logger.warning("Failed to move loss weight tensor to device %s", self.device)
 
     def forward(self, batch: Dict) -> Dict:
         severity = _get_batch_severity(batch, batch['status'].device, self.config)
@@ -367,7 +363,9 @@ class DysarthriaASRLightning(pl.LightningModule):
         # 2. Frame-level CE applied to NEURAL logits (not constrained log-probs).
         # [FIX-T05] Use CTC forced alignment (torchaudio.functional.forced_align) when enabled.
         # This provides a phonetically grounded frame alignment, removing the need for the
-        # epoch gate that was a workaround for the bad proportional alignment.
+        # epoch gate that was a workaround for the bad proportional interpolation.
+        effective_epoch = int(self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0)))
+        frame_ce_start_epoch = int(self.config.training.frame_ce_start_epoch)
         use_forced_alignment = getattr(self.config.training, 'use_forced_alignment', True)
         if use_forced_alignment:
             # Forced alignment is accurate, so activate from epoch 0 without gating
@@ -379,8 +377,6 @@ class DysarthriaASRLightning(pl.LightningModule):
             )
         else:
             # Fallback to proportional interpolation with epoch gate
-            effective_epoch = int(self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0)))
-            frame_ce_start_epoch = int(getattr(self.config.training, 'frame_ce_start_epoch', 15))
             frame_ce_enabled = effective_epoch >= frame_ce_start_epoch
             if frame_ce_enabled:
                 loss_ce = self._compute_ce_loss(outputs.get('logits_neural', log_probs_constrained), labels)
@@ -424,14 +420,11 @@ class DysarthriaASRLightning(pl.LightningModule):
 
         # ── Ablation-mode weighting ──────────────────────────────────────────
         lambda_ctc = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ctc)
-        use_forced_alignment = getattr(self.config.training, 'use_forced_alignment', True)
         if use_forced_alignment:
             # Forced alignment is accurate, so no epoch gating needed
             lambda_ce = 0.0 if ablation == 'symbolic_only' else float(self.lambda_ce)
         else:
-            # Fallback: use epoch gate
-            effective_epoch = int(self.current_epoch + int(getattr(self, 'resume_epoch_offset', 0)))
-            frame_ce_start_epoch = int(getattr(self.config.training, 'frame_ce_start_epoch', 15))
+            # Fallback: use epoch gate (effective_epoch already computed above)
             frame_ce_enabled = effective_epoch >= frame_ce_start_epoch
             lambda_ce = 0.0 if (ablation == 'symbolic_only' or not frame_ce_enabled) else float(self.lambda_ce)
         lambda_art = float(self.lambda_articulatory)
@@ -579,6 +572,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # aligned is (alignment, log_probs) — alignment: [B_valid, max_T]
             alignments = aligned[0]
         except Exception:
+            logger.warning("Forced alignment failed — falling back to proportional interpolation")
             # Fallback path: process each sample individually with align_labels_to_logits
             fallback_samples = len(sample_info) if self.config.training.forced_alignment_fallback_warn else 0
             all_frame_losses = []
@@ -897,11 +891,11 @@ class DysarthriaASRLightning(pl.LightningModule):
 
         # I2: Staged lambda_blank_kl ramp
         tr = self.config.training
-        stage1_end = getattr(tr, 'blank_kl_stage1_end',   5)
-        stage2_end = getattr(tr, 'blank_kl_stage2_end',  15)
+        stage1_end = getattr(tr, 'blank_kl_stage1_end',  10)
+        stage2_end = getattr(tr, 'blank_kl_stage2_end',  20)
         val_s1 = getattr(tr, 'blank_kl_stage1_value', 0.10)
-        val_s2 = getattr(tr, 'blank_kl_stage2_value', 0.20)
-        target = tr.lambda_blank_kl  # Final value (default 0.35)
+        val_s2 = getattr(tr, 'blank_kl_stage2_value', 0.15)
+        target = tr.lambda_blank_kl  # Final value (default 0.20)
         if epoch < stage1_end:
             current_bkl = val_s1
         elif epoch < stage2_end:
@@ -1069,6 +1063,27 @@ class DysarthriaASRLightning(pl.LightningModule):
         # Clear for next epoch
         self.validation_step_outputs.clear()
 
+    def on_test_epoch_end(self) -> None:
+        """Aggregate and log test metrics using macro-speaker PER."""
+        if not self.test_step_outputs:
+            return
+
+        avg_loss = torch.stack([x['loss'] for x in self.test_step_outputs]).mean()
+
+        speaker_per_map: Dict[str, List[float]] = defaultdict(list)
+        for output in self.test_step_outputs:
+            for spk, per in zip(output.get('speakers', []), output.get('per_scores', [])):
+                speaker_per_map[spk].append(per)
+        if speaker_per_map:
+            avg_per = float(np.mean([np.mean(v) for v in speaker_per_map.values()]))
+        else:
+            all_scores = [s for o in self.test_step_outputs for s in o.get('per_scores', [])]
+            avg_per = float(np.mean(all_scores)) if all_scores else 0.0
+
+        self.log('test/per', avg_per)
+
+        self.test_step_outputs.clear()
+
     def _downsample_attn_mask(
         self,
         batch: Dict,
@@ -1163,10 +1178,21 @@ class DysarthriaASRLightning(pl.LightningModule):
         )
         references = decode_references(labels_f, self.id_to_phn)
         per_scores = [compute_per(pred, ref) for pred, ref in zip(predictions, references)]
-        avg_per = float(np.mean(per_scores)) if per_scores else 0.0
+
+        all_speakers = batch.get('speakers', [])
+        valid_speakers = [
+            all_speakers[i] for i in range(len(all_speakers))
+            if i < len(valid_mask) and valid_mask[i].item()
+        ] if all_speakers else []
+
+        self.test_step_outputs.append({
+            'loss': losses['loss'],
+            'per_scores': per_scores,
+            'speakers': valid_speakers,
+            'status': batch['status'][valid_mask],
+        })
 
         self.log('test/loss', losses['loss'])
-        self.log('test/per', avg_per)
 
         return losses
 
@@ -1188,7 +1214,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # HuBERT encoder — slower LR to avoid catastrophic forgetting
             {
                 'params': list(self.model.hubert.parameters()),
-                'lr': lr * 0.1,
+                'lr': lr * self.config.training.encoder_lr_multiplier,
                 'name': 'hubert_encoder',
             },
             # Classification head + severity adapter
@@ -1206,7 +1232,7 @@ class DysarthriaASRLightning(pl.LightningModule):
             # Symbolic layer (learnable C + β)
             {
                 'params': list(self.model.symbolic_layer.parameters()),
-                'lr': lr * 0.5,
+                'lr': lr * self.config.training.symbolic_lr_multiplier,
                 'name': 'symbolic_layer',
             },
         ]
@@ -1253,15 +1279,17 @@ class StratifiedMicroBatchSampler:
         labels,
         batch_size: int,
         dysarthric_ratio: float = 0.75,
+        seed: Optional[int] = None,
     ) -> None:
         self.dysarthric_idx = [i for i, l in enumerate(labels) if l == 1]
         self.control_idx = [i for i, l in enumerate(labels) if l == 0]
         self.batch_size = batch_size
         self.n_dys = max(1, int(dysarthric_ratio * batch_size))
         self.n_ctrl = batch_size - self.n_dys
+        self._seed = seed
 
     def __iter__(self):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self._seed)
         n_dys_total = len(self.dysarthric_idx)
         n_ctrl_total = len(self.control_idx)
         n_total = n_dys_total + n_ctrl_total
@@ -1373,6 +1401,7 @@ def create_dataloaders(
             train_labels,
             batch_size=config.training.batch_size,
             dysarthric_ratio=config.training.stratified_dysarthric_ratio,
+            seed=config.experiment.seed,
         )
         train_batch_sampler = train_sampler
         loader_batch_size = None
@@ -1506,6 +1535,7 @@ class _CompactFoldProgressCallback(pl.Callback):
         try:
             return f"{float(value):.3f}"
         except Exception:
+            logger.warning("Failed to format metric %s", value)
             return "n/a"
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -1527,7 +1557,6 @@ class _CompactFoldProgressCallback(pl.Callback):
             f"val/per={val_per} | blank={blank_mean}"
         )
         logger.info(msg)
-        print(msg)
 
 
 def _save_learning_curve(
@@ -2055,11 +2084,12 @@ def run_loso(
                 skip_fit = True
                 ckpt_path = None
             else:
-                # Guard against OneCycleLR exhaustion when extending runs or
-                # changing batch/accum settings between resumed launches.
-                # If scheduler state is already at/over total_steps, Lightning
-                # resume will fail with: "Tried to step X times... total steps Y".
-                # In that case, resume model weights only (fresh optimizer/scheduler).
+                # Guard against CosineAnnealingWarmRestarts exhaustion when
+                # extending runs or changing batch/accum settings between
+                # resumed launches. If scheduler state is already at/over
+                # total_steps, Lightning resume will fail with: "Tried to step
+                # X times... total steps Y".  In that case, resume model
+                # weights only (fresh optimizer/scheduler).
                 sched_exhausted = False
                 sched_total_steps = None
                 sched_last_epoch = None
@@ -2249,7 +2279,7 @@ def run_loso(
             try:
                 weights_only_marker.unlink()
             except Exception:
-                pass
+                logger.warning("Failed to clean up weights-only marker %s", weights_only_marker)
 
         # H-1: Explicit VRAM cleanup between folds — prevents OOM on 8 GB card.
         del trainer, lm, model

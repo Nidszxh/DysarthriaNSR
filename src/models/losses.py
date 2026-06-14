@@ -4,7 +4,7 @@ Research-Grade Loss Functions for Dysarthric Speech Recognition
 Three novel loss functions implementing the audit proposals:
 
 1. OrdinalContrastiveLoss   — Proposal P1: severity-aware representation learning
-2. BlankPriorKLLoss         — Fix for CTC insertion pathology (56× I/D ratio)
+2. BlankPriorKLLoss         — Fix for CTC insertion pathology (originally ~56× I/D ratio)
 3. SymbolicKLLoss           — Proposal P2: KL anchor for learnable constraint matrix
 
 All losses are additive and flag-controlled; existing CTC+CE baseline is unaffected
@@ -101,8 +101,8 @@ class BlankPriorKLLoss(nn.Module):
     Blank-Prior KL Regularisation — CTC Insertion Fix (Audit Issue R3).
 
     Problem: The frame-level CE loss applies NLLLoss on padded labels (fill=-100),
-    which never penalises non-blank emissions on silence frames. This causes the
-    56× insertion/deletion ratio (21,290 insertions vs 376 deletions).
+    which never penalises non-blank emissions on silence frames. This caused a
+    56× insertion/deletion ratio (21,290 insertions vs 376 deletions) in early baselines.
 
     Solution: Regularise the mean blank probability across all valid frames toward
     a target that matches typical CTC blank-emission rates (default 0.75 — empirically

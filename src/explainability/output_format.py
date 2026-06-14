@@ -7,8 +7,11 @@ pathologists.
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ExplainableOutputFormatter:
@@ -147,7 +150,7 @@ class ExplainableOutputFormatter:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
 
-        print(f"✅ Explanations saved to {output_path} ({len(self._explanations)} utterances)")
+        logger.info("Explanations saved to %s (%d utterances)", output_path, len(self._explanations))
         return output_path
 
     def clear(self) -> None:

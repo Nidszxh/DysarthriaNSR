@@ -1,8 +1,11 @@
+import logging
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DataPaths:
@@ -19,7 +22,7 @@ def run_diagnostics():
     manifest_path = paths.processed_dir / "torgo_neuro_symbolic_manifest.csv"
     
     if not manifest_path.exists():
-        print(f"Manifest not found at {manifest_path}")
+        logger.warning("Manifest not found at %s", manifest_path)
         return
 
     df = pd.read_csv(manifest_path)
@@ -28,10 +31,10 @@ def run_diagnostics():
     missing_phonemes_per_sec = df['phonemes_per_sec'].isna().sum() if 'phonemes_per_sec' in df.columns else len(df)
     missing_manner = df['manner_classes'].isna().sum() if 'manner_classes' in df.columns else len(df)
 
-    print("\nData Cleaning Summary")
-    print(f"  Total samples:           {len(df)}")
-    print(f"  Missing phonemes_per_sec: {missing_phonemes_per_sec}")
-    print(f"  Missing manner_classes:   {missing_manner}")
+    logger.info("Data Cleaning Summary")
+    logger.info("  Total samples:           %d", len(df))
+    logger.info("  Missing phonemes_per_sec: %d", missing_phonemes_per_sec)
+    logger.info("  Missing manner_classes:   %d", missing_manner)
     
     # Set the style
     sns.set_theme(style="whitegrid")
@@ -81,7 +84,7 @@ def run_diagnostics():
     plt.tight_layout()
     save_path = paths.results_dir / "dataset_diagnostics.png"
     plt.savefig(save_path, dpi=300)
-    print(f"Visualization saved to: {save_path}")
+    logger.info("Visualization saved to: %s", save_path)
 
 if __name__ == "__main__":
     run_diagnostics()

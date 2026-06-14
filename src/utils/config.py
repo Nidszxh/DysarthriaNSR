@@ -118,6 +118,7 @@ class ModelConfig:
     
     # Symbolic Neural-Fusion
     constraint_weight_init: float = 0.05
+    # UNUSED (reserved; articulatory distance always computed in _build_static_matrix)
     use_articulatory_distance: bool = True
 
     # --- Phase 3: Architectural additions (audit Proposals P2, P3) ---
@@ -151,6 +152,11 @@ class TrainingConfig:
     precision: str = "bf16-mixed" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "16-mixed"
     
     learning_rate: float = 3e-5
+    # Per-group LR multipliers relative to base learning_rate.
+    # HuBERT encoder: slower to avoid catastrophic forgetting.
+    # Symbolic layer: moderate to stabilise constraint matrix learning.
+    encoder_lr_multiplier: float = 0.1
+    symbolic_lr_multiplier: float = 0.5
     weight_decay: float = 0.01
     optimizer: str = "AdamW" 
     # [FIX-T04] Replaced OneCycleLR with CosineAnnealingWarmRestarts
@@ -161,7 +167,7 @@ class TrainingConfig:
     cosine_T_mult: int = 2      # each cycle is 2× the previous
     cosine_eta_min_ratio: float = 0.001  # eta_min = lr * this ratio
     warmup_steps: int = 250
-    warmup_ratio: float = 0.05
+    warmup_ratio: float = 0.05       # UNUSED (reserved; scheduler uses cosine_warm_restarts)
     
     batch_size: int = 12   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 36 with gradient accumulation
     gradient_accumulation_steps: int = 3   # Effective batch=36 (12×3)
@@ -177,19 +183,15 @@ class TrainingConfig:
     
     # Regularization & Loss
     dropout: float = 0.1
-    layer_dropout: float = 0.05
+    layer_dropout: float = 0.05      # UNUSED (reserved for future stochastic depth)
     label_smoothing: float = 0.1
     gradient_clip_val: float = 1.0
 
     # Multi-task loss weights (primary)
     lambda_ctc: float = 0.8
-    # [FIX-2] Frame-CE gated behind epoch 15 to allow CTC boundary learning first
-    # CTC lacks forced alignment, so frame labels are approximate proportional assignments.
-    # Early frame-CE was training classifier with noisy associations that conflicted
-    # with symbolic layer distribution-shifting. CTC-only for first 15 epochs fixes this.
-    # Audit §1.2: frame-CE was polluting constraint matrix training.
-    # [FIX-T05] Frame-CE now uses CTC forced alignment (torchaudio.functional.forced_align),
-    # so the gate can be disabled (frame_ce_start_epoch=0) and lambda_ce increased.
+    # [FIX-2] (Historical) Frame-CE was originally gated behind epoch 15 because CTC
+    # lacked forced alignment. [FIX-T05] replaced proportional interpolation with
+    # torchaudio.functional.forced_align, so the gate is disabled (frame_ce_start_epoch=0).
     frame_ce_start_epoch: int = 0
     use_forced_alignment: bool = True
     forced_alignment_fallback_warn: bool = True
@@ -218,7 +220,7 @@ class TrainingConfig:
     blank_kl_stage2_end: int = 20
     blank_kl_stage2_value: float = 0.15
     # Symbolic KL anchor (keeps learnable C near symbolic prior)
-    # §3.8 fix: 0.05 with batchmean/V=47 rows → effective per-row weight ≈0.001,
+    # §3.8 fix: Old 0.05 with batchmean/V=47 had effective per-row weight ≈0.001,
     # too weak to prevent degenerate constraint matrix.  0.5 gives ~0.01 per row.
     lambda_symbolic_kl: float = 0.5
     # Staged lambda_symbolic_kl warmup — gentle constraint at first, full after
@@ -238,14 +240,14 @@ class TrainingConfig:
     # Audit §1.4: early stopping was biasing aggregate metrics.
     loso_early_stopping_patience: int = 22
     beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
-    beam_lm_weight: float = 0.0           # Bigram LM shallow-fusion weight (0.0 = disabled)
+    beam_lm_weight: float = 0.0           # UNUSED (reserved for LM shallow-fusion; evaluate.py passes it via CLI flag)
     save_top_k: int = 2
     
     # HW Acceleration — optimised for RTX 4060 + modern NVMe
     num_workers: int = 8          # saturate PCIe; was 4
     pin_memory: bool = True
     prefetch_factor: int = 4       # deeper prefetch queue reduces GPU stalls; was 2
-    blank_priority_weight: float = 1.0  # B2 fix: reduced from 2.5 — insertion bias resolved (I/D=0.87×); no special blank boost needed
+    blank_priority_weight: float = 1.0  # UNUSED (reserved) — dataloader BLANK/PAD multipliers set to 1.0 directly
 
     # --- Phase 4: Training infrastructure (audit G2, ablations) ---
     # Leave-One-Speaker-Out cross-validation (opt-in, keeps fast single-split default)
@@ -311,22 +313,28 @@ class SymbolicConfig:
     voice_weight: float = 0.25
     distance_decay_factor: float = 3.0
     min_rule_confidence: float = 0.05  # C5: lowered to 0.05; β ≈ 0.05–0.20 at typical operating range
-    severity_threshold_mild: float = 2.0
-    severity_threshold_severe: float = 4.0
+    severity_threshold_mild: float = 2.0   # UNUSED (reserved for future severity binning)
+    severity_threshold_severe: float = 4.0 # UNUSED (reserved for future severity binning)
     constraint_entropy_penalty_weight: float = 0.05
     track_rule_activations: bool = True
-    generate_confusion_matrix: bool = True
+    generate_confusion_matrix: bool = True  # UNUSED (reserved; confusion matrix generated unconditionally in evaluate.py)
     severity_beta_slope: float = 0.2
     # TORGO severity range spans [0.0, 4.9]; 5.0 is the ceiling for the
     # binary status → severity fallback.  Used to normalise severity values
     # into [0, 1] for adaptive beta and severity adapter conditioning.
     severity_normalization_constant: float = 5.0
+    # Upper bound for adaptive beta clamping. 0.8 means symbolic constraint
+    # can contribute at most 80% weight even for the most severe dysarthria.
+    max_beta: float = 0.8
     # [FIX-1] Blank-frame constraint threshold lowered from 0.5 → 0.25
     # Previously ~85% of CTC frames bypassed the constraint, producing near-zero
     # gradient signal to logit_C and beta. 0.25 allows constraint to act on
     # ambiguous transition frames while still protecting blank-dominant frames.
     # Audit §1.1: blank-frame bypass threshold too aggressive.
     blank_constraint_threshold: float = 0.25
+    # Blank-column penalty weight in SymbolicKLLoss (default 0.1).
+    # Penalises blank-dominated rows in the learned constraint matrix.
+    blank_penalty_weight: float = 0.1
 
 
 # --- Master Config Handler ---
@@ -361,14 +369,17 @@ class Config:
         """
         if self.device == "cuda":
             total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-            # Conservative upper-bound estimate (BF16/FP16):
-            # - Full parameters kept resident in low precision
-            # - Gradients + AdamW optimizer states only for trainable params
-            # - Activation memory scales with batch/time/active layers
-            # - Add fixed runtime reserve for CUDA workspaces/caching allocator
-            # These are intentionally approximate to avoid false confidence.
-            bytes_per_param = 2 if "16" in str(self.training.precision) or "bf16" in str(self.training.precision).lower() else 4
-            T_frames = self.data.max_audio_length * 50  # ~50 Hz HuBERT output
+            # Estimate breakdown:
+            # - Parameters: stored in fp32 regardless of mixed precision (4 bytes each)
+            # - Gradients: use compute dtype (bf16 → 2 bytes, fp32 → 4 bytes)
+            # - AdamW optimizer states: always fp32 m+v (8 bytes per trainable param)
+            # - Activations: use compute dtype, scaled by layers × batch × frames
+            # - Runtime reserve: CUDA workspaces, caching allocator overhead, NCCL
+            is_mixed = str(self.training.precision).startswith("bf16") or str(self.training.precision).startswith("16")
+            param_bytes = 4       # params always fp32 in Lightning mixed precision
+            compute_bytes = 2 if is_mixed else 4
+            # Temporal downsampler halves HuBERT 50Hz output to ~25Hz.
+            T_frames = self.data.max_audio_length * 25  # post-downsampler frames
             hidden = 768
 
             # Architecture constants for HuBERT-base + task heads.
@@ -379,15 +390,18 @@ class Config:
             # Stage-dependent activation proxies.
             active_layers_warmup = 0   # encoder frozen warmup
             active_layers_peak = max(1, 12 - len(self.model.freeze_encoder_layers))
-            activation_factor = 16.0   # conservative multiplier for saved intermediates
+            # Gradient checkpointing stores far fewer intermediates; without it,
+            # saved activations scale ~2-3× per layer.  16× is for no-checkpointing.
+            ckpt = self.model.use_gradient_checkpointing
+            activation_factor = 3.0 if ckpt else 16.0
 
             def _estimate(trainable_params: int, active_layers: int) -> float:
-                param_gb = (total_params * bytes_per_param) / 1e9
-                grad_gb = (trainable_params * bytes_per_param) / 1e9
-                optim_gb = (trainable_params * 8) / 1e9  # AdamW m+v in fp32
+                param_gb = (total_params * param_bytes) / 1e9
+                grad_gb = (trainable_params * compute_bytes) / 1e9
+                optim_gb = (trainable_params * 8) / 1e9  # AdamW m+v always fp32
                 act_gb = (
                     self.training.batch_size * T_frames * hidden * max(1, active_layers) *
-                    bytes_per_param * activation_factor
+                    compute_bytes * activation_factor
                 ) / 1e9
                 runtime_reserve_gb = 1.2
                 return param_gb + grad_gb + optim_gb + act_gb + runtime_reserve_gb
@@ -395,22 +409,25 @@ class Config:
             est_warmup = _estimate(trainable_warmup, active_layers_warmup)
             est_peak = _estimate(trainable_peak, active_layers_peak)
             margin = total_vram - est_peak
-            print(f"--- ⚡ RTX 4060 OPTIMIZATION ---")
-            print(
-                f"Est. VRAM (warmup→peak): {est_warmup:.2f}GB → {est_peak:.2f}GB / {total_vram:.2f}GB "
-                f"(peak margin: {margin:.2f}GB) "
-                f"[batch={self.training.batch_size}, T={int(T_frames)}, peak_active_layers={active_layers_peak}]"
+            ckpt_label = "on" if ckpt else "off"
+            logger.info("--- ⚡ VRAM ESTIMATE ---")
+            logger.info(
+                "Warmup→Peak: %.2fGB → %.2fGB / %.2fGB (margin: %.2fGB) "
+                "[batch=%d, T=%.0f, peak_active_layers=%d, ckpt=%s]",
+                est_warmup, est_peak, total_vram, margin,
+                self.training.batch_size, T_frames,
+                active_layers_peak, ckpt_label,
             )
-            # Show factual instantaneous allocator usage for context.
             allocated = torch.cuda.memory_allocated(0) / 1e9
             reserved = torch.cuda.memory_reserved(0) / 1e9
-            print(f"CUDA now (allocated/reserved): {allocated:.2f}GB / {reserved:.2f}GB")
-            print(f"Precision: {self.training.precision} | Batch Size: {self.training.batch_size}")
-            print(f"SeverityAdapter: {self.model.use_severity_adapter} | "
-                  f"LearnableC: {self.model.use_learnable_constraint} | "
-                  f"Ablation: {self.training.ablation_mode}")
-            print("Note: estimate is conservative and not a direct profiler reading.")
-            print(f"----------------------------------")
+            logger.info("CUDA now (allocated/reserved): %.2fGB / %.2fGB", allocated, reserved)
+            logger.info("Precision: %s | Batch Size: %d", self.training.precision, self.training.batch_size)
+            logger.info("SeverityAdapter: %s | LearnableC: %s | Ablation: %s",
+                        self.model.use_severity_adapter,
+                        self.model.use_learnable_constraint,
+                        self.training.ablation_mode)
+            logger.info("Note: estimate is conservative and not a direct profiler reading.")
+            logger.info("----------------------------------")
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the config for saving/logging."""

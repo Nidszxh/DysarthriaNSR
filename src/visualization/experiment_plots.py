@@ -19,8 +19,11 @@ Usage (from generate_figures.py)::
 from __future__ import annotations
 
 import json
+import logging
 import warnings
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
@@ -1153,9 +1156,9 @@ def generate_all_plots(
     if error_counts:
         p = plot_error_distribution(error_counts, save_dir / "error_distribution.png")
         saved["error_distribution"] = p
-        print(f"  ✓ error_distribution           → {p.name}")
+        logger.info("  ✓ error_distribution           → %s", p.name)
     else:
-        print("  ⚠  error_distribution skipped — error_counts missing")
+        logger.warning("  ⚠  error_distribution skipped — error_counts missing")
 
     # ------------------------------------------------------------------
     # 2. PER by Speaker
@@ -1164,9 +1167,9 @@ def generate_all_plots(
         p = plot_per_by_speaker(per_speaker, save_dir / "per_by_speaker.png",
                                 severity_map=severity_map)
         saved["per_by_speaker"] = p
-        print(f"  ✓ per_by_speaker               → {p.name}")
+        logger.info("  ✓ per_by_speaker               → %s", p.name)
     else:
-        print("  ⚠  per_by_speaker skipped — per_speaker missing")
+        logger.warning("  ⚠  per_by_speaker skipped — per_speaker missing")
 
     # ------------------------------------------------------------------
     # 3. Severity vs PER
@@ -1174,16 +1177,16 @@ def generate_all_plots(
     if per_speaker and severity_map:
         p = plot_severity_vs_per(per_speaker, severity_map, save_dir / "severity_vs_per.png")
         saved["severity_vs_per"] = p
-        print(f"  ✓ severity_vs_per              → {p.name}")
+        logger.info("  ✓ severity_vs_per              → %s", p.name)
     else:
-        print("  ⚠  severity_vs_per skipped — per_speaker or severity_map missing")
+        logger.warning("  ⚠  severity_vs_per skipped — per_speaker or severity_map missing")
 
     # ------------------------------------------------------------------
     # 4. Uncertainty vs PER
     # ------------------------------------------------------------------
     p = plot_uncertainty_vs_per(utterances, save_dir / "uncertainty_vs_per.png")
     saved["uncertainty_vs_per"] = p
-    print(f"  ✓ uncertainty_vs_per           → {p.name}")
+    logger.info("  ✓ uncertainty_vs_per           → %s", p.name)
 
     # ------------------------------------------------------------------
     # 5. Uncertainty Distribution
@@ -1191,7 +1194,7 @@ def generate_all_plots(
     p = plot_uncertainty_distribution(utterances, severity_map or {},
                                       save_dir / "uncertainty_distribution.png")
     saved["uncertainty_distribution"] = p
-    print(f"  ✓ uncertainty_distribution     → {p.name}")
+    logger.info("  ✓ uncertainty_distribution     → %s", p.name)
 
     # ------------------------------------------------------------------
     # 5b. Rule-Pair Confusion
@@ -1201,9 +1204,9 @@ def generate_all_plots(
         p = plot_rule_pair_confusion(rule_pair_confusion,
                                      save_dir / "rule_pair_confusion.png")
         saved["rule_pair_confusion"] = p
-        print(f"  ✓ rule_pair_confusion          → {p.name}")
+        logger.info("  ✓ rule_pair_confusion          → %s", p.name)
     else:
-        print("  ⚠  rule_pair_confusion skipped — not present in eval_results")
+        logger.warning("  ⚠  rule_pair_confusion skipped — not present in eval_results")
 
     # ------------------------------------------------------------------
     # 6. Experiment Comparison (macro-PER bar chart, multi-run)
@@ -1212,13 +1215,13 @@ def generate_all_plots(
         merged = {run_name: eval_results, **comparison_results}
         p = plot_experiment_comparison(merged, save_dir / "experiment_comparison.png")
         saved["experiment_comparison"] = p
-        print(f"  ✓ experiment_comparison        → {p.name}")
+        logger.info("  ✓ experiment_comparison        → %s", p.name)
     else:
         p = plot_experiment_comparison(
             {run_name: eval_results}, save_dir / "experiment_comparison.png"
         )
         saved["experiment_comparison"] = p
-        print(f"  ✓ experiment_comparison        → {p.name}  (single run)")
+        logger.info("  ✓ experiment_comparison        → %s  (single run)", p.name)
 
     # ------------------------------------------------------------------
     # 7. Neural vs Constrained PER (single run)
@@ -1227,9 +1230,9 @@ def generate_all_plots(
         p = plot_neural_vs_constrained(symbolic_impact,
                                        save_dir / "neural_vs_constrained.png")
         saved["neural_vs_constrained"] = p
-        print(f"  ✓ neural_vs_constrained        → {p.name}")
+        logger.info("  ✓ neural_vs_constrained        → %s", p.name)
     else:
-        print("  ⚠  neural_vs_constrained skipped — symbolic_impact missing")
+        logger.warning("  ⚠  neural_vs_constrained skipped — symbolic_impact missing")
 
     # ------------------------------------------------------------------
     # 7b. Neural vs Constrained PER — multi-run (when comparisons provided)
@@ -1240,7 +1243,7 @@ def generate_all_plots(
             merged_si, save_dir / "neural_vs_constrained_comparison.png"
         )
         saved["neural_vs_constrained_comparison"] = p
-        print(f"  ✓ neural_vs_constrained_cmp    → {p.name}")
+        logger.info("  ✓ neural_vs_constrained_cmp    → %s", p.name)
 
     # ------------------------------------------------------------------
     # 8. Articulatory Accuracy (single run)
@@ -1249,9 +1252,9 @@ def generate_all_plots(
         p = plot_articulatory_accuracy(articulatory_acc,
                                        save_dir / "articulatory_accuracy.png")
         saved["articulatory_accuracy"] = p
-        print(f"  ✓ articulatory_accuracy        → {p.name}")
+        logger.info("  ✓ articulatory_accuracy        → %s", p.name)
     else:
-        print("  ⚠  articulatory_accuracy skipped — articulatory_accuracy missing")
+        logger.warning("  ⚠  articulatory_accuracy skipped — articulatory_accuracy missing")
 
     # ------------------------------------------------------------------
     # 8b. Articulatory Accuracy — multi-run (when comparisons provided)
@@ -1262,7 +1265,7 @@ def generate_all_plots(
             merged_aa, save_dir / "articulatory_accuracy_comparison.png"
         )
         saved["articulatory_accuracy_comparison"] = p
-        print(f"  ✓ articulatory_accuracy_cmp    → {p.name}")
+        logger.info("  ✓ articulatory_accuracy_cmp    → %s", p.name)
 
     # ------------------------------------------------------------------
     # 9. PER by Sequence Length
@@ -1270,9 +1273,9 @@ def generate_all_plots(
     if by_length:
         p = plot_by_length(by_length, save_dir / "per_by_length.png")
         saved["per_by_length"] = p
-        print(f"  ✓ per_by_length                → {p.name}")
+        logger.info("  ✓ per_by_length                → %s", p.name)
     else:
-        print("  ⚠  per_by_length skipped — by_length missing")
+        logger.warning("  ⚠  per_by_length skipped — by_length missing")
 
     # ------------------------------------------------------------------
     # 10. Per-Phoneme PER
@@ -1280,9 +1283,9 @@ def generate_all_plots(
     if per_phoneme_per:
         p = plot_phoneme_per(per_phoneme_per, save_dir / "per_phoneme_per.png")
         saved["per_phoneme_per"] = p
-        print(f"  ✓ per_phoneme_per              → {p.name}")
+        logger.info("  ✓ per_phoneme_per              → %s", p.name)
     else:
-        print("  ⚠  per_phoneme_per skipped — per_phoneme_per.json not loaded")
+        logger.warning("  ⚠  per_phoneme_per skipped — per_phoneme_per.json not loaded")
 
     # ------------------------------------------------------------------
     # 11. PER by Manner (P3.3 new)
@@ -1290,9 +1293,9 @@ def generate_all_plots(
     if per_by_manner:
         p = plot_per_by_manner(per_by_manner, save_dir / "per_by_manner.png")
         saved["per_by_manner"] = p
-        print(f"  ✓ per_by_manner               → {p.name}")
+        logger.info("  ✓ per_by_manner               → %s", p.name)
     else:
-        print("  ⚠  per_by_manner skipped — per_by_manner dict not provided")
+        logger.warning("  ⚠  per_by_manner skipped — per_by_manner dict not provided")
 
-    print(f"\n  All figures saved to: {save_dir}")
+    logger.info("\n  All figures saved to: %s", save_dir)
     return saved

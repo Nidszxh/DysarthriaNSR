@@ -235,11 +235,24 @@ def test7_compact_progress_callback_output() -> None:
         config = DummyConfig()
 
     cb = _CompactFoldProgressCallback()
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        cb.on_validation_epoch_end(DummyTrainer(), DummyModule())
 
+    import logging
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO)
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    # Suppress other loggers to isolate callback output
+    logging.getLogger().setLevel(logging.WARNING)
+
+    cb.on_validation_epoch_end(DummyTrainer(), DummyModule())
+
+    handler.flush()
     out = buffer.getvalue()
+    logger.removeHandler(handler)
+    logging.getLogger().setLevel(logging.WARNING)
+
     assert "Epoch" in out and "val/per" in out and "blank=" in out, (
         f"Unexpected compact callback output: {out!r}"
     )

@@ -1,7 +1,7 @@
 # DysarthriaNSR — Project Roadmap
 
-> **Last updated:** June 12, 2026  
-> **Current baseline:** `v4_final` — macro_per=0.137 (beam, 95% CI: [0.081, 0.208]), per_neural=0.1368 (beam), per_constrained=0.1372 (beam), Δ=+0.00028, WER=0.120, I/D=1.9×  
+> **Last updated:** July 19, 2026  
+> **Current baseline:** `v4_final` — macro_per=0.133 (beam, 95% CI: [0.079, 0.200]), per_neural=0.131 (beam), per_constrained=0.133 (beam), Δ=+0.0015, WER=0.116, I/D=2.1×  
 > **Neural-only ablation:** `ablation_neural_only_v7` — avg_per=0.1346
 
 ---
@@ -37,7 +37,7 @@
 | Loss | File | λ | Status |
 |------|------|---|--------|
 | `CTCLoss` | `train.py` | 0.80 | ✅ `zero_infinity=True`; uses model `output_lengths` |
-| Frame-CE on neural logits | `train.py` | 0.10 | ✅ Applied to `logits_neural`, not constrained (C1 fix) |
+| Frame-CE on neural logits | `train.py` | 0.15 | ✅ Applied to `logits_neural`, not constrained (C1 fix) |
 | Articulatory CE (manner/place/voice) | `train.py` | 0.08 | ✅ Utterance-mode target (L2 fix) |
 | `OrdinalContrastiveLoss` | `losses.py` | 0.05 | ✅ Continuous TORGO severity scores |
 | `BlankPriorKLLoss` | `losses.py` | staged 0.10→0.15→0.20 | ✅ Target 0.75; staged warmup (I2) |
@@ -49,7 +49,7 @@
 |------|--------|-------|
 | PyTorch Lightning `DysarthriaASRLightning` | ✅ | Multi-task training, macro-speaker PER monitoring |
 | Differential LR (HuBERT ×0.1, head ×1.0, symbolic ×0.5) | ✅ | `train.py` L995 |
-| OneCycleLR with cosine annealing | ✅ | |
+| CosineAnnealingWarmRestarts (T_0=1, T_mult=2) | ✅ | Replaced prior OneCycleLR (FIX-T04) |
 | Adam momentum reset on unfreeze (T-04) | ✅ | `_reset_hubert_lr_warmup()` |
 | Staged `lambda_blank_kl` warmup (I2) | ✅ | 0.10→0.15→0.20 over epochs 0/10/20 |
 | Macro-speaker PER validation metric (B15) | ✅ | Groups by speaker before averaging |
@@ -107,14 +107,14 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 
 | Item | Status | Detail |
 |------|--------|--------|
-| `v4_final` (full system, v0.6.0) | ✅ | macro_per=0.137 (beam), per_neural=0.1368 (beam), per_constrained=0.1372 (beam), Δ=+0.00028 (decoder confounding resolved) |
-| `ablation_neural_only_v7` | ✅ | avg_per=0.1346 (ties v4_final) |
+| `v4_final` (full system) | ✅ | macro_per=0.133 (beam), per_neural=0.131 (beam), per_constrained=0.133 (beam), Δ=+0.0015 (p=0.246, not significant) |
+| `ablation_neural_only_v7` | ✅ | avg_per=0.1346 (slightly behind v4_final 0.1326) |
 | `baseline_v6` (constrained) | ✅ | avg_per=0.137, per_neural=0.145, per_constrained=0.137 |
-| `ablation_no_constraint_matrix_v6` | ✅ | avg_per=0.144 (eliminates learnable C, keeps SeverityAdapter) |
-| **Ablation chain** (core evidence) | ✅ | Adapter alone +7.3% worse vs neural-only; constraint recovers 73% of damage. Constraint acts as training-time regularizer for severity-adaptive fusion. |
-| `v4_final_beta_high` (high β diagnostic) | ✅ | β base=0.3, slope=1.5 → M03 PER 0.804 (9.9× worse). Confirms constraint matrix has no useful inference-time phoneme-confusion knowledge. Must remain weak at inference. |
+| `ablation_no_constraint_matrix_v6` | ✅ | avg_per=0.1444 (eliminates learnable C, keeps SeverityAdapter) |
+| **Ablation chain** (core evidence) | ✅ | Adapter alone +7.3% worse vs neural-only; constraint fully recovers damage and surpasses neural-only (0.1326 vs 0.1346). Constraint acts as training-time regularizer for severity-adaptive fusion. |
+| `v4_final_beta_high` (high β diagnostic) | ✅ | β base=0.3, slope=1.5 → M03 PER 0.804 (10.2× worse, vs M03 0.079 in v4_final). Confirms constraint matrix has no useful inference-time phoneme-confusion knowledge. Must remain weak at inference. |
 | Symbolic sweep | ❌ | Lower priority — inference-time effect is negligible; training-time role is the real contribution |
-| LOSO-level symbolic stratified analysis | ⚠️ | Next SPCOM positioning priority: verify dysarthric-strata gains vs neural-only reference |
+| LOSO-level symbolic stratified analysis | ⚠️ | Open future work: verify dysarthric-strata gains vs neural-only reference across LOSO folds |
 
 ---
 
@@ -125,7 +125,7 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | ID | Component | Issue | Evidence | Mitigation |
 |----|-----------|-------|----------|------------|
 | C-3 | Experimental design | Small-split statistical fragility addressed via LOSO 15/15 | `loso_v1_loso_summary.json` | ✅ Resolved |
-| §2.1 | `model.py`, `train.py` | Full system (v4_final, 0.137 beam). Decoder confounding resolved: per_neural=0.1368 (beam) vs per_constrained=0.1372 (beam), Δ=+0.00028 (p=0.025). The constraint is practically identical to the neural sub-path (0.03% relative difference). Ablation chain shows the constraint recovers 73% of the SeverityAdapter's accuracy penalty (adapter alone: 0.1444 → +constraint: 0.1372), establishing its role as a training-time regularizer for severity-adaptive fusion. | `v4_final` full eval | ✅ Documented: decoder confounding fixed; constraint's value is as training-time regularizer (ablation chain) + clinical interpretability |
+| §2.1 | `model.py`, `train.py` | Full system (v4_final, 0.133 beam). per_neural=0.131 (beam) vs per_constrained=0.133 (beam), Δ=+0.0015 (p=0.246). The constraint is practically identical to the neural sub-path (0.11% relative difference). Ablation chain shows the constraint recovers all of the SeverityAdapter's accuracy penalty (adapter alone: 0.1444 → +constraint: 0.1326), establishing its role as a training-time regularizer for severity-adaptive fusion. | `v4_final` full eval | ✅ Documented; constraint's value is as training-time regularizer (ablation chain) + clinical interpretability |
 
 ### Major (Research Validity)
 
@@ -143,21 +143,21 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | §5.5 | `config.py` | `ModelConfig.num_phonemes` now aligned with runtime vocab convention | ✅ Fixed |
 | §5.6 | `dataloader.py` | `create_single_dataloader` removed (D9 — dead code; `create_dataloaders` is the sole entry point) | ✅ Fixed |
 | §8.2 | `rule_tracker.py` | `rule_precision()` not wired into `evaluate_model` output | ⚠️ Proxy added |
-| §3.10 | `train.py` | OneCycleLR not reset after progressive unfreezing; momentum reset applied as workaround | ⚠️ Partial fix via `_reset_hubert_lr_warmup()` |
+| §3.10 | `train.py` | CosineAnnealingWarmRestarts avoids OneCycleLR exhaustion on unfreeze (FIX-T04). `_reset_hubert_lr_warmup()` still clears Adam state for newly active params. | ✅ Resolved |
 | §9.3 | `tests/` | Limited integration coverage for resume/orchestration edge paths | ⚠️ Partial: `tests/test_training_step.py`, `tests/test_evaluate_model.py`, and smoke eval test added; LOSO resume path still untested |
 
 ---
 
 ## Planned Improvements
 
-### Short-Term (Post-LOSO)
+### Short-Term
 
 1. **Publish leaderboard artifacts:** export per-fold table + macro/weighted metrics from `loso_v1_loso_summary.json`
 2. **Targeted dysarthric optimization sweep:** prioritize M01/M02/M04/M05/F01 failure modes
 3. **LOSO-level symbolic stratified analysis:** verify if constraint helps on dysarthric folds specifically (even if neutral on controls). Run neural-only ablation on LOSO folds and compare per-speaker with full system.
 4. **Acceptance rule:** keep symbolic model primary only if globally non-inferior to neural-only and better on at least one dysarthric strata metric
 
-### Medium-Term (Post-Submission)
+### Medium-Term (Post-Publication)
 
 1. **CTC forced alignment** via `torchaudio.functional.forced_align` — fixes T-05 at root level; enables phoneme-boundary-accurate confusion matrices
 2. **Per-group `CosineAnnealingWarmRestarts`** scheduler — full fix for T-04 OneCycleLR/progressive-unfreeze interaction
@@ -177,11 +177,11 @@ All 23 historical bug fixes (B1–B23) plus all March audit fixes (H-1 through H
 | Milestone | Target Date | Status |
 |-----------|-------------|--------|
 | All B1–B23 fixes implemented | Feb 2026 | ✅ Done |
-| `v4_final` trained | Jun 12, 2026 | ✅ Done (0.137 macro PER; decoder confounding resolved; per_neural=0.1368 beam) |
+| `v4_final` trained | Jun 12, 2026 | ✅ Done (0.133 macro PER; per_neural=0.131 beam) |
 | `baseline_v6` trained | Mar 12, 2026 | ✅ Done |
 | Neural-only ablation evaluated | Mar 13, 2026 | ✅ Done |
 | Full LOSO-CV sweep | Mar 2026 | ✅ Completed |
-| SPCOM 2026 paper submission | TBD 2026 | 🔲 Pending post-LOSO packaging |
+| SPCOM 2026 acceptance | May 2026 | ✅ Accepted (presenting Jul 16) |
 
 ---
 

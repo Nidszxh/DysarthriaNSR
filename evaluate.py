@@ -635,11 +635,12 @@ def decode_predictions(
     use_beam_search: bool = False,
     beam_width: int = 10,
     output_lengths: Optional[torch.Tensor] = None,
-    lm_scorer: Optional[BigramLMScorer] = None,
+    lm_scorer: Optional['BigramLMScorer'] = None,
     lm_weight: float = 0.0,
     temperature: float = 1.0,
     speaker_temperatures: Optional[Dict[str, float]] = None,
     speakers: Optional[List[str]] = None,
+    length_norm_alpha: float = 0.6,
 ) -> List[List[str]]:
     """
     Decode model logits into phoneme sequences.
@@ -659,13 +660,10 @@ def decode_predictions(
         speakers:            Optional list of speaker IDs for the batch (aligned with batch).
     """
     if use_beam_search:
-        # §3.1 fix: `config` is not in scope here; use hardcoded default 0.6
-        # (caller can override indirectly through BeamSearchDecoder constructor).
-        _alpha = 0.6
         decoder = BeamSearchDecoder(
             beam_width=beam_width,
             blank_id=phn_to_id['<BLANK>'],
-            length_norm_alpha=_alpha,
+            length_norm_alpha=length_norm_alpha,
             lm_scorer=lm_scorer,
             lm_weight=lm_weight,
         )
@@ -760,6 +758,7 @@ def phoneme_alignment(
 
             return alignment
         except Exception:
+            logger.debug("Rapidfuzz alignment failed, falling back to pure-Python path")
             # Safety-first: keep original pure-Python path on any unexpected error.
             pass
 
@@ -1229,7 +1228,7 @@ def plot_confusion_matrix(
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Saved confusion matrix to {save_path}")
+    logger.info(f"✅ Saved confusion matrix to {save_path}")
 
 
 def plot_per_by_length(
@@ -1261,7 +1260,7 @@ def plot_per_by_length(
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Saved length-stratified PER plot to {save_path}")
+    logger.info(f"✅ Saved length-stratified PER plot to {save_path}")
 
 
 def plot_rule_impact(
@@ -1332,9 +1331,9 @@ def plot_rule_impact(
         fig.tight_layout()
         fig.savefig(save_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
-        print("✅ Constraint matrix heatmap saved (E6 fallback)")
+        logger.info("✅ Constraint matrix heatmap saved (E6 fallback)")
     except Exception as _e6_exc:
-        print(f"⚠️  Constraint matrix heatmap failed (non-fatal): {_e6_exc}")
+        logger.info(f"⚠️  Constraint matrix heatmap failed (non-fatal): {_e6_exc}")
 
 
 def plot_blank_histogram(blank_probs: List[float], save_path: Path, target_prob: float = 0.75) -> None:
@@ -1428,7 +1427,7 @@ def plot_per_phoneme_breakdown(
     sorted_items = sorted(filtered.items(), key=lambda x: x[1]['per'], reverse=True)[:top_k]
 
     if not sorted_items:
-        print(f"⚠️  No phonemes with ≥{min_refs} reference occurrences — skipping per-phoneme plot.")
+        logger.info(f"⚠️  No phonemes with ≥{min_refs} reference occurrences — skipping per-phoneme plot.")
         return
 
     phonemes = [item[0] for item in sorted_items]
@@ -1457,7 +1456,7 @@ def plot_per_phoneme_breakdown(
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅ Saved per-phoneme PER chart to {save_path}")
+    logger.info(f"✅ Saved per-phoneme PER chart to {save_path}")
 
 
 # COMPREHENSIVE EVALUATION
@@ -1530,21 +1529,22 @@ def evaluate_model(
             if _gc_was_enabled:
                 hubert.gradient_checkpointing_disable()
     except Exception:
-        pass  # Non-fatal — proceed without GC disable
+        logger.warning("Could not disable gradient checkpointing during eval — proceeding anyway")
 
     # Initialize decoder
     if use_beam_search:
+        _alpha = getattr(config.training, 'beam_length_norm_alpha', 0.6) if config is not None else 0.6
         decoder = BeamSearchDecoder(
             beam_width=beam_width,
             blank_id=phn_to_id['<BLANK>'],
-            length_norm_alpha=0.6,
+            length_norm_alpha=_alpha,
             lm_scorer=lm_scorer,
             lm_weight=lm_weight,
         )
         _lm_tag = f", LM λ={lm_weight:.2f}" if (lm_scorer is not None and lm_weight > 0) else ""
-        print(f"🔍 Using beam search decoder (width={beam_width}{_lm_tag})")
+        logger.info(f"🔍 Using beam search decoder (width={beam_width}{_lm_tag})")
     else:
-        print("🔍 Using greedy decoder")
+        logger.info("🔍 Using greedy decoder")
 
     # ── Per-speaker temperature calibration ──────────────────────────────────
     speaker_temperatures: Dict[str, float] = {}
@@ -1553,7 +1553,7 @@ def evaluate_model(
         if use_cal:
             temp_range = getattr(config.experiment, 'temperature_calibration_range', (0.5, 3.0))
             target_blank = getattr(config.training, 'blank_target_prob', 0.75)
-            print("🔧 Calibrating per-speaker temperatures on val set...")
+            logger.info("🔧 Calibrating per-speaker temperatures on val set...")
             speaker_temperatures = calibrate_speaker_temperatures(
                 model, val_loader, phn_to_id, device,
                 temperature_range=temp_range,
@@ -1564,10 +1564,10 @@ def evaluate_model(
             try:
                 with open(temp_path, 'w') as f:
                     json.dump(speaker_temperatures, f, indent=2)
-                print(f"📝 Speaker temperatures saved to {temp_path}")
+                logger.info(f"📝 Speaker temperatures saved to {temp_path}")
             except Exception:
-                pass
-            print(f"🔧 Calibrated temperatures for {len(speaker_temperatures)} speakers")
+                logger.warning("Failed to save speaker temperatures to %s", temp_path)
+            logger.info(f"🔧 Calibrated temperatures for {len(speaker_temperatures)} speakers")
 
     all_predictions = []
     all_references = []
@@ -1578,22 +1578,18 @@ def evaluate_model(
     all_blank_probs: List[float] = []   # I2: per-utterance mean blank probability
     all_constraint_pass_rates: List[float] = []  # P1.1: per-utterance frame-pass ratio for symbolic mask
 
-    blank_constraint_threshold = 0.25
+    blank_constraint_threshold = 0.25  # fallback default
     try:
         if hasattr(model, 'symbolic_config'):
             blank_constraint_threshold = float(
-                getattr(model.symbolic_config, 'blank_constraint_threshold', 0.25)
-            )
-        elif hasattr(model, 'config') and hasattr(model.config, 'symbolic'):
-            blank_constraint_threshold = float(
-                getattr(model.config.symbolic, 'blank_constraint_threshold', 0.25)
+                getattr(model.symbolic_config, 'blank_constraint_threshold', blank_constraint_threshold)
             )
         elif hasattr(model, 'symbolic_layer'):
             blank_constraint_threshold = float(
-                getattr(model.symbolic_layer.config, 'blank_constraint_threshold', 0.25)
+                getattr(model.symbolic_layer.config, 'blank_constraint_threshold', blank_constraint_threshold)
             )
     except Exception:
-        pass
+        logger.warning("Could not extract blank_constraint_threshold from model — using default")
 
     articulatory_results = {"manner": [], "place": [], "voice": []}
 
@@ -1607,11 +1603,11 @@ def evaluate_model(
             uncertainty_decoder = UncertaintyAwareDecoder(
                 model, n_samples=uncertainty_n_samples
             )
-            print(f"🎲 MC-Dropout uncertainty enabled ({uncertainty_n_samples} samples)")
+            logger.info(f"🎲 MC-Dropout uncertainty enabled ({uncertainty_n_samples} samples)")
         except Exception as exc:
-            print(f"⚠️  UncertaintyAwareDecoder unavailable (non-fatal): {exc}")
+            logger.info(f"⚠️  UncertaintyAwareDecoder unavailable (non-fatal): {exc}")
 
-    print("🔍 Running evaluation...")
+    logger.info("🔍 Running evaluation...")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -1663,7 +1659,7 @@ def evaluate_model(
                         elif isinstance(conf, (list, tuple)):
                             all_confidence_scores.extend(list(conf))
                 except Exception:
-                    pass  # Non-fatal; uncertainty simply not recorded for this batch
+                    logger.warning("Uncertainty prediction failed for batch — skipping")
 
             # Decode predictions
             log_probs_constrained = outputs.get('log_probs_constrained', outputs['logits_constrained'])
@@ -1691,7 +1687,7 @@ def evaluate_model(
                             mask_batch.float().mean(dim=1).detach().cpu().tolist()
                         )
                 except Exception:
-                    pass
+                    logger.warning("Constraint pass-rate computation failed — skipping")
 
             # I2: Track per-utterance mean blank probability for insertion diagnostic
             try:
@@ -1706,7 +1702,7 @@ def evaluate_model(
                 else:
                     all_blank_probs.extend(blank_probs_batch.mean(dim=1).cpu().tolist())
             except Exception:
-                pass  # Non-fatal
+                logger.warning("Blank probability tracking failed for batch — skipping")
 
             if use_beam_search:
                 # Beam search (slower but more accurate)
@@ -1802,24 +1798,24 @@ def evaluate_model(
                             articulatory_results[key].append(acc)
 
             if (batch_idx + 1) % 100 == 0:
-                print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
+                logger.info(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
 
     # Compute overall metrics
     per_scores = [compute_per(p, r) for p, r in zip(all_predictions, all_references)]
 
     if all_constraint_pass_rates:
-        print(
+        logger.info(
             "   Constraint frame-pass rate "
             f"(P(blank) < {blank_constraint_threshold:.2f}): "
             f"{float(np.mean(all_constraint_pass_rates)):.1%}"
         )
 
     # Corpus-level WER (I1 / E2) — join phoneme sequences as space-separated tokens
-    print("📝 Computing corpus-level WER...")
+    logger.info("📝 Computing corpus-level WER...")
     predictions_text = [' '.join(p) for p in all_predictions]
     references_text = [' '.join(r) for r in all_references]
     corpus_wer = compute_wer_texts(predictions_text, references_text)
-    print(f"   WER: {corpus_wer:.3f}")
+    logger.info(f"   WER: {corpus_wer:.3f}")
 
     # ── Macro-average PER over speakers (audit fix S4) ────────────────────────
     # Group per-scores by speaker, compute per-speaker mean, then macro-average
@@ -1873,7 +1869,7 @@ def evaluate_model(
             'rule_precision': helpful_count / total,
             'n_utterances':  total,
         }
-        print(
+        logger.info(
             f"   Constraint precision  — helpful: {helpful_count/total:.1%}  "
             f"neutral: {neutral_count/total:.1%}  harmful: {harmful_count/total:.1%}"
         )
@@ -1917,7 +1913,7 @@ def evaluate_model(
     _all_alignments: Optional[List[List[Tuple]]] = None
     _neural_alignments: Optional[List[List[Tuple]]] = None
     if _need_full_alignments:
-        print("🔍 Pre-computing phoneme alignments (shared cache for all analysis functions)...")
+        logger.info("🔍 Pre-computing phoneme alignments (shared cache for all analysis functions)...")
         _all_alignments = [
             phoneme_alignment(p, r) for p, r in zip(all_predictions, all_references)
         ]
@@ -1927,31 +1923,31 @@ def evaluate_model(
             ]
 
     # Phoneme-level error analysis
-    print("📊 Analyzing phoneme-level errors...")
+    logger.info("📊 Analyzing phoneme-level errors...")
     error_analysis = analyze_phoneme_errors(all_predictions, all_references, alignments=_all_alignments)
 
     # Per-phoneme PER breakdown (E3)
-    print("📊 Computing per-phoneme PER breakdown...")
+    logger.info("📊 Computing per-phoneme PER breakdown...")
     per_phoneme_breakdown = compute_per_phoneme_breakdown(all_predictions, all_references, alignments=_all_alignments)
     _breakdown_path = results_dir / 'per_phoneme_per.json'
     with open(_breakdown_path, 'w') as _f:
         json.dump(per_phoneme_breakdown, _f, indent=2)
-    print(f"✅ Saved per_phoneme_per.json ({len(per_phoneme_breakdown)} phonemes)")
+    logger.info(f"✅ Saved per_phoneme_per.json ({len(per_phoneme_breakdown)} phonemes)")
     plot_per_phoneme_breakdown(per_phoneme_breakdown, results_dir / 'per_phoneme_per.png')
 
     # Articulatory-stratified PER (H4 / E-02): PER broken down by manner class
-    print("📊 Computing articulatory-stratified PER (E-02)...")
+    logger.info("📊 Computing articulatory-stratified PER (E-02)...")
     try:
         per_by_manner = compute_articulatory_stratified_per(all_predictions, all_references, alignments=_all_alignments)
         with open(results_dir / 'per_by_manner.json', 'w') as _f:
             json.dump(per_by_manner, _f, indent=2)
-        print(f"✅ Saved per_by_manner.json ({len(per_by_manner)} manner classes)")
+        logger.info(f"✅ Saved per_by_manner.json ({len(per_by_manner)} manner classes)")
     except Exception as _e:
         per_by_manner = {}
-        print(f"⚠️  per_by_manner failed (non-fatal): {_e}")
+        logger.info(f"⚠️  per_by_manner failed (non-fatal): {_e}")
 
     # Rule-pair confusion analysis (H4 / E-03): neural vs. constrained sub counts per rule
-    print("📊 Computing rule-pair confusion analysis (E-03)...")
+    logger.info("📊 Computing rule-pair confusion analysis (E-03)...")
     rule_pair_confusion: Dict = {}
     if all_predictions_neural and len(all_predictions_neural) == len(all_references):
         _rules_for_analysis = symbolic_rules or {}
@@ -1967,28 +1963,26 @@ def evaluate_model(
                 )
                 with open(results_dir / 'rule_pair_confusion.json', 'w') as _f:
                     json.dump(rule_pair_confusion, _f, indent=2)
-                print(f"✅ Saved rule_pair_confusion.json ({len(rule_pair_confusion)} rule pairs)")
+                logger.info(f"✅ Saved rule_pair_confusion.json ({len(rule_pair_confusion)} rule pairs)")
             except Exception as _e:
-                print(f"⚠️  rule_pair_confusion failed (non-fatal): {_e}")
+                logger.info(f"⚠️  rule_pair_confusion failed (non-fatal): {_e}")
         else:
-            print("ℹ️  rule_pair_confusion skipped: no symbolic_rules provided")
+            logger.info("ℹ️  rule_pair_confusion skipped: no symbolic_rules provided")
     else:
-        print("ℹ️  rule_pair_confusion skipped: neural predictions not available")
+        logger.info("ℹ️  rule_pair_confusion skipped: neural predictions not available")
 
     # Generate visualizations
-    print("📈 Generating visualizations...")
+    logger.info("📈 Generating visualizations...")
     plot_confusion_matrix(error_analysis['confusion_matrix'], results_dir / 'confusion_matrix.png')
     plot_per_by_length(stratified_by_length, results_dir / 'per_by_length.png')
     plot_clinical_gap(dysarthric_mean, control_mean, results_dir / 'clinical_gap.png')
 
     # I2: Blank probability histogram (always generated; key insertion-bias diagnostic)
     if all_blank_probs:
-        _blank_target = 0.75
-        if hasattr(model, "config") and hasattr(model.config, "training"):
-            _blank_target = float(getattr(model.config.training, "blank_target_prob", _blank_target))
+        _blank_target = float(getattr(config.training, 'blank_target_prob', 0.75)) if config is not None else 0.75
         plot_blank_histogram(all_blank_probs, results_dir / 'blank_probability_histogram.png',
                              target_prob=_blank_target)
-        print(f"✅ Blank probability histogram saved "
+        logger.info(f"✅ Blank probability histogram saved "
               f"(mean={float(np.mean(all_blank_probs)):.3f})")
 
     # C-4: Severity vs PER scatter plot (key SPCOM figure)
@@ -1998,18 +1992,18 @@ def evaluate_model(
         _sev_plot_path = plot_severity_vs_per(
             speaker_metrics, TORGO_SEVERITY_MAP, results_dir / 'severity_vs_per.png'
         )
-        print(f"✅ Severity vs PER scatter saved → {_sev_plot_path.name}")
+        logger.info(f"✅ Severity vs PER scatter saved → {_sev_plot_path.name}")
     except Exception as _sev_exc:
-        print(f"⚠️  Severity vs PER scatter failed (non-fatal): {_sev_exc}")
+        logger.info(f"⚠️  Severity vs PER scatter failed (non-fatal): {_sev_exc}")
 
     # C-5: Rule-pair confusion bar chart (symbolic constraint impact per rule)
     if rule_pair_confusion:
         try:
             from src.visualization.experiment_plots import plot_rule_pair_confusion as _plot_rpc
             _rpc_path = _plot_rpc(rule_pair_confusion, results_dir / 'rule_pair_confusion.png')
-            print(f"✅ Rule-pair confusion chart saved → {_rpc_path.name}")
+            logger.info(f"✅ Rule-pair confusion chart saved → {_rpc_path.name}")
         except Exception as _rpc_exc:
-            print(f"⚠️  Rule-pair confusion chart failed (non-fatal): {_rpc_exc}")
+            logger.info(f"⚠️  Rule-pair confusion chart failed (non-fatal): {_rpc_exc}")
 
     rule_stats = None
     if hasattr(model, 'get_rule_statistics'):
@@ -2075,11 +2069,12 @@ def evaluate_model(
             pearson_r,  pearson_p = stats.pearsonr(sev_scores, per_scores_spk)
             spearman_r, spearman_p = stats.spearmanr(sev_scores, per_scores_spk)
             if not correlation_valid:
-                print(f"ℹ️   Severity ↔ PER correlation computed (n={n_speakers_eval} speakers — "
+                logger.info(f"ℹ️   Severity ↔ PER correlation computed (n={n_speakers_eval} speakers — "
                       f"descriptive only; ≥5 needed for statistical validity)")
         else:
             pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
     except Exception:
+        logger.warning("Severity–PER correlation computation failed")
         pearson_r = pearson_p = spearman_r = spearman_p = float('nan')
 
     # ── Articulatory confusion + Explainability (ROADMAP §6, audit Phase 5) ───
@@ -2105,9 +2100,9 @@ def evaluate_model(
             _art_analyzer.accumulate_from_errors(_subs)
             _attributed_errors.append(_errors)
         _art_analyzer.plot_feature_confusion(results_dir / 'articulatory_confusion.png')
-        print("✅ Articulatory confusion matrix saved")
+        logger.info("✅ Articulatory confusion matrix saved")
     except Exception as _art_exc:
-        print(f"⚠️  Articulatory confusion matrix failed (non-fatal): {_art_exc}")
+        logger.info(f"⚠️  Articulatory confusion matrix failed (non-fatal): {_art_exc}")
 
     if generate_explanations:
         try:
@@ -2140,9 +2135,9 @@ def evaluate_model(
                 )
                 formatter.add(explanation)
             formatter.save_explanations(results_dir)
-            print("✅ Explainability artifacts generated")
+            logger.info("✅ Explainability artifacts generated")
         except Exception as exc:
-            print(f"⚠️  Explainability module failed (non-fatal): {exc}")
+            logger.info(f"⚠️  Explainability module failed (non-fatal): {exc}")
 
     # Compile results
     results = {
@@ -2239,37 +2234,37 @@ def evaluate_model(
     with open(results_dir / 'evaluation_results.json', 'w') as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n✅ Results saved to {results_dir}")
+    logger.info(f"\n✅ Results saved to {results_dir}")
 
     # Print summary
-    print("\n" + "="*65)
-    print("📊 EVALUATION SUMMARY")
-    print("="*65)
-    print(f"Overall PER  (macro-speaker): {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
-    print(f"Overall PER  (sample-mean):   {sample_mean_per:.3f}")
-    print(f"Corpus WER   (phoneme-level): {corpus_wer:.3f}")
-    print(f"Dysarthric   (sample-mean):   {dysarthric_mean:.3f} (n={len(dysarthric_per)})")
-    print(f"Control      (sample-mean):   {control_mean:.3f} (n={len(control_per)})")
+    logger.info("\n" + "="*65)
+    logger.info("📊 EVALUATION SUMMARY")
+    logger.info("="*65)
+    logger.info(f"Overall PER  (macro-speaker): {mean_per:.3f} (95% CI: [{per_ci[0]:.3f}, {per_ci[1]:.3f}])")
+    logger.info(f"Overall PER  (sample-mean):   {sample_mean_per:.3f}")
+    logger.info(f"Corpus WER   (phoneme-level): {corpus_wer:.3f}")
+    logger.info(f"Dysarthric   (sample-mean):   {dysarthric_mean:.3f} (n={len(dysarthric_per)})")
+    logger.info(f"Control      (sample-mean):   {control_mean:.3f} (n={len(control_per)})")
     _corr_note = f"n={n_speakers_eval}" if correlation_valid else f"n={n_speakers_eval}, descriptive only"
-    print(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f}) [{_corr_note}]")
-    print(f"Wilcoxon p (dys vs ctrl):     {p_val_wilcox:.4f} (Holm-corr: {p_corrected[1]:.4f})")
-    print(f"\nError Breakdown:")
-    print(f"  Correct:        {error_analysis['error_counts']['correct']}")
-    print(f"  Substitutions:  {error_analysis['error_counts']['substitutions']}")
-    print(f"  Deletions:      {error_analysis['error_counts']['deletions']}")
-    print(f"  Insertions:     {error_analysis['error_counts']['insertions']}")
+    logger.info(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f}) [{_corr_note}]")
+    logger.info(f"Wilcoxon p (dys vs ctrl):     {p_val_wilcox:.4f} (Holm-corr: {p_corrected[1]:.4f})")
+    logger.info(f"\nError Breakdown:")
+    logger.info(f"  Correct:        {error_analysis['error_counts']['correct']}")
+    logger.info(f"  Substitutions:  {error_analysis['error_counts']['substitutions']}")
+    logger.info(f"  Deletions:      {error_analysis['error_counts']['deletions']}")
+    logger.info(f"  Insertions:     {error_analysis['error_counts']['insertions']}")
     ins = error_analysis['error_counts']['insertions']
     dels = error_analysis['error_counts']['deletions']
     ratio_str = f"{ins/max(dels, 1):.1f}×" if dels > 0 else "N/A"
-    print(f"  I/D ratio:      {ratio_str}  (target: <3×)")
-    print("="*65)
+    logger.info(f"  I/D ratio:      {ratio_str}  (target: <3×)")
+    logger.info("="*65)
 
     # P3.5: Re-enable gradient checkpointing if it was enabled before eval
     try:
         if _gc_was_enabled:
             hubert.gradient_checkpointing_enable()
     except Exception:
-        pass  # Non-fatal
+        logger.warning("Could not re-enable gradient checkpointing after eval")
 
     return results
 
@@ -2281,18 +2276,18 @@ def main() -> None:
     ref = ['B', 'AH', 'T', 'AH', 'L']
 
     per = compute_per(pred, ref)
-    print(f"PER: {per:.3f}")
+    logger.info(f"PER: {per:.3f}")
 
     # Test confidence interval
     per_scores = [0.1, 0.2, 0.15, 0.18, 0.12, 0.25]
     mean, ci = compute_per_with_ci(per_scores)
-    print(f"Mean PER: {mean:.3f} (95% CI: [{ci[0]:.3f}, {ci[1]:.3f}])")
+    logger.info(f"Mean PER: {mean:.3f} (95% CI: [{ci[0]:.3f}, {ci[1]:.3f}])")
 
     # Test alignment
     alignment = phoneme_alignment(pred, ref)
-    print("\nAlignment:")
+    logger.info("\nAlignment:")
     for op, p, r in alignment:
-        print(f"{op:12s} | Pred: {p or '-':5s} | Ref: {r or '-':5s}")
+        logger.info(f"{op:12s} | Pred: {p or '-':5s} | Ref: {r or '-':5s}")
 
 
 if __name__ == "__main__":

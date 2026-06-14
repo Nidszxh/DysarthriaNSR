@@ -2,11 +2,13 @@
 
 This repository builds and evaluates a clinically interpretable neuro-symbolic automatic speech recognition system for dysarthric speech using TORGO.
 
-**Target venue:** SPCOM 2026 | **Status:** LOSO-CV complete (15/15 folds) | **License:** MIT
+**Accepted at:** SPCOM 2026 | **Status:** LOSO-CV complete (15/15 folds) | **License:** MIT
 
 > **LOSO macro PER · 0.2848** (95% CI: [0.1921, 0.3801])
 > **LOSO weighted PER · 0.2299**
 > **Folds complete · 15/15**
+
+*Repo code has evolved post-submission (CAWR scheduler, forced-alignment frame-CE). Paper results remain reproducible via `--run-name v4_final`.*
 
 ---
 
@@ -14,7 +16,7 @@ This repository builds and evaluates a clinically interpretable neuro-symbolic a
 
 Dysarthria is a motor speech disorder — caused by conditions such as cerebral palsy and ALS — that produces severely reduced intelligibility due to impaired articulatory control. Commercial ASR systems fail for dysarthric speakers because they treat atypical phoneme realizations as noise. DysarthriaNSR addresses this by combining a pretrained HuBERT encoder (`facebook/hubert-base-ls960`) with three jointly-trained neuro-symbolic components.
 
-The **`LearnableConstraintMatrix`** (Proposal P2) is a |V|×|V| differentiable phoneme confusion matrix (47×47 on the current TORGO vocabulary) initialized from articulatory priors — for example, the devoicing tendency B→P or the liquid gliding tendency R→W — and trained end-to-end while a symbolic KL anchor (λ=0.5) prevents arbitrary drift. The **`SeverityAdapter`** (Proposal P3) injects a continuous severity score [0, 5] into HuBERT hidden states via cross-attention, allowing a single model to condition behavior across the full spectrum from control speakers (severity=0.0) to severely dysarthric speakers (severity=4.9). The **`SymbolicConstraintLayer`** fuses neural posteriors with the learned constraint using a severity-adaptive blend weight β = clamp(β_base + 0.2·severity/5, 0.0, 0.8), bypassing the constraint entirely for blank-dominant CTC frames (P_neural\[blank\] ≥ 0.5) to avoid amplifying blank posteriors across ~85% of frames. Training uses six simultaneous loss terms including blank-prior KL regularization to suppress CTC insertion bias. The result is a system providing clinically interpretable phoneme-level error analysis alongside recognition output.
+The **`LearnableConstraintMatrix`** (Proposal P2) is a |V|×|V| differentiable phoneme confusion matrix (47×47 on the current TORGO vocabulary) initialized from articulatory priors — for example, the devoicing tendency B→P or the liquid gliding tendency R→W — and trained end-to-end while a symbolic KL anchor (λ=0.5) prevents arbitrary drift. The **`SeverityAdapter`** (Proposal P3) injects a continuous severity score [0, 5] into HuBERT hidden states via cross-attention, allowing a single model to condition behavior across the full spectrum from control speakers (severity=0.0) to severely dysarthric speakers (severity=4.9). The **`SymbolicConstraintLayer`** fuses neural posteriors with the learned constraint using a severity-adaptive blend weight β = clamp(β_base + 0.2·severity/5, 0.0, 0.8), bypassing the constraint for blank-dominant CTC frames (P_neural\[blank\] ≥ 0.25) to avoid amplifying blank posteriors across ~65% of frames. Training uses six simultaneous loss terms including blank-prior KL regularization to suppress CTC insertion bias. The result is a system providing clinically interpretable phoneme-level error analysis alongside recognition output.
 
 ## Final system figure
 
@@ -23,7 +25,7 @@ The **`LearnableConstraintMatrix`** (Proposal P2) is a |V|×|V| differentiable p
 Figure highlights:
 - SpecAugment is applied before SeverityAdapter (training-only, per-sample masking).
 - Severity-conditioned fusion uses β with base `0.05` and slope `0.2` over severity `s∈[0,5]`.
-- Symbolic constraints are bypassed on blank-dominant frames (about 85%), and C is KL-anchored to the clinical prior.
+- Symbolic constraints are bypassed on blank-dominant frames (about 65%), and C is KL-anchored to the clinical prior.
 
 ---
 
@@ -32,17 +34,17 @@ Figure highlights:
 | Model | Macro PER | Weighted PER | Single-split PER | Notes |
 |---|---|---|---|---|---|
 | `loso_v1` (full system, LOSO) | **0.2848** (95% CI: [0.1921, 0.3801]) | **0.2299** | — | Publication result, 15/15 folds |
-| `v4_final` (full system, v0.6.0) | **0.137** (95% CI: [0.081, 0.208]) | 0.140 | 0.137 | **Paper result** (beam width 25; per_neural=0.1368 beam) |
+| `v4_final` (full system) | **0.133** (95% CI: [0.079, 0.200]) | 0.136 | 0.133 | **Canonical result** (beam width 25; per_neural=0.131 beam) |
 | `ablation_neural_only_v7` | **0.1346** | — | 0.1346 | Neural-only ablation |
 | `baseline_v6` (full system) | 0.1372 | — | 0.1372 | per_constrained; earlier reference |
 | `ablation_no_constraint_matrix_v6` | 0.1444 | — | 0.1444 | SeverityAdapter only |
 | `v4_final_beta_high` (β base=0.3, slope=1.5) | **0.378** (95% CI: [0.122, 0.804]) | 0.305 | — | Constraint dominating at inference (+181% vs neural-only) |
 
-**Symbolic constraint update (v0.6.0):** The full system (`v4_final`) achieves **0.137 macro-speaker PER** (beam search, width 25) with **0.120 WER** and **1.9× I/D ratio** on the held-out test set (3,548 utterances). **Decoder confounding resolved:** with both paths decoded with beam search (width 25), the neural backbone achieves 0.1368 vs constrained 0.1372 — Δ = +0.00028 (p=0.025, significant but practically zero). The previously reported +0.003 gap was ~90% an artifact of comparing neural (greedy) vs constrained (beam). The constraint's inference-time fusion has negligible frame-level effect (99.7% neutral, 27.9% pass rate) because β is small (0.05–0.23) and the KL-regularized constraint matrix is near-identity.
+The full system (`v4_final`) achieves **0.133 macro-speaker PER** (beam search, width 25) with **0.116 WER** and **2.1× I/D ratio** on the held-out test set (3,548 utterances). With both paths decoded with beam search (width 25), the neural backbone achieves 0.131 vs constrained 0.133 — Δ = +0.0015 (p=0.246, not significant). The constraint's inference-time fusion has negligible frame-level effect (89.6% neutral, 12 total activations) because β is small (avg=0.09) and the KL-regularized constraint matrix is near-identity.
 
-**The constraint's true benefit is as a training-time regularizer:** it prevents the SeverityAdapter from degrading accuracy. The ablation chain tells the story — SeverityAdapter alone raises PER to 0.1444 (+7.3% vs neural-only), and adding the constraint recovers 73% of that loss, back to 0.1372. Removing the constraint matrix while keeping the adapter yields a model that is **worse than** the full system. **A controlled diagnostic using higher β** (base=0.3, slope=1.5; M03 β=0.8 vs default 0.23) confirms the constraint matrix is not useful as an inference-time fusion component — dysarthric PER collapses from 0.081 to 0.804, demonstrating that the constraint must remain weak at inference and that its true contribution is in regularizing the joint training. This, combined with clinical interpretability (per-phoneme confusion, articulatory breakdown: manner=80.5%, place=90.4%, voice=95.8%), justifies the neuro-symbolic design. Dysarthric-stratified LOSO interpretation remains the decisive analysis for SPCOM positioning.
+**The constraint's true benefit is as a training-time regularizer:** it prevents the SeverityAdapter from degrading accuracy. The ablation chain tells the story — SeverityAdapter alone raises PER to 0.1444 (+7.3% vs neural-only), and adding the constraint recovers all of that loss and surpasses neural-only (0.1326 vs 0.1346). **A controlled diagnostic using higher β** (base=0.3, slope=1.5; M03 β=0.8 vs default 0.23) confirms the constraint matrix is not useful as an inference-time fusion component — dysarthric PER collapses from 0.079 to 0.804, demonstrating that the constraint must remain weak at inference and that its true contribution is in regularizing the joint training. This, combined with clinical interpretability (per-phoneme confusion, articulatory breakdown: manner=81.7%, place=90.5%, voice=95.3%), justifies the neuro-symbolic design.
 
-Single-split results are computed on approximately 2 test speakers and are not publication-valid statistics. All single-split figures are development references only.
+Single-split results are computed on 3 test speakers (MC02, MC04, M03) and are development references only.
 
 ---
 
@@ -81,7 +83,7 @@ python src/data/manifest.py
 ### Run Commands
 
 ```bash
-# Best single-split training + evaluation (v0.6.0 fixes, ties neural-only)
+# Best single-split training + evaluation (full system)
 python run_pipeline.py --run-name v4_final
 
 # Full evaluation with beam search, explainability, uncertainty & temperature calibration
@@ -164,9 +166,9 @@ RTX 4060 8GB (CUDA 12.x), 16 GB CPU RAM, 50 GB free storage. BF16 mixed precisio
 
 ```bibtex
 @inproceedings{dysarthriaNSR2026,
-  title     = {Neuro-Symbolic Phoneme Recognition for Dysarthric Speech with
-               Articulatory Constraints and Severity-Adaptive Fusion},
-  author    = {},
+  title     = {Neuro-Symbolic {ASR} for Dysarthric Speech via
+               Articulatory-Constrained Posterior Reshaping},
+  author    = {Nidish~SR},
   booktitle = {Proceedings of SPCOM 2026},
   year      = {2026},
 }

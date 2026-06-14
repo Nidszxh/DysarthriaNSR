@@ -56,7 +56,9 @@ class SymbolicProcessor:
 
     @lru_cache(maxsize=2048)
     def get_features(self, text: str) -> Dict[str, object]:
-        """Convert transcript to phonemes and multi-dimensional classes."""
+        """Convert transcript to phonemes and multi-dimensional classes.
+        LRU cache avoids re-running G2P for repeated transcripts across speakers.
+        G2P text cache (this) is separate from the per-sample feature cache in dataloader.py."""
         if not self.g2p or not text:
             return {"phn": "", "manner": "", "place": "", "voice": "", "count": 0}
 
@@ -105,6 +107,7 @@ def calculate_audio_metrics(audio_path: Path) -> Dict:
             "duration": round(float(duration), 3)
         }
     except Exception:
+        logger.warning("Failed to compute audio features for %s", audio_path)
         return {"rms": 0.0, "duration": 0.0}
 
 # --- MAIN PIPELINE ---

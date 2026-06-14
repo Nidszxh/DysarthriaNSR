@@ -74,7 +74,7 @@ graph LR
 | Parameter | Default | Description |
 |---|---|---|
 | `use_severity_adapter` | `True` | Enable/disable adapter |
-| `severity_adapter_dim` | `64` | Bottleneck dim for severity projection (Linear(1,64)→SiLU→Linear(64,768)) |
+| `severity_adapter_dim` | `128` | Bottleneck dim for severity projection (Linear(1,128)→SiLU→Linear(128,768)) |
 | `hidden_dim` (cross-attn) | `768` | Matches HuBERT output dim |
 | `n_heads` | `8` | Multi-head attention heads |
 | `classifier_dropout` | `0.1` | Dropout on attention output |
@@ -181,7 +181,7 @@ P_final = mask * P_fused + ~mask * P_neural
 log_probs_constrained = log(P_final.clamp_min(1e-6))
 ```
 
-**Blank-frame masking:** ~85% of CTC frames are blank-dominant. Applying the constraint to those frames amplifies blank posteriors through the blank row of C, degrading PER. Only non-blank-dominant frames receive symbolic correction.
+**Blank-frame masking:** Frames where P_neural[blank] ≥ blank_constraint_threshold (default 0.25, configurable via `SymbolicConfig.blank_constraint_threshold`) are blank-dominant. Applying the constraint to those frames amplifies blank posteriors through the blank row of C, degrading PER. Only non-blank-dominant frames receive symbolic correction.
 
 **Adaptive β:** Control speakers (severity=0.0) get β≈0.05; severe dysarthric speakers (severity≈4.9) get β≈0.25. The maximum is clamped to 0.8 to always retain some neural contribution.
 
@@ -196,6 +196,7 @@ log_probs_constrained = log(P_final.clamp_min(1e-6))
 | `severity_normalization_constant` | `5.0` | Normalization for adaptive β: `severity / norm` |
 | `blank_constraint_threshold` | `0.25` | Blank-dominance gate threshold (FIX-1: lowered from 0.5) |
 | `constraint_entropy_penalty_weight` | `0.05` | Row-entropy MSE penalty for constraint matrix |
+| `blank_penalty_weight` | `0.1` | Blank-column mass penalty in SymbolicKLLoss; penalises blank-dominated constraint rows |
 | `min_rule_confidence` | `0.05` | Minimum β for rule activation logging (C5 fix) |
 
 **`_track_activations()` (B4b fix):** Wrapped in `torch.no_grad()` to prevent building an unused gradient graph during inference. Capped at 100 indices per call; `SymbolicRuleTracker` caps total activations at `_MAX_ACTIVATIONS = 50,000` (H-5 fix).
@@ -207,9 +208,9 @@ log_probs_constrained = log(P_final.clamp_min(1e-6))
 Controlled via `--ablation` flag (stored in `config.training.ablation_mode`):
 
 | Mode | SeverityAdapter | SymbolicConstraintLayer | Art Heads | Best single-split PER | Notes |
-|---|---|---|---|---|---|
-| `full` | ✅ | ✅ learnable C | ✅ | **0.137** | **Paper result** (beam width 25; v4_final, v0.6.0) |
-| `neural_only` | ❌ | ❌ bypassed entirely | ❌ | **0.1346** | Pure HuBERT+classifier; ties full system |
+|---|---|---|---|---|---|---|
+| `full` | ✅ | ✅ learnable C | ✅ | **0.133** | **Canonical result** (beam width 25; v4_final) |
+| `neural_only` | ❌ | ❌ bypassed entirely | ❌ | **0.1346** | Pure HuBERT+classifier; full system slightly better |
 | `no_constraint_matrix` | ✅ | ❌ log-softmax of neural logits | ✅ | 0.1444 | Isolates SeverityAdapter contribution |
 | `no_severity_adapter` | ❌ | ✅ learnable C | ✅ | — | Tests symbolic constraint without severity conditioning (FIX-9) |
 | `no_art_heads` | ✅ | ✅ | ❌ | — | Tests articulatory head contribution |
@@ -217,7 +218,7 @@ Controlled via `--ablation` flag (stored in `config.training.ablation_mode`):
 | `no_temporal_ds` | ✅ (no DS) | ✅ | ✅ | — | Tests TemporalDownsampler contribution |
 | `symbolic_only` | ✅ | ✅ | ✅ | — | CTC/CE disabled (λ=0); tests pure symbolic signal |
 
-**Note:** The full system (`v4_final`, v0.6.0) achieves **0.137 macro-speaker PER** (beam search, width 25; 95% CI: [0.081, 0.208]) — the canonical paper result. The internal neural sub-path (greedy) yields 0.134, matching `neural_only` (0.1346). The symbolic constraint provides a **non-significant PER impact** (per_neural=0.134 vs per_constrained=0.137, p=0.1114), with a 6.1%/89.0%/4.9% helpful/neutral/harmful split. Best checkpoint at epoch 37 (val_per=0.508). Test speakers: MC02 (0.208), MC04 (0.122), M03 (0.081). See [experiments.md](experiments.md) for full analysis.
+**Note:** The full system (`v4_final`) achieves **0.133 macro-speaker PER** (beam search, width 25; 95% CI: [0.079, 0.200]) — the canonical result. With a decoder-fair comparison (both paths beam-decoded), the neural sub-path yields **0.131** and the constrained path yields **0.133** (Δ=+0.0015, p=0.246, not significant). Test speakers: MC02 (0.200), MC04 (0.119), M03 (0.079). See [experiments.md](experiments.md) for full analysis.
 
 ---
 
@@ -232,7 +233,7 @@ Implemented in `DysarthriaASRLightning.on_train_epoch_start()` in `train.py` L56
 | Stage 2 | ≥ `encoder_second_unfreeze_epoch` (default **6**) | 6, 7, 8, 9, 10, 11 | `train.py` L601 | Direct `unfreeze_encoder(layers=[6,7,8,9,10,11])` call — not `unfreeze_after_warmup()` (B14 fix) |
 | Stage 3 | ≥ `encoder_third_unfreeze_epoch` (default **12**) | 4, 5, 6, 7, 8, 9, 10, 11 | `train.py` L610 | Deepest dysarthric adaptation; layers 0–3 remain frozen throughout |
 
-Layers 0–3 are permanently frozen (`freeze_encoder_layers=[0,1,2,3]`). After each unfreeze event, `_reset_hubert_lr_warmup()` clears Adam first/second moment estimates for the newly active `hubert_encoder` parameter group. The entire per-parameter state dict entry is cleared (`optimizer.state[p].clear()`), not individual keys, to avoid a `KeyError('exp_avg')` on the next `optimizer.step()`. OneCycleLR's step counter is not reset (known limitation T-04; full fix is O-2, per-group schedulers).
+Layers 0–3 are permanently frozen (`freeze_encoder_layers=[0,1,2,3]`). After each unfreeze event, `_reset_hubert_lr_warmup()` clears Adam first/second moment estimates for the newly active `hubert_encoder` parameter group. The entire per-parameter state dict entry is cleared (`optimizer.state[p].clear()`), not individual keys, to avoid a `KeyError('exp_avg')` on the next `optimizer.step()`. The `CosineAnnealingWarmRestarts` scheduler naturally resets on restart boundaries.
 
 ---
 
@@ -295,7 +296,7 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `use_articulatory_distance` | `True` | Use articulatory distance for `C_static` fallback |
 | `use_learnable_constraint` | `True` | Enable `LearnableConstraintMatrix` (Proposal P2) |
 | `use_severity_adapter` | `True` | Enable cross-attention `SeverityAdapter` (Proposal P3) |
-| `severity_adapter_dim` | `64` | Severity projection bottleneck |
+| `severity_adapter_dim` | `128` | Severity projection bottleneck |
 | `use_temporal_downsample` | `True` | Enable stride-2 Conv1d downsampler |
 | `use_spec_augment` | `True` | Enable SpecAugment on hidden states |
 | `spec_time_mask_prob` | `0.05` | Fraction of frames to mask per sample |
@@ -311,8 +312,8 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `learning_rate` | `3e-5` | Peak LR for classifier/adapter group |
 | `weight_decay` | `0.01` | AdamW weight decay |
 | `optimizer` | `AdamW` | Optimizer type |
-| `lr_scheduler` | `onecycle` | OneCycleLR with cosine annealing |
-| `warmup_ratio` | `0.05` | Fraction of total steps for LR warmup |
+| `lr_scheduler` | `cosine_warm_restarts` | CosineAnnealingWarmRestarts (T_0=1, T_mult=2) |
+| `warmup_ratio` | `0.05` | UNUSED (reserved; scheduler uses cosine_warm_restarts) |
 | `batch_size` | `12` | Per-GPU batch size |
 | `gradient_accumulation_steps` | `3` | Effective batch = 12 × 3 = 36 |
 | `max_epochs` | `40` | Maximum training epochs |
@@ -320,6 +321,10 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `encoder_second_unfreeze_epoch` | `6` | Stage 2 unfreeze trigger epoch |
 | `encoder_third_unfreeze_epoch` | `12` | Stage 3 unfreeze trigger epoch |
 | `gradient_clip_val` | `1.0` | Gradient norm clipping |
+| `encoder_lr_multiplier` | `0.1` | HuBERT encoder LR = base_lr × multiplier |
+| `symbolic_lr_multiplier` | `0.5` | Symbolic layer LR = base_lr × multiplier |
+| `use_forced_alignment` | `True` | Use `torchaudio.functional.forced_align` for frame-CE (FIX-T05) |
+| `frame_ce_start_epoch` | `0` | Frame-CE active from epoch 0 (forced alignment removed gate) |
 | `lambda_ctc` | `0.8` | CTC loss weight |
 | `lambda_ce` | `0.15` | Frame-CE loss weight |
 | `lambda_articulatory` | `0.08` | Articulatory CE weight |
@@ -329,11 +334,10 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `lambda_symbolic_kl` | `0.50` | Symbolic KL anchor weight |
 | `early_stopping_patience` | `8` | Epochs without improvement before stopping (single-split/ablation runs) |
 | `loso_early_stopping_patience` | `22` | Epochs without improvement for full-system LOSO runs (FIX-4: higher due to fold variance) |
-| `frame_ce_start_epoch` | `15` | Epoch at which frame-CE loss activates (FIX-2: gated to allow CTC boundary learning first) |
+
 | `use_stratified_micro_batch` | `True` | Enable `StratifiedMicroBatchSampler` for per-batch dysarthric/control balance |
 | `stratified_dysarthric_ratio` | `0.75` | Target dysarthric fraction per micro-batch |
-| `lambda_ordinal` | `0.05` | Ordinal contrastive weight (final stage) |
-| `lambda_symbolic_kl` | `0.50` | Symbolic KL anchor weight (final stage) |
+| `ablation_mode` | `full` | Active ablation mode |
 | `ordinal_stage1_end` | `10` | Epoch at which ordinal reaches stage 2 |
 | `ordinal_stage2_end` | `20` | Epoch at which ordinal reaches full target |
 | `ordinal_stage1_value` | `0.01` | Ordinal λ during epochs 0–9 |
@@ -344,7 +348,6 @@ Total loss: `loss = λ_ctc·CTC + λ_ce·CE + λ_art·Art + λ_ord·Ordinal + λ
 | `symbolic_kl_stage2_value` | `0.3` | Symbolic KL λ during epochs 5–14 |
 
 **Optimizer LR groups (paper setting):** HuBERT encoder uses `0.1×` peak LR, classifier+adapter uses `1.0×`, and the constraint layer uses `0.5×` under the same CosineAnnealingWarmRestarts schedule (T_0=1, T_mult=2, interval='epoch').
-| `ablation_mode` | `full` | Active ablation mode |
 
 ---
 

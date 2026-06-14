@@ -89,13 +89,13 @@ Config is saved to both `checkpoints/{run_name}/config.yaml` (during training) a
 | Config key | Default | CLI flag | Notes |
 |---|---|---|---|
 | `experiment.run_name` | `rtx4060_optimized_v1` | `--run-name STR` | Single source of truth for all output paths |
-| `training.ablation_mode` | `full` | `--ablation MODE` | One of: full, neural_only, no_constraint_matrix, no_severity_adapter, no_art_heads, no_spec_augment, no_temporal_ds, symbolic_only |
+| `training.ablation_mode` | `null` (falls back to config) | `--ablation MODE` | One of: full, neural_only, no_constraint_matrix, no_severity_adapter, no_art_heads, no_spec_augment, no_temporal_ds, symbolic_only |
 | `training.max_epochs` | `40` | `--max-epochs INT` | Maximum training epochs |
 | `training.batch_size` | `12` | `--batch-size INT` | Per-GPU batch size |
 | `training.gradient_accumulation_steps` | `3` | `--grad-accum INT` | Effective batch = batch_size × grad_accum |
 | `training.early_stopping_patience` | `8` | `--early-stopping-patience INT` | Epochs without improvement (single-split/ablation runs) |
 | `training.loso_early_stopping_patience` | `22` | (modify config.py) | LOSO full-system runs use higher patience (FIX-4) |
-| `training.frame_ce_start_epoch` | `15` | (modify config.py) | Frame-CE activates after epoch 15 (FIX-2) |
+| `training.frame_ce_start_epoch` | `0` | (modify config.py) | Frame-CE active from epoch 0 (FIX-T05: forced alignment removed gate) |
 | `training.check_val_every_n_epoch` | `1` | `--check-val-every-n-epoch INT` | Set to 2 to halve validation overhead for LOSO |
 | `training.encoder_warmup_epochs` | `1` | (modify config.py) | Stage 1 unfreeze trigger |
 | `training.lambda_symbolic_kl` | `0.5` | (modify config.py) | KL anchor strength |
@@ -216,9 +216,9 @@ python run_pipeline.py --run-name cache_warmup --warm-cache --warm-cache-only
 
 ## Training Dynamics Deep Dive
 
-### Differential Learning-Rate Groups (paper configuration)
+### Differential Learning-Rate Groups
 
-Paper runs use AdamW with three parameter groups under CosineAnnealingWarmRestarts (T_0=1, T_mult=2, interval='epoch'):
+AdamW with three parameter groups under CosineAnnealingWarmRestarts (T_0=1, T_mult=2, interval='epoch'):
 
 | Parameter group | LR multiplier | Base LR | Effective peak LR |
 |---|---:|---:|---:|
@@ -337,7 +337,7 @@ The progress file `results/{run_name}_loso_progress.json` records completed fold
 
 2. **Normal checkpoint resume:** If `checkpoints/{fold_run_name}/last.ckpt` exists and the scheduler is not exhausted, continue training from the checkpoint.
 
-3. **Weights-only resume (scheduler exhausted):** If `last.ckpt` epoch ≥ max_epochs-1, or if the OneCycleLR scheduler's `last_epoch ≥ total_steps`, the model weights are loaded but the optimizer/scheduler are fresh. `resume_epoch_offset` is set to preserve staged unfreezing behavior. A `weights_only_resume.pt` marker file is written to the fold checkpoint directory.
+3. **Weights-only resume (scheduler exhausted):** If `last.ckpt` epoch ≥ max_epochs-1, or if the `CosineAnnealingWarmRestarts` scheduler's `last_epoch ≥ total_steps`, the model weights are loaded but the optimizer/scheduler are fresh. `resume_epoch_offset` is set to preserve staged unfreezing behavior. A `weights_only_resume.pt` marker file is written to the fold checkpoint directory.
 
 **`--loso-force-speakers`:** Clears `checkpoints/{fold_run_name}/` and `results/{fold_run_name}/` before rerunning the specified folds. Use to recover from corrupted checkpoints or to rerun with code fixes.
 
@@ -432,26 +432,26 @@ results/{run_name}/
 
 ```json
 {
-  "avg_per": 0.134,
-  "wer": 0.122,
+  "avg_per": 0.133,
+  "wer": 0.116,
   "overall": {
-    "per_macro_speaker": 0.134,
-    "per_sample_mean": 0.138,
-    "wer": 0.122,
-    "ci": [0.072, 0.210],
-    "std": 0.048,
+    "per_macro_speaker": 0.133,
+    "per_sample_mean": 0.136,
+    "wer": 0.116,
+    "ci": [0.079, 0.200],
+    "std": 0.252,
     "n_samples": 3548,
     "n_speakers": 3
   },
-  "articulatory_accuracy": { "manner": 0.786, "place": 0.791, "voice": 0.924 },
+  "articulatory_accuracy": { "manner": 0.817, "place": 0.905, "voice": 0.953 },
   "stratified": {
-    "dysarthric": { "per_sample": 0.072, "n": 810 },
-    "control":    { "per_sample": 0.158, "n": 2738 }
+    "dysarthric": { "per_sample": 0.079, "n": 810 },
+    "control":    { "per_sample": 0.152, "n": 2738 }
   },
   "error_analysis": {
-    "error_counts": { "substitutions": 1541, "deletions": 738, "insertions": 1742, "correct": 29688 }
+    "error_counts": { "substitutions": 1521, "deletions": 756, "insertions": 1554, "correct": 29896 }
   },
-  "uncertainty": { "computed": false, "n_samples": null, "entropy_mean": null, "per_utterance": [] }
+  "uncertainty": { "computed": true, "n_samples": 20, "entropy_mean": 0.384, "per_utterance": [] }
 }
 ```
 

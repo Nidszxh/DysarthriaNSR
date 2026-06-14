@@ -429,6 +429,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
                         self._memory_feature_cache.popitem(last=False)
                 return tensor
         except Exception:
+            logger.warning("Corrupted cache file for idx=%s, treating as cache miss", idx)
             # Corrupted cache files are treated as misses and overwritten below.
             return None
 
@@ -454,12 +455,13 @@ class TorgoNeuroSymbolicDataset(Dataset):
             torch.save(features, tmp_path)
             tmp_path.replace(cache_path)
         except Exception:
+            logger.warning("Cache write failed for idx=%s (non-fatal)", idx)
             # Cache write failures are non-fatal; training should continue.
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
             except Exception:
-                pass
+                logger.warning("Failed to clean up temp cache file %s", tmp_path)
 
     def _encode_phonemes(self, phonemes_str: str) -> List[int]:
 

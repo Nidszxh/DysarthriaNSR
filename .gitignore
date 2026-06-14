@@ -2,7 +2,6 @@
 /data/abnerh__*
 /data/external
 /data/raw/
-/home/nidszxh/Projects/DysarthriaNSR/data/_home_nidszxh_Projects_DysarthriaNSR_data_abnerh___torgo-database_default_0.0.0_c4e0b560a515465e61bb555455e34fc620031fe8.lock
 /nltk_data/
 
 # --- Python Environment ---
@@ -49,9 +48,6 @@ Thumbs.db
 *.swp
 /mlruns/
 
-# --- Generated Experiment Outputs ---
-results/
-
 # --- Generated Data Artifacts ---
 data/processed/*.csv
 
@@ -63,3 +59,12 @@ configs/
 /chats/
 /temp/
 /justdocs/
+
+# --- Generated Experiment Outputs ---
+results/
+!results/v4_final/
+!results/loso_v1_loso_summary.json
+!results/loso_v1_loso_progress.json
+!results/ablation_neural_only_v7/
+!results/ablation_no_constraint_matrix_v6/
+!results/baseline_v6/

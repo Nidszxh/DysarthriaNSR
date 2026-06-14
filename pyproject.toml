@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "dysarthria-nsr"
+version = "2.1.0"
+description = "Neuro-Symbolic ASR for Dysarthric Speech"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch==2.9.0",
+    "torchaudio==2.9.0",
+    "transformers==4.57.1",
+    "datasets==4.4.1",
+    "pytorch-lightning==2.6.0",
+    "mlflow==3.6.0",
+    "librosa==0.11.0",
+    "soundfile==0.13.1",
+    "g2p-en==2.1.0",
+    "nltk==3.9.2",
+    "jiwer==4.0.0",
+    "editdistance==0.8.1",
+    "statsmodels==0.14.6",
+    "pandas==2.3.3",
+    "numpy==1.26.4",
+    "tqdm==4.67.1",
+    "matplotlib==3.10.8",
+    "seaborn==0.13.2",
+    "pyyaml==6.0.3",
+    "scipy==1.15.3",
+    "rapidfuzz==3.9.7",
+]
+
+[project.urls]
+Repository = "https://github.com/anomalyco/DysarthriaNSR"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["src.*", "train.py", "evaluate.py", "run_pipeline.py", "scripts.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+    "ignore::UserWarning",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "S"]
+ignore = [
+    "E501",   # line-length enforced by formatter
+    "S101",   # assert allowed in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+"scripts/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false

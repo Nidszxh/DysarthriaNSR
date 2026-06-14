@@ -138,14 +138,14 @@ if ablation_mode == "my_new_ablation":
 | I | Important bugs (correctness or metric validity) | I2 (staged KL warmup), I5 (utterance-level art heads) |
 | E | Evaluation-specific bugs | E5 (always generate art confusion), E6 (fallback heatmap) |
 | H | High-impact hotfixes | H-1 (VRAM cleanup), H-2 (alignment cache), H-5 (activation cap) |
-| T | Technical debt / training-stability issues | T-04 (OneCycleLR + unfreeze interaction) |
+| T | Technical debt / training-stability issues | T-04 (scheduler + unfreeze interaction, resolved via CosineAnnealingWarmRestarts) |
 | N | New features or enhancements | N3 (bootstrap delta test), N4 (add-k LM), N7 (rule precision proxy) |
 | O | Optional / deferred improvements | O-2 (per-group scheduler) |
 | M | Medium-priority issues | M-5 (conformal APS heuristic), M-6 (per-speaker severity sort) |
 | Q | Code quality and refactoring | Q7 (true neural-only ablation bypass) |
-| FIX | v0.4.0 audit fixes | FIX-1 (blank threshold), FIX-2 (frame-CE gating), FIX-3 (OneCycleLR restart), FIX-9 (no_severity_adapter), FIX-10 (spearman_valid), FIX-11 (plot_per_by_manner), FIX-12 (BigramLM leak) |
+| FIX | v0.4.0 audit fixes | FIX-1 (blank threshold), FIX-2 (frame-CE gating, obsoleted by FIX-T05 forced alignment), FIX-3 (OneCycleLR restart, obsoleted by CosineAnnealingWarmRestarts), FIX-9 (no_severity_adapter), FIX-10 (spearman_valid), FIX-11 (plot_per_by_manner), FIX-12 (BigramLM leak) |
 
-To add a fix: implement it, add a row to `docs/02_COMPLETED_WORK.md` with `ID | File | Fix Applied`, add a `# [FIX-N]` comment block at the affected code site, and document in `docs/changes.md`.
+To add a fix: implement it, add a row to [CHANGELOG.md](../CHANGELOG.md) under the next version, add a `# [FIX-N]` comment block at the affected code site, and document in [experiments.md](experiments.md) if results are affected.
 
 ### Pre-Commit Checklist
 
@@ -158,7 +158,7 @@ Before committing any code change:
 - New metrics logged to MLflow
 - Tested on RTX 4060 (8 GB VRAM target)
 - Labels use `-100` sentinel for padding (not `0` or `1`)
-- If bug fixed: add the fix ID and summary to `docs/02_COMPLETED_WORK.md`
+- If bug fixed: add the fix ID and summary to [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

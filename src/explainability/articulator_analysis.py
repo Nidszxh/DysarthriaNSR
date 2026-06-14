@@ -5,9 +5,12 @@ Builds per-feature (manner / place / voice) confusion matrices from phoneme-leve
 error alignments and produces publication-quality heatmaps.
 """
 
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -182,4 +185,4 @@ class ArticulatoryConfusionAnalyzer:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        print(f"✅ Articulatory confusion plot saved to {save_path}")
+        logger.info("Articulatory confusion plot saved to %s", save_path)
