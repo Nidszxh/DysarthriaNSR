@@ -52,6 +52,16 @@ python scripts/smoke_test.py --profile unit      # 8 fast checks
 python scripts/smoke_test.py --profile pipeline   # 1 full CLI smoke
 python scripts/smoke_test.py --profile all        # both
 
+# Serving, Docker & CI (see docs/serving.md)
+RUN_NAME=v4_final DEVICE=cuda python serve.py --port 8000   # FastAPI: /health /model /transcribe
+curl -F "file=@sample.wav" -F "severity=4.9" http://localhost:8000/transcribe
+docker compose up --build serve                    # GPU serving container (:8000)
+docker compose run train --run-name v4_final       # one-off training container
+docker build --check .                             # validate Dockerfile (no build)
+docker compose config                              # validate compose file
+ruff check .                                       # repo-wide lint (must pass)
+mypy serve.py --follow-imports=silent              # type gate for the serving file
+
 # Data setup (order matters — download first)
 python src/data/download.py && python src/data/manifest.py
 python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')"
@@ -64,29 +74,37 @@ python run_pipeline.py --run-name cache_warmup --warm-cache --warm-cache-only
 ## Critical Conventions
 
 ### Phoneme Normalization
+
 **Always** normalize phonemes before comparison or vocab building:
+
 ```python
 from src.utils.config import normalize_phoneme
 normalize_phoneme("AH0")  # → "AH" (strips stress markers 0/1/2)
 ```
+
 Manifest uses ARPABET with stress; model vocab is stress-agnostic.
 
 ### Vocabulary IDs (Fixed — never change)
-```
+
+```text
 <BLANK> = 0  # CTC blank (never a true label)
 <PAD>   = 1  # Padding sentinel (valid token)
 <UNK>   = 2  # Unknown fallback
-IY, AE… = 3-46  # ARPABET phonemes (47 total)
+IY, AE… = 3-46  # ARPABET phonemes (47 total from manifest; includes BLANK/PAD/UNK at 0-2)
 ```
+
 Built in `TorgoNeuroSymbolicDataset._build_vocabularies()`.
 
 ### Label Padding
+
 Labels use **-100** sentinel (never 0 or 1 — those are valid token IDs):
+
 ```python
 labels = torch.nn.functional.pad(labels, (0, max_len - labels.size(1)), value=-100)
 ```
 
 ### BF16 Epsilon Safety
+
 All numerical epsilons use **1e-6** (not 1e-8) for BF16 numerical safety.
 
 ### Key Config Defaults (TrainingConfig / SymbolicConfig)

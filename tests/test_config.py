@@ -6,10 +6,9 @@ Tests verify:
 - Config persists to YAML and round-trips correctly
 - Hyperparameter values match expected defaults
 """
-import pathlib
 import pytest
 
-from src.utils.config import Config, TrainingConfig, ModelConfig, SymbolicConfig
+from src.utils.config import Config, TrainingConfig
 
 
 class TestConfigDefaults:
@@ -69,7 +68,7 @@ class TestConfigRoundtrip:
         n_rules_original = len(cfg.symbolic.substitution_rules)
         yaml_path = tmp_path / "config.yaml"
         cfg.save(yaml_path)
-        loaded = Config.load(yaml_path)
+        Config.load(yaml_path)
         # Rules may be loaded as flat dict with string keys; we just check count
         assert n_rules_original > 0  # rules exist
 

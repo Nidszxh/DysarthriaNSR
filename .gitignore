@@ -1,24 +1,12 @@
-# --- Data and Datasets ---
-/data/abnerh__*
-/data/external
-/data/raw/
+# --- Data ---
+/data/
 /nltk_data/
 
 # --- Python Environment ---
 .venv*/
 venv/
 env/
-bin/
-lib/
-develop-eggs/
-dist/
-eggs/
-lib64/
-parts/
-sdist/
-var/
 *.egg-info/
-.installed.cfg
 *.egg
 *.lock
 
@@ -27,14 +15,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# --- Linter / type-checker / test caches ---
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # --- Model Checkpoints & Logs ---
-/models/
 checkpoints/
 experiments/
 outputs/
 logs/
 wandb/
 runs/
+/mlruns/
 *.pt
 *.pth
 *.bin
@@ -46,25 +39,9 @@ runs/
 .DS_Store
 Thumbs.db
 *.swp
-/mlruns/
-
-# --- Generated Data Artifacts ---
-data/processed/*.csv
-
-# --- Hyperparameter Configs (local tuning only) ---
-configs/
-
-# --- Project Specific ---
-/papers/
-/chats/
-/temp/
-/justdocs/
 
 # --- Generated Experiment Outputs ---
 results/
-!results/v4_final/
-!results/loso_v1_loso_summary.json
-!results/loso_v1_loso_progress.json
-!results/ablation_neural_only_v7/
-!results/ablation_no_constraint_matrix_v6/
-!results/baseline_v6/
+
+# --- Hyperparameter Configs (local tuning only) ---
+configs/

@@ -16,11 +16,10 @@ Enables calibrated phoneme-set predictions that are clinically useful:
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 

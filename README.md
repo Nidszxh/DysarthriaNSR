@@ -20,9 +20,10 @@ The **`LearnableConstraintMatrix`** (Proposal P2) is a |V|×|V| differentiable p
 
 ## Final system figure
 
-![DysarthriaNSR final architecture](docs/final.png)
+![DysarthriaNSR architecture](docs/architecture.png)
 
 Figure highlights:
+
 - SpecAugment is applied before SeverityAdapter (training-only, per-sample masking).
 - Severity-conditioned fusion uses β with base `0.05` and slope `0.2` over severity `s∈[0,5]`.
 - Symbolic constraints are bypassed on blank-dominant frames (about 65%), and C is KL-anchored to the clinical prior.
@@ -32,7 +33,7 @@ Figure highlights:
 ## Key Results
 
 | Model | Macro PER | Weighted PER | Single-split PER | Notes |
-|---|---|---|---|---|---|
+|---|---|---|---|---|
 | `loso_v1` (full system, LOSO) | **0.2848** (95% CI: [0.1921, 0.3801]) | **0.2299** | — | Publication result, 15/15 folds |
 | `v4_final` (full system) | **0.133** (95% CI: [0.079, 0.200]) | 0.136 | 0.133 | **Canonical result** (beam width 25; per_neural=0.131 beam) |
 | `ablation_neural_only_v7` | **0.1346** | — | 0.1346 | Neural-only ablation |
@@ -111,12 +112,16 @@ python scripts/smoke_test.py --profile unit
 
 ## Repository Layout
 
-```
+```text
 DysarthriaNSR/
 ├── run_pipeline.py          # Canonical entry point: train + eval orchestrator
 ├── train.py                 # DysarthriaASRLightning, run_loso()
 ├── evaluate.py              # evaluate_model(), BeamSearchDecoder, compute_per()
+├── serve.py                 # FastAPI inference service (see docs/serving.md)
 ├── requirements.txt         # Pinned dependency stack
+├── Dockerfile               # Multi-stage: base / train / serve (docs/serving.md)
+├── docker-compose.yml       # GPU serve service + one-off train container
+├── .github/workflows/ci.yml # CI: ruff, mypy (serve.py), pytest, smoke unit
 ├── src/
 │   ├── models/
 │   │   ├── model.py         # NeuroSymbolicASR, all architectural components
@@ -152,7 +157,29 @@ DysarthriaNSR/
 | [docs/data.md](docs/data.md) | TORGO corpus, download/manifest pipeline, manifest schema, vocabulary system, collator internals, data splits |
 | [docs/training.md](docs/training.md) | Environment setup, configuration system, complete CLI reference, training dynamics, monitoring, troubleshooting |
 | [docs/evaluation.md](docs/evaluation.md) | Metrics reference, greedy and beam decoders, symbolic impact analysis, explainability pipeline, uncertainty estimation |
+| [docs/serving.md](docs/serving.md) | FastAPI inference service, Docker (multi-stage + compose), GitHub Actions CI |
 | [docs/contributing.md](docs/contributing.md) | Code conventions, adding components/metrics/ablations, fix naming, known codebase risks |
+
+---
+
+## Serving, Docker & CI
+
+The repo ships a containerized FastAPI inference endpoint (`serve.py`), a multi-stage `Dockerfile` (+ `docker-compose.yml`), and GitHub Actions CI (ruff, mypy, 135 tests, smoke checks). See [docs/serving.md](docs/serving.md) for the full reference.
+
+```bash
+# Serve a trained checkpoint over HTTP (GPU)
+RUN_NAME=v4_final docker compose up --build serve
+curl -F "file=@sample.wav" -F "severity=4.9" http://localhost:8000/transcribe
+
+# One-off training run in a container
+docker compose run train --run-name v4_final
+
+# CI equivalent (local): lint + type-check + tests + smoke
+ruff check .
+mypy serve.py --follow-imports=silent
+pytest -q
+python scripts/smoke_test.py --profile unit
+```
 
 ---
 

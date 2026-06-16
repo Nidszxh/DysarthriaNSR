@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 from pathlib import Path
-import sys
 
 logger = logging.getLogger(__name__)
 

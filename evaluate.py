@@ -13,13 +13,11 @@ Key Features:
 - Statistical significance testing
 """
 
-import logging
 import json
+import logging
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-from torch.utils.data import DataLoader
 
 import editdistance
 import jiwer
@@ -27,11 +25,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
-from scipy import stats
-
 from rapidfuzz.distance import Levenshtein as _RFLevenshtein
+from scipy import stats
+from torch.utils.data import DataLoader
 
-from src.utils.config import Config, normalize_phoneme, get_project_root, get_speaker_severity
+from src.utils.config import Config, get_project_root, get_speaker_severity, normalize_phoneme
 from src.utils.sequence_utils import align_labels_to_logits as _align_labels_to_logits
 
 logger = logging.getLogger(__name__)
@@ -60,8 +58,8 @@ def calibrate_speaker_temperatures(
     Returns:
         Dict mapping speaker_id -> optimal temperature
     """
-    from scipy.optimize import minimize_scalar
     import torch.nn.functional as F
+    from scipy.optimize import minimize_scalar
 
     model.eval()
     speaker_logits = defaultdict(list)
@@ -203,7 +201,7 @@ class BigramLMScorer:
 class BeamSearchDecoder:
     """
     CTC Beam Search Decoder with prefix pruning.
-    
+
     Implements efficient beam search for CTC outputs using prefix merging.
     Significantly more accurate than greedy decoding for ambiguous sequences.
     """
@@ -230,14 +228,14 @@ class BeamSearchDecoder:
     ) -> Tuple[List[str], float]:
         """
         Decode log probabilities to phoneme sequence using beam search.
-        
+
         Args:
             log_probs: Log probabilities [time, num_classes]
             id_to_phn: ID → Phoneme mapping
-        
+
         Returns:
             (best_sequence, log_probability)
-        
+
         Algorithm:
             1. Initialize beam with empty sequence
             2. For each timestep:
@@ -466,11 +464,11 @@ def decode_references(
 ) -> List[List[str]]:
     """
     Decode reference labels to phoneme sequences.
-    
+
     Args:
         labels: Label tensor [batch, seq_len]
         id_to_phn: ID → Phoneme mapping
-    
+
     Returns:
         List of phoneme sequences
     """
@@ -495,7 +493,7 @@ def decode_references(
 def compute_per(prediction: List[str], reference: List[str]) -> float:
     """
     Compute Phoneme Error Rate (PER) using edit distance.
-    
+
     PER = (S + D + I) / N
     where S = substitutions, D = deletions, I = insertions, N = reference length
     """
@@ -514,15 +512,15 @@ def compute_per_with_ci(
 ) -> Tuple[float, Tuple[float, float]]:
     """
     Compute PER with bootstrap confidence interval.
-    
+
     Args:
         per_scores: List of per-sample PER scores
         confidence_level: Confidence level (default: 0.95 for 95% CI)
         n_bootstrap: Number of bootstrap samples
-    
+
     Returns:
         (mean_per, (ci_lower, ci_upper))
-    
+
     Method:
         Bootstrap resampling with percentile method for CI estimation.
     """
@@ -700,15 +698,15 @@ def phoneme_alignment(
 ) -> List[Tuple[str, Optional[str], Optional[str]]]:
     """
     Align predicted and reference phoneme sequences using Levenshtein alignment.
-    
+
     Args:
         pred: Predicted phoneme sequence
         ref: Reference phoneme sequence
-    
+
     Returns:
         List of (operation, predicted_phoneme, reference_phoneme) tuples
         Operations: 'correct', 'substitute', 'delete', 'insert'
-    
+
     Algorithm:
         Dynamic programming (Levenshtein distance) with backtracking.
     """
@@ -828,14 +826,14 @@ def analyze_phoneme_errors(
 ) -> Dict:
     """
     Comprehensive phoneme-level error analysis.
-    
+
     Args:
         predictions: List of predicted phoneme sequences
         references: List of reference phoneme sequences
         alignments: Optional pre-computed alignments from ``phoneme_alignment()``.
                     When provided, skips internal alignment (4× speedup when shared
                     across multiple analysis functions).
-    
+
     Returns:
         Dictionary containing:
             - confusion_matrix: Phoneme substitution patterns
@@ -1074,19 +1072,19 @@ def stratify_by_phoneme_length(
 ) -> Dict[str, Dict[str, float]]:
     """
     Stratify PER by phoneme sequence length and dysarthria status.
-    
+
     Args:
         per_scores: List of PER scores
         phoneme_lengths: List of phoneme sequence lengths
         status: List of dysarthria labels (0=control, 1=dysarthric)
-    
+
     Returns:
         Dictionary with structure:
             {
                 'dysarthric': {'0-5': per, '6-10': per, ...},
                 'control': {'0-5': per, '6-10': per, ...}
             }
-    
+
     Buckets: [0-5], [6-10], [11-20], [21+]
     """
     def get_bucket(length):
@@ -1987,8 +1985,8 @@ def evaluate_model(
 
     # C-4: Severity vs PER scatter plot (key SPCOM figure)
     try:
-        from src.visualization.experiment_plots import plot_severity_vs_per
         from src.utils.config import TORGO_SEVERITY_MAP
+        from src.visualization.experiment_plots import plot_severity_vs_per
         _sev_plot_path = plot_severity_vs_per(
             speaker_metrics, TORGO_SEVERITY_MAP, results_dir / 'severity_vs_per.png'
         )
@@ -2085,7 +2083,8 @@ def evaluate_model(
     _attributed_errors: List[List[Dict]] = []  # reused by formatter if needed
     try:
         from src.explainability import (
-            PhonemeAttributor, ArticulatoryConfusionAnalyzer,
+            ArticulatoryConfusionAnalyzer,
+            PhonemeAttributor,
         )
         _attributor = PhonemeAttributor()
         _art_analyzer = ArticulatoryConfusionAnalyzer()
@@ -2248,7 +2247,7 @@ def evaluate_model(
     _corr_note = f"n={n_speakers_eval}" if correlation_valid else f"n={n_speakers_eval}, descriptive only"
     logger.info(f"Severity ↔ PER correlation:  r={pearson_r:.3f} (p={pearson_p:.4f}) [{_corr_note}]")
     logger.info(f"Wilcoxon p (dys vs ctrl):     {p_val_wilcox:.4f} (Holm-corr: {p_corrected[1]:.4f})")
-    logger.info(f"\nError Breakdown:")
+    logger.info("\nError Breakdown:")
     logger.info(f"  Correct:        {error_analysis['error_counts']['correct']}")
     logger.info(f"  Substitutions:  {error_analysis['error_counts']['substitutions']}")
     logger.info(f"  Deletions:      {error_analysis['error_counts']['deletions']}")

@@ -18,7 +18,6 @@ Usage (from generate_figures.py)::
 
 from __future__ import annotations
 
-import json
 import logging
 import warnings
 from pathlib import Path
@@ -27,10 +26,11 @@ logger = logging.getLogger(__name__)
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
+
 matplotlib.use("Agg")  # Headless backend; must appear before pyplot import
 
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 from scipy import stats as sp_stats

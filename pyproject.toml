@@ -32,6 +32,9 @@ dependencies = [
     "pyyaml==6.0.3",
     "scipy==1.15.3",
     "rapidfuzz==3.9.7",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "python-multipart==0.0.20",
 ]
 
 [project.urls]
@@ -59,6 +62,10 @@ select = ["E", "F", "W", "I", "N", "UP", "S"]
 ignore = [
     "E501",   # line-length enforced by formatter
     "S101",   # assert allowed in tests
+    "N",      # paper tensor notation (B/T/V/C/P_neural, taF/F) is deliberate
+    "UP",     # Dict/Optional/typing style kept for py3.10 parity across the repo
+    "S324",   # md5/sha1 used for cache keys & filenames, not security
+    "E402",   # project-root sys.path bootstrap before imports is deliberate
 ]
 
 [tool.ruff.lint.per-file-ignores]

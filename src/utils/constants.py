@@ -6,7 +6,6 @@ Both data manifest generation and model symbolic logic should import from here.
 
 from typing import Dict, Tuple
 
-
 PHONEME_ARTICULATORY: Dict[str, Tuple[str, str, str]] = {
     # Stops
     "P": ("stop", "bilabial", "voiceless"),

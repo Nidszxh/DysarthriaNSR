@@ -34,9 +34,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-from src.utils.config import TORGO_SEVERITY_MAP                    # noqa: E402
+from src.utils.config import TORGO_SEVERITY_MAP  # noqa: E402
 from src.visualization.experiment_plots import generate_all_plots  # noqa: E402
-
 
 # Helpers
 
@@ -189,7 +188,7 @@ def main() -> None:
     save_dir     = Path(args.out_dir) if args.out_dir else (results_root / run_name / "figures")
 
     print(f"\n{'='*60}")
-    print(f"  DysarthriaNSR — Generate Figures")
+    print("  DysarthriaNSR — Generate Figures")
     print(f"  Run:        {run_name}")
     print(f"  Output:     {save_dir}")
     print(f"{'='*60}\n")

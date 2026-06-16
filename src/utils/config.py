@@ -3,7 +3,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import yaml
 
@@ -69,7 +70,7 @@ def get_speaker_severity(speaker_id: str) -> float:
 class ProjectPaths:
     """Immutable path structure with auto-directory creation."""
     root: Path = field(default_factory=get_project_root)
-    
+
     @property
     def data_dir(self) -> Path: return self.root / "data"
     @property
@@ -87,7 +88,7 @@ class ProjectPaths:
 
     def ensure_directories(self) -> None:
         """Creates all sub-folders needed for the pipeline."""
-        for path in [self.raw_dir, self.processed_dir, self.external_dir, 
+        for path in [self.raw_dir, self.processed_dir, self.external_dir,
                      self.checkpoints_dir, self.results_dir, self.mlruns_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -103,7 +104,7 @@ class ModelConfig:
     # Memory-vs-speed tradeoff: checkpointing reduces VRAM but adds compute.
     # Disable for faster training/eval when VRAM headroom allows.
     use_gradient_checkpointing: bool = True
-    
+
     # Permanently freeze only the bottom 4 layers (robust generic acoustic features).
     # Layers 4-11 are fine-tuned progressively via the two-stage warmup schedule in
     # on_train_epoch_start (epoch 1: unfreeze 8-11; epoch 6: unfreeze 4-11).
@@ -115,7 +116,7 @@ class ModelConfig:
     # (<BLANK>, <PAD>, <UNK>) plus the observed ARPABET phonemes.
     num_phonemes: Optional[int] = None
     classifier_dropout: float = 0.1
-    
+
     # Symbolic Neural-Fusion
     constraint_weight_init: float = 0.05
     # UNUSED (reserved; articulatory distance always computed in _build_static_matrix)
@@ -147,10 +148,10 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training hyperparams tuned for RTX 4060 stability and speed."""
-    
+
     # RTX 4060 (Ada) supports BF16 which is much more stable than FP16
     precision: str = "bf16-mixed" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "16-mixed"
-    
+
     learning_rate: float = 3e-5
     # Per-group LR multipliers relative to base learning_rate.
     # HuBERT encoder: slower to avoid catastrophic forgetting.
@@ -158,7 +159,7 @@ class TrainingConfig:
     encoder_lr_multiplier: float = 0.1
     symbolic_lr_multiplier: float = 0.5
     weight_decay: float = 0.01
-    optimizer: str = "AdamW" 
+    optimizer: str = "AdamW"
     # [FIX-T04] Replaced OneCycleLR with CosineAnnealingWarmRestarts
     # OneCycleLR's step counter cannot be rewound; warm restarts provide proper
     # LR cycling per unfreeze stage.
@@ -168,7 +169,7 @@ class TrainingConfig:
     cosine_eta_min_ratio: float = 0.001  # eta_min = lr * this ratio
     warmup_steps: int = 250
     warmup_ratio: float = 0.05       # UNUSED (reserved; scheduler uses cosine_warm_restarts)
-    
+
     batch_size: int = 12   # RTX 4060: safe upper bound after OOM at batch=16; effective batch stays 36 with gradient accumulation
     gradient_accumulation_steps: int = 3   # Effective batch=36 (12×3)
     use_stratified_micro_batch: bool = True
@@ -180,7 +181,7 @@ class TrainingConfig:
     val_check_interval: float = 1.0        # Validate once per epoch (was 0.5) — halves eval overhead
     check_val_every_n_epoch: int = 1        # Evaluate every N epochs (set 2 to halve val overhead)
     num_sanity_val_steps: int = 0           # Skip startup sanity-validation for faster fold startup
-    
+
     # Regularization & Loss
     dropout: float = 0.1
     layer_dropout: float = 0.05      # UNUSED (reserved for future stochastic depth)
@@ -242,7 +243,7 @@ class TrainingConfig:
     beam_length_norm_alpha: float = 0.6  # Exponent for beam-search length normalisation: score / len^alpha
     beam_lm_weight: float = 0.0           # UNUSED (reserved for LM shallow-fusion; evaluate.py passes it via CLI flag)
     save_top_k: int = 2
-    
+
     # HW Acceleration — optimised for RTX 4060 + modern NVMe
     num_workers: int = 8          # saturate PCIe; was 4
     pin_memory: bool = True
@@ -347,10 +348,10 @@ class Config:
         self.data = DataConfig()
         self.experiment = ExperimentConfig()
         self.symbolic = SymbolicConfig()
-        
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.effective_batch_size = self.training.batch_size * self.training.gradient_accumulation_steps
-        
+
         self.paths.ensure_directories()
         # NOTE: _print_vram_status() is intentionally NOT called here.
         # run_pipeline.py sets config.training.ablation_mode *after* Config() is

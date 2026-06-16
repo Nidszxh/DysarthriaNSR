@@ -169,7 +169,7 @@ graph LR
 
 **This is the core research contribution.** The complete forward-pass equation is:
 
-```
+```text
 P_constrained = P_neural @ C                    # constraint matrix application
 P_fused       = β(s)·P_constrained + (1-β(s))·P_neural  # severity-adaptive blend
 β(s)          = clamp(β_base + 0.2·s/5, 0.0, 0.8)       # s ∈ [0, 5]

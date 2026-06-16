@@ -25,18 +25,16 @@ Current checks
 from __future__ import annotations
 
 import argparse
-import contextlib
 import inspect
 import io
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+from pathlib import Path
 from typing import Callable, Dict, List
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,7 +49,7 @@ def run_test(n: int, name: str, fn: Callable[[], None]) -> bool:
         fn()
         print(f"  [PASS] Test {n}: {name}")
         RESULTS[n] = True
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         print(f"  [FAIL] Test {n}: {name}")
         traceback.print_exc()
         RESULTS[n] = False
@@ -67,7 +65,7 @@ def test1_config_and_severity_map() -> None:
     import yaml  # noqa: PLC0415
 
     from src.utils import constants as constants_mod  # noqa: PLC0415
-    from src.utils.config import Config, TORGO_SEVERITY_MAP  # noqa: PLC0415
+    from src.utils.config import TORGO_SEVERITY_MAP, Config  # noqa: PLC0415
 
     invalid = {k: v for k, v in TORGO_SEVERITY_MAP.items() if not (0.0 <= v <= 5.0)}
     assert not invalid, f"Invalid severity values: {invalid}"
@@ -170,7 +168,7 @@ def test4_ordinal_contrastive_loss() -> None:
     severity_1 = torch.tensor([5.0])
     loss_1 = loss_fn(embeddings_1, severity_1)
     assert not (loss_1 != loss_1).item(), (  # NaN check: NaN != NaN is True
-        f"OrdinalContrastiveLoss returned NaN for batch_size=1 (Bug B8 not fixed)"
+        "OrdinalContrastiveLoss returned NaN for batch_size=1 (Bug B8 not fixed)"
     )
     assert loss_1.item() >= 0.0, f"Loss negative on single-item batch: {loss_1.item()}"
 
@@ -352,7 +350,7 @@ def test9_pipeline_cli_smoke() -> None:
         "--early-stopping-patience", "1",
         "--no-gradient-checkpointing",
     ]
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: S603 - fixed command list, no user input
         cmd,
         cwd=project_root,
         check=False,

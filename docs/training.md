@@ -16,10 +16,12 @@
 **VRAM budget:** `Config._print_vram_status()` (called automatically by `run_pipeline.py` after config overrides) prints a rough VRAM safety estimate. The formula sums: `param_memory + gradient_memory + optimizer_states + activation_memory + 1.2 GB runtime reserve`. With `batch_size=12`, `bf16-mixed`, and `use_temporal_downsample=True`, estimated peak VRAM is approximately 6.5–7.2 GB during Stage 3 (layers 4–11 unfrozen). The call to `print_vram_status()` must come after all config overrides are applied so ablation mode is correctly reflected.
 
 **BF16 check:**
+
 ```python
 import torch
 print(torch.cuda.is_bf16_supported())  # True for RTX 30xx+ (Ampere and later)
 ```
+
 If BF16 is unavailable, set `config.training.precision = "16-mixed"`.
 
 ---
@@ -67,11 +69,13 @@ Full pinned stack in `requirements.txt`.
 All hyperparameters are defined in `src/utils/config.py`. The `Config` class aggregates six dataclasses: `ModelConfig`, `TrainingConfig`, `DataConfig`, `ExperimentConfig`, `SymbolicConfig`, and `ProjectPaths`.
 
 **Golden rules:**
+
 - Never hardcode hyperparameters outside `config.py` — all parameters must come from config and are logged to MLflow automatically via `flatten_config_for_mlflow()`.
 - Never hardcode file paths — use `ProjectPaths` from `config.py` (`get_project_root() / "results" / config.experiment.run_name`).
 - The deferred `config.print_vram_status()` call in `run_pipeline.py` must come after all overrides are applied.
 
 **Config save/load round-trip:**
+
 ```python
 from src.utils.config import Config
 from pathlib import Path
@@ -230,7 +234,7 @@ This split keeps pretrained HuBERT updates conservative while allowing classifie
 
 ### Three-Stage Freeze Schedule
 
-```
+```text
 Epoch 0      ──────────────────────────────── Warmup
   Frozen: layers 0-11 + CNN
   Trainable: PhonemeClassifier, SeverityAdapter, SymbolicLayer, art heads
@@ -288,7 +292,7 @@ The `StratifiedMicroBatchSampler` (train.py, gated by `use_stratified_micro_batc
 
 `_MetricLoggerCallback.on_train_epoch_end()` logs the raw magnitude and λ-weighted contribution of each loss component at every epoch end:
 
-```
+```text
 Epoch 3 weighted loss breakdown:
       CTC   46.8747 × 0.800 =  37.4998 ( 97.7%)
        CE    3.5929 × 0.150 =   0.5389 (  1.4%)
@@ -317,6 +321,7 @@ Samples where `label_lengths > input_lengths` are dropped before loss computatio
 ### Deterministic Fold Ordering
 
 `run_loso()` sorts speakers via `_split_speaker_id()`:
+
 ```python
 def _split_speaker_id(spk: str) -> Tuple[str, int]:
     m = re.match(r"([A-Za-z]+)(\d+)$", str(spk))
@@ -401,7 +406,7 @@ All experiments log to the `DysarthriaNSR` experiment. Filter by `run_name` tag 
 
 ### Directory Layout
 
-```
+```text
 checkpoints/{run_name}/
 ├── epoch=07-val_per=0.721.ckpt    # Scored checkpoint (lower val_per wins)
 ├── epoch=28-val_per=0.505.ckpt    # Best checkpoint

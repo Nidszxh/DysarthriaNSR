@@ -10,8 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss
-
+from src.models.losses import BlankPriorKLLoss, OrdinalContrastiveLoss, SymbolicKLLoss
 
 # ── OrdinalContrastiveLoss ────────────────────────────────────────────────────
 

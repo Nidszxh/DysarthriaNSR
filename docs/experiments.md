@@ -8,7 +8,7 @@
 
 ### Phoneme Error Rate (PER)
 
-```
+```text
 PER = (S + D + I) / N
 ```
 
@@ -114,6 +114,7 @@ Interpretation: The symbolic constraint meaningfully changes 12.94% of utterance
 The full system achieves **0.133 macro-speaker PER** (beam search, width 25) — the canonical result. Both paths are decoded with beam search (width 25), providing an apples-to-apples comparison. The internal neural sub-path yields **0.131** (beam), slightly better than the constrained path at 0.133.
 
 **Symbolic constraint impact (3,548 test utterances, beam width 25, both paths):**
+
 | Metric | Value |
 |--------|-------|
 | per_neural (beam search, width=25 of internal logits) | **0.1311** |
@@ -125,6 +126,7 @@ The full system achieves **0.133 macro-speaker PER** (beam search, width 25) —
 The symbolic constraint is **practically identical** to the neural sub-path — the +0.0015 difference is 0.11% relative PER. The p-value of 0.246 confirms the difference is not statistically significant.
 
 **Per-speaker breakdown (held-out):**
+
 | Speaker | PER | CI (95%) | Type | n |
 |---------|-----|----------|------|---|
 | MC02 | 0.200 | [0.184, 0.217] | Control | 1121 |
@@ -134,6 +136,7 @@ The symbolic constraint is **practically identical** to the neural sub-path — 
 The two control speakers happen to be more challenging than the dysarthric speaker in this split, not a systematic pattern. Dysarthric vs. control difference is **highly significant** (Wilcoxon p<1e-15), but driven by speaker identity rather than severity.
 
 **Articulatory accuracy:**
+
 | Feature | Accuracy |
 |---------|----------|
 | Manner | 81.7% |
@@ -141,6 +144,7 @@ The two control speakers happen to be more challenging than the dysarthric speak
 | Voice | **95.3%** |
 
 **Additional diagnostics:**
+
 | Metric | Value |
 |--------|-------|
 | I/D ratio | **2.1×** (target <3× ✓) |
@@ -153,6 +157,7 @@ The two control speakers happen to be more challenging than the dysarthric speak
 | Top confusion | IH↔AH (71×) — vowel centralization |
 
 **Temperature calibration (val set):**
+
 | Speaker | τ |
 |---------|---|
 | M05 | 1.25 |

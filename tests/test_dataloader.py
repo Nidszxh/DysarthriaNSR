@@ -7,8 +7,8 @@ Tests verify:
 - Attention mask correctly marks valid vs. padding regions
 - Articulatory labels are padded with -100
 """
-import pytest
 import pandas as pd
+import pytest
 import torch
 
 from src.data.dataloader import NeuroSymbolicCollator, compute_sample_weights

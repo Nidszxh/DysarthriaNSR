@@ -7,13 +7,10 @@ Tests verify:
 - Output distributions are valid (sum to 1, no NaN)
 - Severity-adaptive beta shifts blending weight
 """
-import pytest
 import torch
-import torch.nn.functional as F
 
 from src.models.model import SymbolicConstraintLayer
 from src.utils.config import SymbolicConfig
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

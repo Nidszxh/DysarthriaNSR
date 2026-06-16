@@ -1,0 +1,6 @@
+{
+  // Line length not enforced — technical docs contain long references and tables
+  "MD013": false,
+  // Tables use compact pipe style
+  "MD060": false
+}

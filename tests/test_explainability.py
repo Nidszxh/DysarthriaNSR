@@ -8,12 +8,9 @@ Tests verify:
 - Edge cases: empty error lists, missing features, unknown phonemes
 """
 import json
-import pytest
-from pathlib import Path
 
-from src.explainability.output_format import ExplainableOutputFormatter
 from src.explainability.articulator_analysis import ArticulatoryConfusionAnalyzer
-
+from src.explainability.output_format import ExplainableOutputFormatter
 
 # ── ExplainableOutputFormatter ──────────────────────────────────────────────
 

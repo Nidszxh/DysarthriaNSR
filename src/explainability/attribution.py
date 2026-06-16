@@ -6,12 +6,10 @@ Provides two attribution strategies:
   2. Attention-based: Aggregate HuBERT attention maps to phoneme boundaries
 """
 
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
 
 # Map common articulatory feature substitution patterns to probable clinical causes
 _PROBABLE_CAUSE_MAP = {

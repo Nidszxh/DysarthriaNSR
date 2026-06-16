@@ -62,14 +62,15 @@ python src/data/manifest.py
 
 `TorgoManager` in `src/data/download.py` loads TORGO metadata from `abnerh/TORGO-database` via HuggingFace `datasets`, downloads and resamples audio to 16 kHz, and writes files to `data/raw/audio/` with the naming convention:
 
-```
+```text
 {speaker_id}_{md5_hash_of_hf_path}_{original_filename}.wav
 ```
 
 The MD5 hash is computed as `hashlib.md5(hf_path.encode()).hexdigest()[:8]` from the HuggingFace path string. This hash-based naming is required for manifest matching: the TORGO HuggingFace dataset has no consistent `speaker_id` metadata field, so the manifest code reconstructs speaker IDs from filenames using `path.name.split('_')[2]` (B12 fix — position [0] returns the literal string `'unknown'`). The output `data/processed/raw_extraction_map.csv` records speaker, filename, path, original sample rate, and target sample rate for every extracted file.
 
 Output layout:
-```
+
+```text
 data/raw/audio/
 └── train/
     ├── M01_abc12345_s1_mic1_001.wav
@@ -122,7 +123,7 @@ data/raw/audio/
 | `articulatory_classes` | str | Legacy alias for `manner_classes` | `stop vowel stop fricative vowel` |
 | `manner_classes` | str | Space-separated manner-of-articulation labels | `stop vowel stop fricative vowel` |
 | `place_classes` | str | Space-separated place-of-articulation labels | `bilabial central alveolar dental central` |
-| `voice_classes` | str | Space-separated voicing labels | `voiceless vowel voiceless voiced vowel` |
+| `voice_classes` | str | Space-separated voicing labels | `voiced voiced voiceless voiced voiceless voiced` |
 | `phn_count` | int | Number of phonemes in the sequence | `17` |
 | `phonemes_per_sec` | float | Phoneme rate (phn_count / duration) | `4.2` |
 | `duration` | float | Audio duration in seconds | `4.05` |
@@ -144,7 +145,7 @@ data/raw/audio/
 
 These IDs are built first in `TorgoNeuroSymbolicDataset._build_vocabularies()` and assumed throughout training, evaluation, and decoding. Changing these assignments silently breaks CTC alignment, CE loss, and all downstream decoding.
 
-**Total vocabulary size: 47 tokens** (44 ARPABET phonemes + 3 special tokens).
+**Total vocabulary size: 47 tokens** (phonemes from G2P output after stress-strip, including BLANK/PAD/UNK). The manifest vocab is built dynamically from the actual corpus (`_build_vocabularies()`); the 39 standard ARPABET phonemes are extended by additional tokens present in the TORGO transcripts.
 
 ### `normalize_phoneme()` — Must Be Called Everywhere
 
@@ -164,19 +165,22 @@ The vocabulary is built from `sorted(set(...))` over all phonemes in the manifes
 ### Articulatory Classes
 
 **Manner of articulation** (8 classes, used by `manner_head`):
-```
+
+```text
 stop, fricative, affricate, nasal, liquid, glide, vowel, diphthong
 ```
 
 **Place of articulation** (12 classes, used by `place_head`):
-```
+
+```text
 bilabial, labiodental, dental, alveolar, postalveolar, palatal, velar,
 glottal, labio-velar, front, back, central
 ```
 
-**Voicing** (3 classes, used by `voice_head`):
-```
-voiced, voiceless, vowel
+**Voicing** (2 classes, used by `voice_head`):
+
+```text
+voiced, voiceless
 ```
 
 ---
@@ -185,7 +189,7 @@ voiced, voiceless, vowel
 
 ### `_load_audio()` — No Peak Normalization (C2 fix)
 
-```
+```text
 1. Load WAV at native sample rate via torchaudio.load()
 2. Convert stereo → mono: torch.mean(waveform, dim=0)
 3. Resample to 16,000 Hz via torchaudio.functional.resample() if needed
@@ -249,6 +253,7 @@ Labels use `-100` for padding. This is automatically ignored by `nn.CTCLoss` and
 ### `WeightedRandomSampler` (B20 fix)
 
 Training uses `WeightedRandomSampler` with speaker-level inverse-frequency weights:
+
 ```python
 speaker_counts = train_df['speaker'].value_counts().to_dict()
 train_weights = [1.0 / speaker_counts[dataset.df.iloc[i]['speaker']] for i in train_idx]

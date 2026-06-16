@@ -10,7 +10,7 @@ Tests verify:
 import pytest
 import torch
 
-from src.utils.config import normalize_phoneme, get_speaker_severity, TORGO_SEVERITY_MAP
+from src.utils.config import TORGO_SEVERITY_MAP, get_speaker_severity, normalize_phoneme
 from src.utils.constants import PHONEME_ARTICULATORY, PHONEME_FEATURES
 from src.utils.sequence_utils import align_labels_to_logits
 

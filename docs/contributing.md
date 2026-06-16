@@ -79,20 +79,21 @@ def compute_per(prediction: List[str], reference: List[str]) -> float:
 3. **Wire into `NeuroSymbolicASR.__init__()`** using the `use_*` flag pattern: `if model_config.use_my_component: self.my_component = MyComponent(...)`.
 
 4. **Wire into `NeuroSymbolicASR.forward()`** with an `ablation_mode` guard:
+
 ```python
 if self.my_component is not None and ablation_mode != "no_my_component":
     hidden_states = self.my_component(hidden_states)
 ```
 
-5. **Add a loss class** (if the component introduces a new loss term) to `src/models/losses.py` as an `nn.Module` (not a plain function — I6 fix requirement so Lightning device-manages the module). Instantiate it in `DysarthriaASRLightning._init_loss_functions()`. Add a `lambda_*` config field to `TrainingConfig`.
+1. **Add a loss class** (if the component introduces a new loss term) to `src/models/losses.py` as an `nn.Module` (not a plain function — I6 fix requirement so Lightning device-manages the module). Instantiate it in `DysarthriaASRLightning._init_loss_functions()`. Add a `lambda_*` config field to `TrainingConfig`.
 
-6. **Wire into `compute_loss()`** and add MLflow logging in `training_step()`.
+2. **Wire into `compute_loss()`** and add MLflow logging in `training_step()`.
 
-7. **Update the ablation mode table** in [architecture.md](architecture.md) with a new row.
+3. **Update the ablation mode table** in [architecture.md](architecture.md) with a new row.
 
-8. **Add a smoke test check** in `scripts/smoke_test.py` if the component has critical invariants (gradient flow, output shape, non-negativity).
+4. **Add a smoke test check** in `scripts/smoke_test.py` if the component has critical invariants (gradient flow, output shape, non-negativity).
 
-9. **Add a refactor note** at the top of modified files: `# [CLEAN]`, `# [PERF]`, `# [REPRO]` per the existing log convention.
+5. **Add a refactor note** at the top of modified files: `# [CLEAN]`, `# [PERF]`, `# [REPRO]` per the existing log convention.
 
 ---
 
@@ -113,19 +114,21 @@ if self.my_component is not None and ablation_mode != "no_my_component":
 ## Adding a New Ablation Mode
 
 1. **Add to the choices list** in `run_pipeline.py _build_parser()`:
+
 ```python
 choices=["full", "neural_only", ..., "my_new_ablation"]
 ```
 
-2. **Add a guard** in `NeuroSymbolicASR.forward()`:
+1. **Add a guard** in `NeuroSymbolicASR.forward()`:
+
 ```python
 if ablation_mode == "my_new_ablation":
     # bypass specific component
 ```
 
-3. **Add a row** to the ablation mode table in [architecture.md](architecture.md).
+1. **Add a row** to the ablation mode table in [architecture.md](architecture.md).
 
-4. **Run a smoke test** before committing: `python scripts/smoke_test.py --profile unit`.
+2. **Run a smoke test** before committing: `python scripts/smoke_test.py --profile unit`.
 
 ---
 
@@ -158,7 +161,7 @@ Before committing any code change:
 - New metrics logged to MLflow
 - Tested on RTX 4060 (8 GB VRAM target)
 - Labels use `-100` sentinel for padding (not `0` or `1`)
-- If bug fixed: add the fix ID and summary to [CHANGELOG.md](CHANGELOG.md)
+- If bug fixed: add the fix ID and summary to [CHANGELOG.md](../CHANGELOG.md)
 
 ---
 
@@ -187,6 +190,7 @@ The following non-blocking issues are known from the March 2026 research audit. 
 ### LOSO Resume Orchestration Test Gap (§9.3)
 
 The `weights_only_resume` and `scheduler_exhausted` paths in `run_loso()` have no automated integration test. If a fold resumes incorrectly, debug by checking:
+
 1. `lm.resume_epoch_offset` — should equal the saved `start_epoch` from `weights_only_resume.pt`
 2. The `weights_only_resume.pt` marker file in the fold's checkpoint directory — delete it to force a clean weights-only resume from `last.ckpt`
 

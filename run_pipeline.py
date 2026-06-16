@@ -50,17 +50,17 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from src.utils.config import Config, get_default_config, get_project_root
+from evaluate import BigramLMScorer, evaluate_model
 from src.data.dataloader import TorgoNeuroSymbolicDataset
 from src.data.warm_feature_cache import warm_feature_cache
 from src.models.model import NeuroSymbolicASR
+from src.utils.config import Config, get_default_config, get_project_root
 from train import (
     DysarthriaASRLightning,
     create_dataloaders,
     run_loso,
     train,
 )
-from evaluate import evaluate_model, BigramLMScorer
 
 # Logging
 logging.basicConfig(
@@ -487,7 +487,7 @@ def run_auto(args: argparse.Namespace) -> None:
             log.info("--warm-cache-only set; exiting after cache warm-up.")
             return
 
-    # ── 3. Training stage 
+    # ── 3. Training stage
     trained_model: Optional[DysarthriaASRLightning] = None
     dataset: Optional[TorgoNeuroSymbolicDataset] = None
 
@@ -520,7 +520,7 @@ def run_auto(args: argparse.Namespace) -> None:
     else:
         log.info("--skip-train set; skipping training stage.")
 
-    # ── 4. Evaluation stage 
+    # ── 4. Evaluation stage
     if args.skip_eval:
         log.info("--skip-eval set; skipping evaluation stage.")
         return
@@ -557,7 +557,7 @@ def run_auto(args: argparse.Namespace) -> None:
                 test_speakers = set(test_loader.dataset.df['speaker'].unique())
             elif hasattr(test_loader.dataset, 'speaker_to_indices'):
                 test_speakers = set(test_loader.dataset.speaker_to_indices.keys())
-            
+
             # Get val speakers - check if val_loader exists, otherwise use dataset's val speakers
             val_speakers = set()
             if val_loader is not None:
@@ -565,7 +565,7 @@ def run_auto(args: argparse.Namespace) -> None:
                     val_speakers = set(val_loader.dataset.df['speaker'].unique())
                 elif hasattr(val_loader.dataset, 'speaker_to_indices'):
                     val_speakers = set(val_loader.dataset.speaker_to_indices.keys())
-            
+
             # [FIX-12] Filter to only training speakers (prevents data leakage from val/test)
             train_speakers = [
                 s for s in dataset.df['speaker'].unique()
@@ -582,7 +582,7 @@ def run_auto(args: argparse.Namespace) -> None:
                     phn_seqs.append(ids)
             _lm_scorer = BigramLMScorer(k=0.5)
             _lm_scorer.fit(phn_seqs, vocab_size=len(dataset.phn_to_id))
-            log.info("Bigram LM built from %d training sequences (test=%s, val=%s, train=%d speakers).", 
+            log.info("Bigram LM built from %d training sequences (test=%s, val=%s, train=%d speakers).",
                      len(phn_seqs), len(test_speakers), len(val_speakers), len(train_speakers))
         except Exception as _lm_exc:
             log.warning("Bigram LM build failed (non-fatal, falling back to acoustic-only): %s", _lm_exc)
@@ -620,7 +620,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Orchestration-level flags (owned by run_pipeline.py) 
+    # ── Orchestration-level flags (owned by run_pipeline.py)
     orch = parser.add_argument_group("Orchestration")
     orch.add_argument(
         "--run-name",

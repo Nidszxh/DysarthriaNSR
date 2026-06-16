@@ -23,7 +23,7 @@ class ArticulatoryConfusionAnalyzer:
 
     Instead of raw phoneme confusions (44×44), this produces 3 small matrices:
         - Manner confusion:  e.g. stop → fricative
-        - Place confusion:   e.g. bilabial → alveolar  
+        - Place confusion:   e.g. bilabial → alveolar
         - Voice confusion:   e.g. voiced → voiceless
 
     These are directly interpretable by speech-language pathologists and map

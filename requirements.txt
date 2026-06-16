@@ -33,6 +33,11 @@ seaborn==0.13.2
 # Configuration
 pyyaml==6.0.3
 
+# Inference serving
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
+
 # Utilities
 scipy==1.15.3
 rapidfuzz==3.9.7

@@ -65,7 +65,7 @@
 | TORGO manifest generation (`manifest.py`) | ✅ | 16,531 rows; speaker at `split('_')[2]` (B12) |
 | `TorgoNeuroSymbolicDataset` | ✅ | Disk + memory LRU feature cache |
 | `NeuroSymbolicCollator` | ✅ | Pads audio to 0.0; labels to -100 |
-| Phoneme vocabulary: 47 tokens | ✅ | 44 ARPABET + `<BLANK>`/`<PAD>`/`<UNK>` |
+| Phoneme vocabulary: 47 tokens | ✅ | Manifest vocab from G2P output (includes `<BLANK>`/`<PAD>`/`<UNK>` + phonemes from TORGO transcripts) |
 | Articulatory labels (manner/place/voice) | ✅ | Aligned with IPA (B23: postalveolar fixes) |
 | No peak normalization (C2) | ✅ | HuBERT processor handles normalization |
 | 6.0s max audio length | ✅ | ~99% TORGO coverage |

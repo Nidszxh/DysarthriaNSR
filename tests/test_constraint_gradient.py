@@ -7,13 +7,11 @@ Tests verify:
 - Output of LearnableConstraintMatrix is always row-stochastic and NaN-free
 - SymbolicConstraintLayer in static mode has no learnable_matrix
 """
-import pytest
 import torch
 import torch.nn.functional as F
 
 from src.models.model import LearnableConstraintMatrix, SymbolicConstraintLayer
 from src.utils.config import SymbolicConfig
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

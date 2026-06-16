@@ -25,22 +25,22 @@ symbolic constraints, and comprehensive evaluation metrics.
 #         OneCycleLR step-count drift detection in train().
 """
 
+import json
 import logging
 import os
-import sys
-from collections import defaultdict
-import warnings
-import json
-import time
 import re
 import shutil
+import sys
+import time
+import warnings
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
+
 matplotlib.use('Agg')   # [CLEAN] Backend set at module level before any pyplot import
 import matplotlib.pyplot as plt
-
 import mlflow
 import numpy as np
 import pytorch_lightning as pl
@@ -56,15 +56,14 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 project_root = Path(__file__).resolve().parent
 sys.path.insert(2, str(project_root / "src"))
 
+# Import evaluate functions from root level
+from evaluate import compute_per, decode_predictions, decode_references, evaluate_model
+from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
+from src.models.losses import BlankPriorKLLoss, OrdinalContrastiveLoss, SymbolicKLLoss
+from src.models.model import NeuroSymbolicASR
+from src.utils import resolve_best_fold_checkpoint
 from src.utils.config import Config, get_default_config, get_project_root, get_speaker_severity
 from src.utils.sequence_utils import align_labels_to_logits
-from src.utils import resolve_best_fold_checkpoint
-from src.data.dataloader import NeuroSymbolicCollator, TorgoNeuroSymbolicDataset
-from src.models.model import NeuroSymbolicASR
-from src.models.losses import OrdinalContrastiveLoss, BlankPriorKLLoss, SymbolicKLLoss
-
-# Import evaluate functions from root level
-from evaluate import compute_per, evaluate_model, decode_predictions, decode_references
 
 warnings.filterwarnings('once')
 
@@ -84,8 +83,9 @@ def _seed_worker(worker_id: int) -> None:
     """
     # [REPRO] torch.initial_seed() returns the initial seed set by pl.seed_everything();
     # adding worker_id ensures distinct (but deterministic) sequences across workers.
+    import random  # noqa: PLC0415
+
     import numpy as np  # noqa: PLC0415  (local import avoids top-level NumPy fork hazard)
-    import random       # noqa: PLC0415
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed + worker_id)
     random.seed(worker_seed + worker_id)
@@ -1068,7 +1068,7 @@ class DysarthriaASRLightning(pl.LightningModule):
         if not self.test_step_outputs:
             return
 
-        avg_loss = torch.stack([x['loss'] for x in self.test_step_outputs]).mean()
+        torch.stack([x['loss'] for x in self.test_step_outputs]).mean()
 
         speaker_per_map: Dict[str, List[float]] = defaultdict(list)
         for output in self.test_step_outputs:
@@ -1125,7 +1125,7 @@ class DysarthriaASRLightning(pl.LightningModule):
     def _compute_stratified_per(self) -> Tuple[float, float]:
         """
         Compute PER stratified by dysarthric vs control speakers.
-        
+
         Returns:
             Tuple of (dysarthric_per, control_per)
         """
@@ -1247,7 +1247,6 @@ class DysarthriaASRLightning(pl.LightningModule):
         # T_mult = 2 means each restart cycle is twice as long
         # eta_min = lr * cosine_eta_min_ratio
         # interval='epoch' steps per epoch, not per batch
-        warmup_epochs = self.config.training.encoder_warmup_epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
             T_0=self.config.training.cosine_T0,
@@ -1281,8 +1280,8 @@ class StratifiedMicroBatchSampler:
         dysarthric_ratio: float = 0.75,
         seed: Optional[int] = None,
     ) -> None:
-        self.dysarthric_idx = [i for i, l in enumerate(labels) if l == 1]
-        self.control_idx = [i for i, l in enumerate(labels) if l == 0]
+        self.dysarthric_idx = [i for i, label in enumerate(labels) if label == 1]
+        self.control_idx = [i for i, label in enumerate(labels) if label == 0]
         self.batch_size = batch_size
         self.n_dys = max(1, int(dysarthric_ratio * batch_size))
         self.n_ctrl = batch_size - self.n_dys
@@ -2323,7 +2322,7 @@ def run_loso(
         if wer_valid_mask.any() else float('nan')
     )
 
-    logger.info(f"\n✅ LOSO Complete:")
+    logger.info("\n✅ LOSO Complete:")
     logger.info(f"   Mean PER     = {macro_per:.4f}  [95% CI: {ci_lo:.4f} – {ci_hi:.4f}]")
     logger.info(f"   Weighted PER = {weighted_per:.4f}  (weighted by fold sample count)")
     logger.info(f"   Dys PER      = {dysarthric_avg_per:.4f}  |  Ctrl PER = {control_avg_per:.4f}")

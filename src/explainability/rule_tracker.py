@@ -6,7 +6,7 @@ understand which dysarthric substitution patterns the model identified.
 """
 
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # Maximum number of individual activation events held in memory.
 # At 5 % activation rate over 15 LOSO folds this would otherwise reach ~9 M

@@ -1,8 +1,8 @@
-import logging
-import warnings
 import hashlib
+import logging
 import os
 import threading
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import torchaudio
 import torchaudio.functional as taF
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset
 from transformers import AutoFeatureExtractor, AutoProcessor
 
 from src.utils.config import ProjectPaths, normalize_phoneme
@@ -107,12 +107,12 @@ class TorgoNeuroSymbolicDataset(Dataset):
     def _validate_and_clean_manifest(self) -> None:
         """
         Validate manifest data quality and remove invalid samples.
-        
+
         Checks:
         1. Remove samples with empty phoneme sequences
         2. Validate required columns exist
         3. Check for duplicate sample IDs
-        
+
         Modifies self.df in-place.
         """
         initial_count = len(self.df)
@@ -163,13 +163,13 @@ class TorgoNeuroSymbolicDataset(Dataset):
     def _build_vocabularies(self) -> None:
         """
         Build phoneme and articulatory class vocabularies from manifest.
-        
+
         Creates:
         - phn_to_id: Phoneme → ID mapping (includes special tokens)
         - id_to_phn: ID → Phoneme reverse mapping
         - art_to_id: Articulatory class → ID mapping
         - id_to_art: ID → Articulatory class reverse mapping
-        
+
         Special tokens:
         - <BLANK> (ID 0): CTC blank token for alignment
         - <PAD> (ID 1): Padding for variable-length sequences
@@ -247,10 +247,10 @@ class TorgoNeuroSymbolicDataset(Dataset):
     def _calculate_phoneme_weights(self) -> torch.Tensor:
         """
         Calculate inverse-frequency weights for phoneme class balancing.
-        
+
         Uses sqrt-damped inverse frequency to avoid extreme weights for rare phonemes.
         Formula: weight[i] = sqrt(median_freq / freq[i])
-        
+
         Returns:
             Tensor of shape [num_phonemes] with weights aligned to phn_to_id
         """
@@ -327,7 +327,7 @@ class TorgoNeuroSymbolicDataset(Dataset):
     def _load_audio(self, audio_path: str) -> torch.Tensor:
         """
         Load and preprocess audio waveform
-        
+
         Preprocessing steps:
         1. Load audio (handle failures gracefully)
         2. Convert stereo → mono
@@ -339,10 +339,10 @@ class TorgoNeuroSymbolicDataset(Dataset):
 
         Args:
             audio_path: Path to audio file
-        
+
         Returns:
             Normalized waveform tensor [T] where T = num_samples
-        
+
         Notes:
             - Returns silence (zeros) on load failure to avoid crashing training
             - No manual peak normalization: HuBERT processor applies its own
@@ -621,12 +621,12 @@ class TorgoNeuroSymbolicDataset(Dataset):
 class NeuroSymbolicCollator:
     """
     Collator for batching neuro-symbolic samples with proper padding.
-    
+
     Handles variable-length audio and phoneme sequences for CTC training:
     - Pads audio to max batch length
     - Pads labels with -100 (ignored by CTC/CE loss)
     - Creates attention masks for valid regions
-    
+
     Args:
         processor: Feature processor instance
         pad_id: Padding token ID (default: 1)

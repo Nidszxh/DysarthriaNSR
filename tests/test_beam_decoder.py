@@ -9,10 +9,8 @@ Tests verify:
 - Beam-width=1 does not crash and returns a list
 """
 import numpy as np
-import pytest
 
 from evaluate import BeamSearchDecoder
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
