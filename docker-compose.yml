@@ -1,0 +1,58 @@
+# Docker Compose for DysarthriaNSR.
+#
+#   docker compose up --build serve       # FastAPI inference service (GPU, :8000)
+#   docker compose run train --run-name v4_final   # one-off train/eval run (profile: train)
+#
+# The serve service mounts checkpoints + processed data read-only; point
+# RUN_NAME at whichever run you want to serve.
+
+services:
+  serve:
+    build:
+      context: .
+      target: serve
+    image: dysarthria-nsr:serve
+    ports:
+      - "${SERVE_PORT:-8000}:8000"
+    environment:
+      - RUN_NAME=${RUN_NAME:-v4_final}
+      - DEVICE=${DEVICE:-cuda}
+    volumes:
+      - ./checkpoints:/workspace/checkpoints:ro
+      - ./data:/workspace/data:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  train:
+    build:
+      context: .
+      target: train
+    image: dysarthria-nsr:train
+    profiles: ["train"]
+    volumes:
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+      - ./data:/workspace/data
+      - ./mlruns:/workspace/mlruns
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Args are passed straight through to run_pipeline.py, e.g.:
+    #   docker compose run train --run-name v4_final
+    #   docker compose run train --run-name loso_v1 --loso

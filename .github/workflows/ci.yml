@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff==0.11.0" "mypy==1.15.0"
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Mypy (serve.py, repo is not yet fully type-clean)
+        run: mypy serve.py --follow-imports=silent
+
+  test:
+    name: Tests (pytest + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install CPU torch (fast, no CUDA wheels)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==2.9.0" "torchaudio==2.9.0" \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project deps + dev tools
+        run: |
+          pip install -r requirements.txt
+          pip install "pytest==8.3.4" "pytest-cov==6.0.0"
+
+      - name: Run pytest suite
+        run: pytest -q
+
+      - name: Run smoke unit profile
+        run: python scripts/smoke_test.py --profile unit
+
+      - name: Import check (serve app without model load)
+        run: |
+          python -c "import serve; assert serve.app is not None; print('serve.py imports OK')"

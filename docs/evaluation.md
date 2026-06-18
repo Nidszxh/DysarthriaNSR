@@ -50,6 +50,7 @@ When running LOSO via `run_pipeline.py --loso`, aggregate metrics are written to
 ### Paired Bootstrap Delta (Neural vs. Constrained)
 
 **Function:** `bootstrap_paired_per_delta()` in `evaluate.py`. Computes `Δ = per_constrained - per_neural` for each utterance (positive = constrained is worse), bootstraps the mean delta (n=10,000 resamples), and reports a two-sided empirical p-value:
+
 ```python
 p_left = mean(boot_arr <= 0.0)
 p_right = mean(boot_arr >= 0.0)
@@ -79,6 +80,7 @@ Welch t-test (`scipy.stats.ttest_ind(equal_var=False)`) and Wilcoxon rank-sum (`
 **Function:** `greedy_decode()` in `evaluate.py`.
 
 **Collapse rules applied per frame in order:**
+
 1. Blank token (ID=0) → reset `prev_id`; emit nothing
 2. PAD token (ID=1) → reset `prev_id`; emit nothing (same semantics as blank — prevents probability mass inflation)
 3. Consecutive duplicate of `prev_id` without intervening blank → collapse; emit nothing
@@ -126,6 +128,7 @@ The LM is built automatically from training phoneme sequences when `--lm-weight 
 **How `per_neural` and `per_constrained` are measured:** Both are greedy-decoded from sub-paths of the **same jointly-trained model** in a single forward pass. `logits_neural` is the output of `PhonemeClassifier` before `SymbolicConstraintLayer`; `log_probs_constrained` is the output after. They are **not** independent models.
 
 **`constraint_precision` computation:** For each utterance, compare `per_constrained` vs. `per_neural` with tolerance 1e-6:
+
 - Helpful: `per_constrained < per_neural - 1e-6`
 - Neutral: `|per_constrained - per_neural| <= 1e-6`
 - Harmful: `per_constrained > per_neural + 1e-6`
@@ -143,6 +146,7 @@ Rates reported as `helpful_rate`, `neutral_rate`, `harmful_rate` in `evaluation_
 **Fallback:** Pure-Python DP Levenshtein with backtracking.
 
 **Operation semantics (prediction's perspective):**
+
 - `'correct'`: pred_ph == ref_ph; increments correct count
 - `'substitute'`: pred_ph ≠ ref_ph; both present; increments substitution count for ref_ph
 - `'delete'`: pred_ph present in prediction but not in reference; increments insertion count for pred_ph
@@ -171,6 +175,7 @@ Rates reported as `helpful_rate`, `neutral_rate`, `harmful_rate` in `evaluation_
 **Class:** `ExplainableOutputFormatter` in `src/explainability/output_format.py`. Activated by `--explain` flag.
 
 **`explanations.json` schema (per utterance):**
+
 ```json
 {
   "utterance_id": "utt_0042",
@@ -223,6 +228,7 @@ Rates reported as `helpful_rate`, `neutral_rate`, `harmful_rate` in `evaluation_
 **`conformal_phoneme_sets()` (M-5 documentation):** APS-like heuristic — sorts phoneme probabilities descending, includes top-k tokens until cumulative probability ≥ `coverage`. **This is NOT calibrated conformal prediction.** True conformal calibration requires fitting τ on a held-out calibration set. The current implementation uses `τ = coverage` as a conservative approximation.
 
 **Output fields in `evaluation_results.json['uncertainty']`:**
+
 ```json
 {
   "computed": true,
